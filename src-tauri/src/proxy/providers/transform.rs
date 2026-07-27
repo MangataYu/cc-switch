@@ -218,12 +218,15 @@ pub fn anthropic_to_openai_with_reasoning_content(
             .iter()
             .filter(|t| t.get("type").and_then(|v| v.as_str()) != Some("BatchTool"))
             .map(|t| {
+                let name = t.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let schema = clean_schema(t.get("input_schema").cloned().unwrap_or(json!({})));
+                let parameters = super::tool_compat::clean_anthropic_tool_schema(name, schema);
                 json!({
                     "type": "function",
                     "function": {
-                        "name": t.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                        "name": name,
                         "description": t.get("description"),
-                        "parameters": clean_schema(t.get("input_schema").cloned().unwrap_or(json!({})))
+                        "parameters": parameters
                     }
                 })
             })
@@ -881,6 +884,45 @@ mod tests {
             result["tools"][0]["function"]["parameters"]["properties"]["location"]["type"],
             json!("string")
         );
+    }
+
+    #[test]
+    fn test_anthropic_to_openai_cleans_read_safe_integer_maximum() {
+        let input = json!({
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "Read the file"}],
+            "tools": [{
+                "name": "Read",
+                "input_schema": {
+                    "type": "object",
+                    "required": ["file_path"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "offset": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991_u64
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "exclusiveMinimum": 0,
+                            "maximum": 9007199254740991_u64
+                        },
+                        "pages": {"type": "string"}
+                    }
+                }
+            }]
+        });
+
+        let result = anthropic_to_openai(input).unwrap();
+        let schema = &result["tools"][0]["function"]["parameters"];
+
+        assert!(schema["properties"]["offset"].get("maximum").is_none());
+        assert!(schema["properties"]["limit"].get("maximum").is_none());
+        assert_eq!(schema["properties"]["offset"]["type"], "integer");
+        assert_eq!(schema["required"], json!(["file_path"]));
+        assert_eq!(schema["additionalProperties"], false);
     }
 
     #[test]
