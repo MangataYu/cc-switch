@@ -8,7 +8,7 @@
 //!
 //! 与 Chat Completions 的 delta chunk 模型完全不同，需要独立的状态机处理。
 
-use super::reasoning_bridge::{encode_openai_reasoning_item, reasoning_summary_text};
+use super::reasoning_bridge::anthropic_block_from_openai_reasoning_item;
 use super::transform_responses::{
     build_anthropic_usage_from_responses, map_responses_stop_reason, responses_to_anthropic,
     sanitize_anthropic_tool_use_input_json,
@@ -1377,7 +1377,13 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
                                             .get(&index)
                                             .cloned()
                                             .unwrap_or_else(|| item.clone());
-                                        let full_text = reasoning_summary_text(&final_item);
+                                        let anthropic_block =
+                                            anthropic_block_from_openai_reasoning_item(&final_item);
+                                        let full_text = anthropic_block
+                                            .as_ref()
+                                            .and_then(|block| block.get("thinking"))
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("");
                                         let emitted_text = reasoning_text_by_index
                                             .get(&index)
                                             .cloned()
@@ -1402,39 +1408,33 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
                                             yield Ok(Bytes::from(delta_sse));
                                         }
 
-                                        let encrypted = final_item
-                                            .get("encrypted_content")
+                                        if let Some(signature) = anthropic_block
+                                            .as_ref()
+                                            .and_then(|block| block.get("signature"))
                                             .and_then(Value::as_str)
-                                            .is_some_and(|value| !value.is_empty());
-                                        if encrypted {
-                                            if let Some(envelope) = encode_openai_reasoning_item(&final_item) {
-                                                if open_indices.contains(&index) {
-                                                    let signature_event = json!({
-                                                        "type": "content_block_delta",
-                                                        "index": index,
-                                                        "delta": {
-                                                            "type": "signature_delta",
-                                                            "signature": envelope
-                                                        }
-                                                    });
-                                                    let signature_sse = format!("event: content_block_delta\ndata: {}\n\n",
-                                                        serde_json::to_string(&signature_event).unwrap_or_default());
-                                                    yield Ok(Bytes::from(signature_sse));
-                                                } else {
-                                                    let start_event = json!({
-                                                        "type": "content_block_start",
-                                                        "index": index,
-                                                        "content_block": {
-                                                            "type": "redacted_thinking",
-                                                            "data": envelope
-                                                        }
-                                                    });
-                                                    let start_sse = format!("event: content_block_start\ndata: {}\n\n",
-                                                        serde_json::to_string(&start_event).unwrap_or_default());
-                                                    yield Ok(Bytes::from(start_sse));
-                                                    open_indices.insert(index);
-                                                }
+                                        {
+                                            if !open_indices.contains(&index) {
+                                                let start_event = json!({
+                                                    "type": "content_block_start",
+                                                    "index": index,
+                                                    "content_block": {"type": "thinking", "thinking": ""}
+                                                });
+                                                let start_sse = format!("event: content_block_start\ndata: {}\n\n",
+                                                    serde_json::to_string(&start_event).unwrap_or_default());
+                                                yield Ok(Bytes::from(start_sse));
+                                                open_indices.insert(index);
                                             }
+                                            let signature_event = json!({
+                                                "type": "content_block_delta",
+                                                "index": index,
+                                                "delta": {
+                                                    "type": "signature_delta",
+                                                    "signature": signature
+                                                }
+                                            });
+                                            let signature_sse = format!("event: content_block_delta\ndata: {}\n\n",
+                                                serde_json::to_string(&signature_event).unwrap_or_default());
+                                            yield Ok(Bytes::from(signature_sse));
                                         }
                                         if open_indices.remove(&index) {
                                             let stop_event = json!({"type": "content_block_stop", "index": index});
@@ -1966,6 +1966,87 @@ mod tests {
         let stop_position = merged.find("event: content_block_stop").unwrap();
         assert!(signature_position < stop_position);
         assert!(!merged[stop_position..].contains("content_block_delta"));
+    }
+
+    #[tokio::test]
+    async fn test_encrypted_reasoning_without_summary_emits_empty_thinking_signature() {
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_reason_empty\",\"model\":\"gpt-5.6\"}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"rs_empty\",\"type\":\"reasoning\",\"summary\":[]}}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_empty\",\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":\"opaque\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        );
+        let upstream = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(input))]);
+        let events: Vec<Value> = create_anthropic_sse_stream_from_responses(upstream)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .flat_map(|chunk| {
+                String::from_utf8_lossy(chunk.unwrap().as_ref())
+                    .split("\n\n")
+                    .filter_map(|block| {
+                        block
+                            .lines()
+                            .find_map(|line| line.strip_prefix("data: "))
+                            .and_then(|data| serde_json::from_str(data).ok())
+                    })
+                    .collect::<Vec<Value>>()
+            })
+            .collect();
+
+        let thinking_start = events
+            .iter()
+            .position(|event| {
+                event.get("type").and_then(Value::as_str) == Some("content_block_start")
+                    && event.pointer("/content_block/type").and_then(Value::as_str)
+                        == Some("thinking")
+            })
+            .expect("encrypted reasoning must start a thinking block");
+        let thinking_index = events[thinking_start]["index"].as_u64().unwrap();
+        assert_eq!(events[thinking_start]["content_block"]["thinking"], "");
+        assert!(!events.iter().any(|event| {
+            event.pointer("/content_block/type").and_then(Value::as_str)
+                == Some("redacted_thinking")
+        }));
+        assert!(!events.iter().any(|event| {
+            event.pointer("/delta/type").and_then(Value::as_str) == Some("thinking_delta")
+        }));
+
+        let signature_position = events
+            .iter()
+            .position(|event| {
+                event.get("index").and_then(Value::as_u64) == Some(thinking_index)
+                    && event.pointer("/delta/type").and_then(Value::as_str)
+                        == Some("signature_delta")
+            })
+            .expect("encrypted reasoning must emit a signature delta");
+        assert!(
+            events[signature_position]["delta"]["signature"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("ccswitch-openai-reasoning-v1:"))
+        );
+        let stop_position = events
+            .iter()
+            .position(|event| {
+                event.get("type").and_then(Value::as_str) == Some("content_block_stop")
+                    && event.get("index").and_then(Value::as_u64) == Some(thinking_index)
+            })
+            .expect("thinking block must stop");
+        assert!(signature_position < stop_position);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.get("type").and_then(Value::as_str) == Some("message_delta"))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.get("type").and_then(Value::as_str) == Some("message_stop"))
+        );
     }
 
     #[tokio::test]

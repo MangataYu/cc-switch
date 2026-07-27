@@ -2,8 +2,8 @@
 //!
 //! The Anthropic Messages protocol has no field for an OpenAI Responses
 //! `reasoning` item. To keep stateless tool loops lossless, the complete item is
-//! carried in a versioned thinking signature/redacted-thinking payload and
-//! restored when the client replays the assistant message.
+//! carried in a versioned thinking signature (with legacy redacted-thinking
+//! payload support on input) and restored when the client replays the assistant message.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde_json::{json, Value};
@@ -58,12 +58,6 @@ pub(crate) fn anthropic_block_from_openai_reasoning_item(item: &Value) -> Option
 
     if has_encrypted_content {
         let envelope = encode_openai_reasoning_item(item)?;
-        if text.is_empty() {
-            return Some(json!({
-                "type": "redacted_thinking",
-                "data": envelope
-            }));
-        }
         return Some(json!({
             "type": "thinking",
             "thinking": text,
@@ -114,15 +108,23 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_item_without_summary_uses_redacted_thinking() {
+    fn encrypted_item_without_summary_uses_empty_thinking_signature() {
         let item = json!({
             "id": "rs_2",
             "type": "reasoning",
             "summary": [],
-            "encrypted_content": "opaque"
+            "encrypted_content": "opaque",
+            "future_field": {"preserved": true}
         });
         let block = anthropic_block_from_openai_reasoning_item(&item).unwrap();
-        assert_eq!(block["type"], "redacted_thinking");
+        assert_eq!(block["type"], "thinking");
+        assert_eq!(block["thinking"], "");
+        assert!(block.get("data").is_none());
+        assert!(
+            block["signature"]
+                .as_str()
+                .is_some_and(|value| value.starts_with(OPENAI_REASONING_ITEM_PREFIX))
+        );
         assert_eq!(
             openai_reasoning_item_from_anthropic_block(&block),
             Some(item)
