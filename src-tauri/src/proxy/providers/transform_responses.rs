@@ -1641,9 +1641,11 @@ mod tests {
         let anthropic = responses_to_anthropic(response).unwrap();
         let thinking = anthropic["content"][0].clone();
         assert_eq!(thinking["type"], "thinking");
-        assert!(thinking["signature"]
-            .as_str()
-            .is_some_and(|value| value.starts_with("ccswitch-openai-reasoning-v1:")));
+        assert!(
+            thinking["signature"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("ccswitch-openai-reasoning-v1:"))
+        );
 
         let replay = anthropic_to_responses(
             json!({
@@ -1651,6 +1653,51 @@ mod tests {
                 "messages": [{"role": "assistant", "content": [
                     thinking,
                     {"type": "tool_use", "id": "call_1", "name": "lookup", "input": {}}
+                ]}]
+            }),
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(replay["input"][0], original);
+        assert_eq!(replay["input"][1]["type"], "function_call");
+    }
+
+    #[test]
+    fn test_encrypted_reasoning_without_summary_uses_empty_thinking_signature() {
+        let original = json!({
+            "type": "reasoning",
+            "id": "rs_empty",
+            "summary": [],
+            "encrypted_content": "opaque-ciphertext",
+            "future_field": {"preserved": true}
+        });
+        let response = json!({
+            "id": "resp_empty",
+            "status": "completed",
+            "model": "gpt-5.6",
+            "output": [original.clone()],
+            "usage": {"input_tokens": 10, "output_tokens": 2}
+        });
+
+        let anthropic = responses_to_anthropic(response).unwrap();
+        let thinking = anthropic["content"][0].clone();
+        assert_eq!(thinking["type"], "thinking");
+        assert_eq!(thinking["thinking"], "");
+        assert!(thinking.get("data").is_none());
+        assert!(
+            thinking["signature"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("ccswitch-openai-reasoning-v1:"))
+        );
+
+        let replay = anthropic_to_responses(
+            json!({
+                "model": "gpt-5.6",
+                "messages": [{"role": "assistant", "content": [
+                    thinking,
+                    {"type": "tool_use", "id": "call_empty", "name": "lookup", "input": {}}
                 ]}]
             }),
             None,
@@ -1822,9 +1869,11 @@ mod tests {
         });
 
         let result = anthropic_to_responses(input, None, false, false).unwrap();
-        assert!(result["input"][0]["content"][0]
-            .get("cache_control")
-            .is_none());
+        assert!(
+            result["input"][0]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
     }
 
     #[test]
@@ -2037,13 +2086,17 @@ mod tests {
             .expect("include should be array");
 
         // 原有项必须保留
-        assert!(includes
-            .iter()
-            .any(|v| v.as_str() == Some("something.else")));
+        assert!(
+            includes
+                .iter()
+                .any(|v| v.as_str() == Some("something.else"))
+        );
         // marker 必须存在
-        assert!(includes
-            .iter()
-            .any(|v| v.as_str() == Some("reasoning.encrypted_content")));
+        assert!(
+            includes
+                .iter()
+                .any(|v| v.as_str() == Some("reasoning.encrypted_content"))
+        );
         // 不重复：marker 只出现一次
         let marker_count = includes
             .iter()
