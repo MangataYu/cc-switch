@@ -9,9 +9,9 @@
 //! 与 Chat Completions 的 delta chunk 模型完全不同，需要独立的状态机处理。
 
 use super::reasoning_bridge::anthropic_block_from_openai_reasoning_item;
+use super::tool_compat::sanitize_anthropic_tool_use_input_json;
 use super::transform_responses::{
     build_anthropic_usage_from_responses, map_responses_stop_reason, responses_to_anthropic,
-    sanitize_anthropic_tool_use_input_json,
 };
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use bytes::Bytes;
@@ -1799,6 +1799,30 @@ mod tests {
         assert!(merged.contains("\"name\":\"Read\""));
         assert!(merged.contains("\"partial_json\":\"{\\\"file_path\\\":\\\"/tmp/demo.py\\\",\\\"limit\\\":2000,\\\"offset\\\":0}"));
         assert!(!merged.contains("\\\"pages\\\":\\\"\\\""));
+    }
+
+    #[tokio::test]
+    async fn test_streaming_read_tool_drops_scientific_notation_offset() {
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_read_bad_offset\",\"model\":\"gpt-5.5\"}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"fc_read\",\"type\":\"function_call\",\"call_id\":\"call_read\",\"name\":\"Read\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_read\",\"delta\":\"{\\\"file_path\\\":\\\"file\\\",\\\"offset\\\":2.300\"}\n\n",
+            "event: response.function_call_arguments.done\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_read\",\"arguments\":\"{\\\"file_path\\\":\\\"file\\\",\\\"offset\\\":2.300310976710655e+22,\\\"limit\\\":2000,\\\"pages\\\":\\\"\\\"}\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        );
+
+        let merged = convert_stream_text(input).await;
+
+        assert!(!merged.contains("2.300310976710655e+22"));
+        assert!(!merged.contains("\\\"offset\\\":"));
+        assert!(!merged.contains("\\\"pages\\\":\\\"\\\""));
+        assert!(merged.contains("\\\"file_path\\\":\\\"file\\\""));
+        assert!(merged.contains("\\\"limit\\\":2000"));
     }
 
     #[tokio::test]

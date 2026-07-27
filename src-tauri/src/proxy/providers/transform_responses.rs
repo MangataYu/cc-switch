@@ -252,34 +252,7 @@ fn responses_image_from_chat_media(part: &Value) -> Option<Value> {
     Some(image)
 }
 
-pub(crate) fn sanitize_anthropic_tool_use_input(name: &str, input: Value) -> Value {
-    if name != "Read" {
-        return input;
-    }
-
-    match input {
-        Value::Object(mut object) => {
-            if matches!(object.get("pages"), Some(Value::String(value)) if value.is_empty()) {
-                object.remove("pages");
-            }
-            Value::Object(object)
-        }
-        other => other,
-    }
-}
-
-pub(crate) fn sanitize_anthropic_tool_use_input_json(name: &str, raw: &str) -> String {
-    if name != "Read" || raw.is_empty() {
-        return raw.to_string();
-    }
-
-    let Ok(input) = serde_json::from_str::<Value>(raw) else {
-        return raw.to_string();
-    };
-
-    serde_json::to_string(&sanitize_anthropic_tool_use_input(name, input))
-        .unwrap_or_else(|_| raw.to_string())
-}
+pub(crate) use super::tool_compat::sanitize_anthropic_tool_use_input;
 
 /// Anthropic 请求 → OpenAI Responses 请求
 ///
@@ -1471,6 +1444,30 @@ mod tests {
         assert_eq!(result["stop_reason"], "end_turn");
         assert_eq!(result["usage"]["input_tokens"], 10);
         assert_eq!(result["usage"]["output_tokens"], 5);
+    }
+
+    #[test]
+    fn test_responses_to_anthropic_drops_invalid_read_offset() {
+        let input = json!({
+            "id": "resp_read",
+            "status": "completed",
+            "model": "gpt-4o",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_read",
+                "name": "Read",
+                "arguments": "{\"file_path\":\"file\",\"offset\":2.300310976710655e+22,\"limit\":2000,\"pages\":\"\"}"
+            }],
+            "usage": {"input_tokens": 10, "output_tokens": 15}
+        });
+
+        let result = responses_to_anthropic(input).unwrap();
+        let tool_input = &result["content"][0]["input"];
+
+        assert!(tool_input.get("offset").is_none());
+        assert!(tool_input.get("pages").is_none());
+        assert_eq!(tool_input["file_path"], "file");
+        assert_eq!(tool_input["limit"], 2000);
     }
 
     #[test]

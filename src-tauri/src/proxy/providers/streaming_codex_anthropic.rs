@@ -7,6 +7,7 @@
 //! this set of events.
 
 use super::codex_responses_sse as sse;
+use super::tool_compat::sanitize_anthropic_tool_use_input_json;
 use super::transform_codex_anthropic::{
     build_responses_usage_from_anthropic, map_anthropic_stop_reason_to_status,
     responses_reasoning_item_from_anthropic_block,
@@ -19,7 +20,6 @@ use super::transform_codex_chat::{
     response_tool_call_item_from_chat_name, response_tool_call_item_id_from_chat_name,
     CodexToolContext,
 };
-use super::transform_responses::sanitize_anthropic_tool_use_input_json;
 use crate::proxy::json_canonical::canonicalize_tool_arguments_str;
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use bytes::Bytes;

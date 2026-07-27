@@ -2,6 +2,7 @@
 //!
 //! 实现 OpenAI SSE → Anthropic SSE 格式转换
 
+use crate::proxy::providers::tool_compat::sanitize_anthropic_tool_use_input_json;
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
@@ -419,6 +420,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                                         }
                                                         let pending_after_start = if should_start
                                                             && !state.pending_args.is_empty()
+                                                            && state.name != "Read"
                                                         {
                                                             Some(std::mem::take(&mut state.pending_args))
                                                         } else {
@@ -443,6 +445,9 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                                                     state.name
                                                                 );
                                                                 state.aborted = true;
+                                                                None
+                                                            } else if state.name == "Read" {
+                                                                state.pending_args.push_str(&args);
                                                                 None
                                                             } else if state.started {
                                                                 Some(args)
@@ -539,6 +544,39 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                             }
                                             current_non_tool_block_type = None;
 
+                                            let mut completed_read_args: Vec<(u32, String)> = tool_blocks_by_index
+                                                .values_mut()
+                                                .filter(|state| {
+                                                    state.started
+                                                        && !state.aborted
+                                                        && state.name == "Read"
+                                                        && !state.pending_args.is_empty()
+                                                })
+                                                .map(|state| {
+                                                    (
+                                                        state.anthropic_index,
+                                                        sanitize_anthropic_tool_use_input_json(
+                                                            "Read",
+                                                            &std::mem::take(&mut state.pending_args),
+                                                        ),
+                                                    )
+                                                })
+                                                .collect();
+                                            completed_read_args.sort_unstable_by_key(|(index, _)| *index);
+                                            for (index, args) in completed_read_args {
+                                                let event = json!({
+                                                    "type": "content_block_delta",
+                                                    "index": index,
+                                                    "delta": {
+                                                        "type": "input_json_delta",
+                                                        "partial_json": args
+                                                    }
+                                                });
+                                                let sse_data = format!("event: content_block_delta\ndata: {}\n\n",
+                                                    serde_json::to_string(&event).unwrap_or_default());
+                                                yield Ok(Bytes::from(sse_data));
+                                            }
+
                                             // Late start for blocks that accumulated args before id/name arrived.
                                             let mut late_tool_starts: Vec<(u32, String, String, String)> =
                                                 Vec::new();
@@ -564,6 +602,11 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                                 };
                                                 state.started = true;
                                                 let pending = std::mem::take(&mut state.pending_args);
+                                                let pending = if fallback_name == "Read" {
+                                                    sanitize_anthropic_tool_use_input_json("Read", &pending)
+                                                } else {
+                                                    pending
+                                                };
                                                 late_tool_starts.push((
                                                     state.anthropic_index,
                                                     fallback_id,
@@ -758,6 +801,35 @@ mod tests {
             map_stop_reason(Some("content_filter")),
             Some("end_turn".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_read_buffers_and_sanitizes_invalid_offset() {
+        let input = concat!(
+            "data: {\"id\":\"chatcmpl_read\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_read\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"file_path\\\":\\\"file\\\",\\\"offset\\\":2.300\"}}]}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_read\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"310976710655e+22,\\\"limit\\\":2000,\\\"pages\\\":\\\"\\\"}\"}}]}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_read\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        let events = collect_anthropic_events(input).await;
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter(|event| {
+                event_type(event) == Some("content_block_delta")
+                    && event.pointer("/delta/type").and_then(Value::as_str)
+                        == Some("input_json_delta")
+            })
+            .filter_map(|event| event.pointer("/delta/partial_json").and_then(Value::as_str))
+            .collect();
+
+        assert_eq!(deltas.len(), 1);
+        assert!(!deltas[0].contains("2.300310976710655e+22"));
+        let arguments: Value = serde_json::from_str(deltas[0]).unwrap();
+        assert!(arguments.get("offset").is_none());
+        assert!(arguments.get("pages").is_none());
+        assert_eq!(arguments["file_path"], "file");
+        assert_eq!(arguments["limit"], 2000);
     }
 
     #[tokio::test]

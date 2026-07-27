@@ -627,6 +627,7 @@ pub fn openai_to_anthropic(body: Value) -> Result<Value, ProxyError> {
                 .and_then(|a| a.as_str())
                 .unwrap_or("{}");
             let input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+            let input = super::tool_compat::sanitize_anthropic_tool_use_input(name, input);
 
             content.push(json!({
                 "type": "tool_use",
@@ -654,6 +655,7 @@ pub fn openai_to_anthropic(body: Value) -> Result<Value, ProxyError> {
                 Some(v @ Value::Object(_)) | Some(v @ Value::Array(_)) => v.clone(),
                 _ => json!({}),
             };
+            let input = super::tool_compat::sanitize_anthropic_tool_use_input(name, input);
 
             if !name.is_empty() || has_arguments {
                 content.push(json!({
@@ -1403,6 +1405,35 @@ mod tests {
             usage.dedup_request_id(None),
             "session:chatcmpl-claude-compatible"
         );
+    }
+
+    #[test]
+    fn test_openai_to_anthropic_drops_invalid_read_offset() {
+        let input = json!({
+            "id": "chatcmpl-read",
+            "model": "gpt-4",
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call_read",
+                        "type": "function",
+                        "function": {
+                            "name": "Read",
+                            "arguments": "{\"file_path\":\"file\",\"offset\":2.300310976710655e+22,\"limit\":2000,\"pages\":\"\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+
+        let result = openai_to_anthropic(input).unwrap();
+        let tool_input = &result["content"][0]["input"];
+
+        assert!(tool_input.get("offset").is_none());
+        assert!(tool_input.get("pages").is_none());
+        assert_eq!(tool_input["file_path"], "file");
+        assert_eq!(tool_input["limit"], 2000);
     }
 
     #[test]
