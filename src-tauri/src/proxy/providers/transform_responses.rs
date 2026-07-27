@@ -360,13 +360,16 @@ pub fn anthropic_to_responses(
             .iter()
             .filter(|t| t.get("type").and_then(|v| v.as_str()) != Some("BatchTool"))
             .map(|t| {
+                let name = t.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let schema = super::transform::clean_schema(
+                    t.get("input_schema").cloned().unwrap_or(json!({})),
+                );
+                let parameters = super::tool_compat::clean_anthropic_tool_schema(name, schema);
                 json!({
                     "type": "function",
-                    "name": t.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                    "name": name,
                     "description": t.get("description"),
-                    "parameters": super::transform::clean_schema(
-                        t.get("input_schema").cloned().unwrap_or(json!({}))
-                    )
+                    "parameters": parameters
                 })
             })
             .collect();
@@ -1123,6 +1126,44 @@ mod tests {
         );
         // input_schema should not appear
         assert!(result["tools"][0].get("input_schema").is_none());
+    }
+
+    #[test]
+    fn test_anthropic_to_responses_cleans_read_safe_integer_maximum() {
+        let input = json!({
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "Read the file"}],
+            "tools": [{
+                "name": "Read",
+                "input_schema": {
+                    "type": "object",
+                    "required": ["file_path"],
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "offset": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991_u64
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "exclusiveMinimum": 0,
+                            "maximum": 9007199254740991_u64
+                        },
+                        "pages": {"type": "string"}
+                    }
+                }
+            }]
+        });
+
+        let result = anthropic_to_responses(input, None, false, false).unwrap();
+        let schema = &result["tools"][0]["parameters"];
+        let offset = &schema["properties"]["offset"];
+
+        assert_eq!(offset["type"], "integer");
+        assert_eq!(offset["minimum"], 0);
+        assert!(offset.get("maximum").is_none());
+        assert!(schema["properties"]["limit"].get("maximum").is_none());
     }
 
     #[test]
