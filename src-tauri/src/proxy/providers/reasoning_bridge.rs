@@ -120,11 +120,9 @@ mod tests {
         assert_eq!(block["type"], "thinking");
         assert_eq!(block["thinking"], "");
         assert!(block.get("data").is_none());
-        assert!(
-            block["signature"]
-                .as_str()
-                .is_some_and(|value| value.starts_with(OPENAI_REASONING_ITEM_PREFIX))
-        );
+        assert!(block["signature"]
+            .as_str()
+            .is_some_and(|value| value.starts_with(OPENAI_REASONING_ITEM_PREFIX)));
         assert_eq!(
             openai_reasoning_item_from_anthropic_block(&block),
             Some(item)
