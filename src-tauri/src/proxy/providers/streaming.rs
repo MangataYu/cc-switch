@@ -2,6 +2,7 @@
 //!
 //! 实现 OpenAI SSE → Anthropic SSE 格式转换
 
+use crate::proxy::providers::read_trace::{ReadCallTrace, ReadTrace};
 use crate::proxy::providers::tool_compat::{
     sanitize_anthropic_tool_use_input_json_with_protection, ReadOffsetProtection,
 };
@@ -94,6 +95,7 @@ struct ToolBlockState {
     name: String,
     started: bool,
     pending_args: String,
+    read_trace_call: Option<ReadCallTrace>,
     /// 连续空白字符计数 — 用于检测 Copilot 无限换行 bug
     /// 当 function call 参数中的连续空白字符达到阈值时，强制终止流
     consecutive_whitespace: usize,
@@ -152,7 +154,7 @@ fn build_message_delta_event(stop_reason: Option<String>, usage_json: Option<Val
 pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
     stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
-    create_anthropic_sse_stream_with_read_offset_protection(stream, None)
+    create_anthropic_sse_stream_with_read_offset_protection_and_trace(stream, None, None)
 }
 
 pub(crate) fn create_anthropic_sse_stream_with_read_offset_protection<
@@ -160,6 +162,20 @@ pub(crate) fn create_anthropic_sse_stream_with_read_offset_protection<
 >(
     stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
     read_offset_protection: Option<ReadOffsetProtection>,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    create_anthropic_sse_stream_with_read_offset_protection_and_trace(
+        stream,
+        read_offset_protection,
+        None,
+    )
+}
+
+pub(crate) fn create_anthropic_sse_stream_with_read_offset_protection_and_trace<
+    E: std::error::Error + Send + 'static,
+>(
+    stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+    read_offset_protection: Option<ReadOffsetProtection>,
+    read_trace: Option<ReadTrace>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let mut buffer = String::new();
@@ -403,6 +419,7 @@ pub(crate) fn create_anthropic_sse_stream_with_read_offset_protection<
                                                                     name: String::new(),
                                                                     started: false,
                                                                     pending_args: String::new(),
+                                                                    read_trace_call: None,
                                                                     consecutive_whitespace: 0,
                                                                     aborted: false,
                                                                 }
@@ -442,6 +459,25 @@ pub(crate) fn create_anthropic_sse_stream_with_read_offset_protection<
                                                             .as_ref()
                                                             .and_then(|f| f.arguments.clone());
                                                         let immediate_delta = if let Some(args) = args_delta {
+                                                            if state.name == "Read" {
+                                                                if state.read_trace_call.is_none() {
+                                                                    state.read_trace_call =
+                                                                        read_trace.as_ref().map(ReadTrace::new_call);
+                                                                }
+                                                                if let (Some(trace), Some(call)) =
+                                                                    (read_trace.as_ref(), state.read_trace_call.as_ref())
+                                                                {
+                                                                    trace.upstream_fragment(
+                                                                        call,
+                                                                        "chat.tool_calls",
+                                                                        Some(tool_call.index),
+                                                                        None,
+                                                                        (!state.id.is_empty()).then_some(state.id.as_str()),
+                                                                        "Read",
+                                                                        &args,
+                                                                    );
+                                                                }
+                                                            }
                                                             // 无限空白 bug 检测：跟踪连续空白字符
                                                             for ch in args.chars() {
                                                                 if ch.is_whitespace() {
@@ -564,14 +600,43 @@ pub(crate) fn create_anthropic_sse_stream_with_read_offset_protection<
                                                         && !state.pending_args.is_empty()
                                                 })
                                                 .map(|state| {
-                                                    (
-                                                        state.anthropic_index,
-                                                        sanitize_anthropic_tool_use_input_json_with_protection(
+                                                    let raw = std::mem::take(&mut state.pending_args);
+                                                    let sanitized = sanitize_anthropic_tool_use_input_json_with_protection(
+                                                        "Read",
+                                                        &raw,
+                                                        read_offset_protection.as_ref(),
+                                                    );
+                                                    if state.read_trace_call.is_none() {
+                                                        state.read_trace_call = read_trace.as_ref().map(ReadTrace::new_call);
+                                                    }
+                                                    if let (Some(trace), Some(call)) =
+                                                        (read_trace.as_ref(), state.read_trace_call.as_ref())
+                                                    {
+                                                        trace.upstream_complete(
+                                                            call,
+                                                            "chat.finish_reason",
+                                                            None,
+                                                            None,
+                                                            (!state.id.is_empty()).then_some(state.id.as_str()),
                                                             "Read",
-                                                            &std::mem::take(&mut state.pending_args),
-                                                            read_offset_protection.as_ref(),
-                                                        ),
-                                                    )
+                                                            &raw,
+                                                            "aggregated_deltas",
+                                                        );
+                                                        let raw_offset = serde_json::from_str::<Value>(&raw)
+                                                            .ok()
+                                                            .and_then(|value| value.get("offset").cloned());
+                                                        let sanitized_offset = serde_json::from_str::<Value>(&sanitized)
+                                                            .ok()
+                                                            .and_then(|value| value.get("offset").cloned());
+                                                        trace.anthropic_emitted(
+                                                            call,
+                                                            &state.id,
+                                                            "Read",
+                                                            &serde_json::from_str(&sanitized).unwrap_or(Value::Null),
+                                                            raw_offset != sanitized_offset,
+                                                        );
+                                                    }
+                                                    (state.anthropic_index, sanitized)
                                                 })
                                                 .collect();
                                             completed_read_args.sort_unstable_by_key(|(index, _)| *index);

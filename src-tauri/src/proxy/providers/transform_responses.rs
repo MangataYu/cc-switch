@@ -8,6 +8,7 @@
 //! - system prompt 使用 `instructions` 字段而非 system role message
 //! - usage 字段命名与 Anthropic 一致 (input_tokens/output_tokens)
 
+use crate::proxy::providers::read_trace::ReadTrace;
 use crate::proxy::{
     error::ProxyError,
     json_canonical::canonical_json_string,
@@ -819,9 +820,29 @@ pub fn responses_to_anthropic(body: Value) -> Result<Value, ProxyError> {
     responses_to_anthropic_with_read_offset_protection(body, None)
 }
 
+pub(crate) fn responses_to_anthropic_with_read_offset_protection_and_trace(
+    body: Value,
+    read_offset_protection: Option<&super::tool_compat::ReadOffsetProtection>,
+    read_trace: Option<&ReadTrace>,
+) -> Result<Value, ProxyError> {
+    responses_to_anthropic_with_read_offset_protection_impl(
+        body,
+        read_offset_protection,
+        read_trace,
+    )
+}
+
 pub(crate) fn responses_to_anthropic_with_read_offset_protection(
     body: Value,
     read_offset_protection: Option<&super::tool_compat::ReadOffsetProtection>,
+) -> Result<Value, ProxyError> {
+    responses_to_anthropic_with_read_offset_protection_impl(body, read_offset_protection, None)
+}
+
+fn responses_to_anthropic_with_read_offset_protection_impl(
+    body: Value,
+    read_offset_protection: Option<&super::tool_compat::ReadOffsetProtection>,
+    read_trace: Option<&ReadTrace>,
 ) -> Result<Value, ProxyError> {
     // A Responses failure can arrive inside an HTTP 2xx response object. Reject it
     // before looking at `output`; otherwise `{status:"failed", output:[]}` becomes
@@ -905,11 +926,34 @@ pub(crate) fn responses_to_anthropic_with_read_offset_protection(
                         "Function call arguments for '{name}' must be a JSON object"
                     )));
                 }
+                let raw_offset = input.get("offset").cloned();
                 let input = super::tool_compat::sanitize_anthropic_tool_use_input_with_protection(
                     name,
                     input,
                     read_offset_protection,
                 );
+                if name == "Read" {
+                    if let Some(trace) = read_trace {
+                        let call = trace.new_call();
+                        trace.upstream_complete(
+                            &call,
+                            "responses.output.function_call",
+                            None,
+                            None,
+                            (!call_id.is_empty()).then_some(call_id),
+                            name,
+                            args_str,
+                            "json_arguments",
+                        );
+                        trace.anthropic_emitted(
+                            &call,
+                            call_id,
+                            name,
+                            &input,
+                            raw_offset != input.get("offset").cloned(),
+                        );
+                    }
+                }
 
                 content.push(json!({
                     "type": "tool_use",

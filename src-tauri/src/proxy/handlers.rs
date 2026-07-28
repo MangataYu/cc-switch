@@ -20,14 +20,15 @@ use super::{
         codex_chat_common::extract_reasoning_field_text,
         codex_chat_history::record_responses_sse_stream,
         get_adapter, get_claude_api_format,
-        streaming::create_anthropic_sse_stream_with_read_offset_protection,
+        read_trace::ReadTrace,
+        streaming::create_anthropic_sse_stream_with_read_offset_protection_and_trace,
         streaming_codex_anthropic::{
             create_responses_sse_stream_from_anthropic_with_context,
             responses_sse_events_from_anthropic_message,
         },
         streaming_codex_chat::create_responses_sse_stream_from_chat_with_context,
         streaming_gemini::create_anthropic_sse_stream_from_gemini,
-        streaming_responses::create_anthropic_sse_stream_from_responses_with_read_offset_protection,
+        streaming_responses::create_anthropic_sse_stream_from_responses_with_read_offset_protection_and_trace,
         transform, transform_codex_anthropic, transform_codex_chat,
         transform_codex_responses_namespace, transform_gemini, transform_responses,
     },
@@ -400,6 +401,11 @@ async fn handle_claude_transform(
             is_codex_oauth,
         )
     };
+    let read_trace = match api_format {
+        "openai_chat" => ReadTrace::from_env(ctx.read_trace_id.clone(), "openai_chat"),
+        "openai_responses" => ReadTrace::from_env(ctx.read_trace_id.clone(), "openai_responses"),
+        _ => None,
+    };
     let read_offset_protection = (api_format == "openai_chat" || api_format == "openai_responses")
         .then(|| {
             crate::proxy::providers::tool_compat::ReadOffsetProtection::from_anthropic_request(
@@ -416,9 +422,10 @@ async fn handle_claude_transform(
             dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin,
         > = if api_format == "openai_responses" {
             Box::new(Box::pin(
-                create_anthropic_sse_stream_from_responses_with_read_offset_protection(
+                create_anthropic_sse_stream_from_responses_with_read_offset_protection_and_trace(
                     stream,
                     read_offset_protection.clone(),
+                    read_trace.clone(),
                 ),
             ))
         } else if api_format == "gemini_native" {
@@ -431,9 +438,10 @@ async fn handle_claude_transform(
             )))
         } else {
             Box::new(Box::pin(
-                create_anthropic_sse_stream_with_read_offset_protection(
+                create_anthropic_sse_stream_with_read_offset_protection_and_trace(
                     stream,
                     read_offset_protection.clone(),
+                    read_trace.clone(),
                 ),
             ))
         };
@@ -594,9 +602,10 @@ async fn handle_claude_transform(
 
     // 根据 api_format 选择非流式转换器
     let transform_result = if api_format == "openai_responses" {
-        transform_responses::responses_to_anthropic_with_read_offset_protection(
+        transform_responses::responses_to_anthropic_with_read_offset_protection_and_trace(
             upstream_response,
             read_offset_protection.as_ref(),
+            read_trace.as_ref(),
         )
     } else if api_format == "gemini_native" {
         transform_gemini::gemini_to_anthropic_with_shadow_and_hints(
@@ -607,9 +616,10 @@ async fn handle_claude_transform(
             tool_schema_hints.as_ref(),
         )
     } else {
-        transform::openai_to_anthropic_with_read_offset_protection(
+        transform::openai_to_anthropic_with_read_offset_protection_and_trace(
             upstream_response,
             read_offset_protection.as_ref(),
+            read_trace.as_ref(),
         )
     };
     let anthropic_response = match transform_result {

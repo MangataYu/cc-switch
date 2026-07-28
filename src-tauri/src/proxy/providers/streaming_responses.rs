@@ -8,13 +8,14 @@
 //!
 //! 与 Chat Completions 的 delta chunk 模型完全不同，需要独立的状态机处理。
 
+use super::read_trace::{ReadCallTrace, ReadTrace};
 use super::reasoning_bridge::anthropic_block_from_openai_reasoning_item;
 use super::tool_compat::{
     sanitize_anthropic_tool_use_input_json_with_protection, ReadOffsetProtection,
 };
 use super::transform_responses::{
     build_anthropic_usage_from_responses, map_responses_stop_reason,
-    responses_to_anthropic_with_read_offset_protection,
+    responses_to_anthropic_with_read_offset_protection_and_trace,
 };
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use bytes::Bytes;
@@ -69,17 +70,21 @@ fn anthropic_error_sse(message: &str, error_type: &str) -> Bytes {
 fn responses_json_to_anthropic_sse(
     body: Value,
     read_offset_protection: Option<&ReadOffsetProtection>,
+    read_trace: Option<&ReadTrace>,
 ) -> Vec<Bytes> {
-    let message =
-        match responses_to_anthropic_with_read_offset_protection(body, read_offset_protection) {
-            Ok(message) => message,
-            Err(error) => {
-                return vec![anthropic_error_sse(
-                    &error.to_string(),
-                    "response_transform_error",
-                )]
-            }
-        };
+    let message = match responses_to_anthropic_with_read_offset_protection_and_trace(
+        body,
+        read_offset_protection,
+        read_trace,
+    ) {
+        Ok(message) => message,
+        Err(error) => {
+            return vec![anthropic_error_sse(
+                &error.to_string(),
+                "response_transform_error",
+            )]
+        }
+    };
 
     let usage = message.get("usage").cloned().unwrap_or_else(|| json!({}));
     let mut start_usage = usage.clone();
@@ -300,7 +305,9 @@ fn resolve_content_index(
 pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 'static>(
     stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
-    create_anthropic_sse_stream_from_responses_with_read_offset_protection(stream, None)
+    create_anthropic_sse_stream_from_responses_with_read_offset_protection_and_trace(
+        stream, None, None,
+    )
 }
 
 pub(crate) fn create_anthropic_sse_stream_from_responses_with_read_offset_protection<
@@ -308,6 +315,20 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_read_offset_protec
 >(
     stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
     read_offset_protection: Option<ReadOffsetProtection>,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    create_anthropic_sse_stream_from_responses_with_read_offset_protection_and_trace(
+        stream,
+        read_offset_protection,
+        None,
+    )
+}
+
+pub(crate) fn create_anthropic_sse_stream_from_responses_with_read_offset_protection_and_trace<
+    E: std::error::Error + Send + 'static,
+>(
+    stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+    read_offset_protection: Option<ReadOffsetProtection>,
+    read_trace: Option<ReadTrace>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let mut buffer = String::new();
@@ -325,6 +346,8 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_read_offset_protec
         let mut tool_name_by_index: HashMap<u32, String> = HashMap::new();
         let mut tool_args_by_index: HashMap<u32, String> = HashMap::new();
         let mut tool_had_delta: HashSet<u32> = HashSet::new();
+        let mut tool_trace_by_index: HashMap<u32, ReadCallTrace> = HashMap::new();
+        let mut tool_call_id_by_index: HashMap<u32, String> = HashMap::new();
         let mut last_tool_index: Option<u32> = None;
         let mut reasoning_index_by_item_id: HashMap<String, u32> = HashMap::new();
         let mut reasoning_item_by_index: HashMap<u32, Value> = HashMap::new();
@@ -367,6 +390,7 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_read_offset_protec
                                 for event in responses_json_to_anthropic_sse(
                                     body,
                                     read_offset_protection.as_ref(),
+                                    read_trace.as_ref(),
                                 ) {
                                     yield Ok(event);
                                 }
@@ -726,6 +750,9 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_read_offset_protec
                                             tool_index_by_item_id.insert(item_id.to_string(), index);
                                         }
                                         tool_name_by_index.insert(index, name.to_string());
+                                        if !call_id.is_empty() {
+                                            tool_call_id_by_index.insert(index, call_id.to_string());
+                                        }
                                         last_tool_index = Some(index);
 
                                         if open_indices.contains(&index) {
@@ -856,6 +883,27 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_read_offset_protec
                                     tool_had_delta.insert(index);
 
                                     if tool_name_by_index.get(&index).map(String::as_str) == Some("Read") {
+                                        if let Some(trace) = read_trace.as_ref() {
+                                            let call = tool_trace_by_index
+                                                .entry(index)
+                                                .or_insert_with(|| trace.new_call());
+                                            trace.upstream_fragment(
+                                                call,
+                                                event_name,
+                                                None,
+                                                data.get("output_index").and_then(Value::as_u64),
+                                                tool_call_id_by_index
+                                                    .get(&index)
+                                                    .map(String::as_str)
+                                                    .or_else(|| data.get("call_id").and_then(Value::as_str))
+                                                    .or(item_id),
+                                                "Read",
+                                                delta,
+                                            );
+                                        }
+                                    }
+
+                                    if tool_name_by_index.get(&index).map(String::as_str) == Some("Read") {
                                         continue;
                                     }
 
@@ -911,6 +959,45 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_read_offset_protec
                                                 &raw,
                                                 read_offset_protection.as_ref(),
                                             );
+                                        if let Some(trace) = read_trace.as_ref() {
+                                            let call = tool_trace_by_index
+                                                .entry(index)
+                                                .or_insert_with(|| trace.new_call());
+                                            trace.upstream_complete(
+                                                call,
+                                                event_name,
+                                                None,
+                                                data.get("output_index").and_then(Value::as_u64),
+                                                tool_call_id_by_index
+                                                    .get(&index)
+                                                    .map(String::as_str)
+                                                    .or(item_id),
+                                                "Read",
+                                                &raw,
+                                                if data.get("arguments").is_some()
+                                                    || data.pointer("/item/arguments").is_some()
+                                                {
+                                                    "done_arguments"
+                                                } else {
+                                                    "delta_buffer"
+                                                },
+                                            );
+                                            let raw_offset = serde_json::from_str::<Value>(&raw)
+                                                .ok()
+                                                .and_then(|value| value.get("offset").cloned());
+                                            let sanitized_value = serde_json::from_str::<Value>(&sanitized)
+                                                .unwrap_or(Value::Null);
+                                            trace.anthropic_emitted(
+                                                call,
+                                                tool_call_id_by_index
+                                                    .get(&index)
+                                                    .map(String::as_str)
+                                                    .unwrap_or_default(),
+                                                "Read",
+                                                &sanitized_value,
+                                                raw_offset != sanitized_value.get("offset").cloned(),
+                                            );
+                                        }
                                         if !sanitized.is_empty() {
                                             let event = json!({
                                                 "type": "content_block_delta",
@@ -959,6 +1046,8 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_read_offset_protec
                                     tool_name_by_index.remove(&index);
                                     tool_args_by_index.remove(&index);
                                     tool_had_delta.remove(&index);
+                                    tool_trace_by_index.remove(&index);
+                                    tool_call_id_by_index.remove(&index);
                                 }
                             }
 
@@ -1348,11 +1437,49 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_read_offset_protec
                                                             .unwrap_or_default()
                                                     });
                                                 let arguments = if name == "Read" {
-                                                    sanitize_anthropic_tool_use_input_json_with_protection(
+                                                    let sanitized = sanitize_anthropic_tool_use_input_json_with_protection(
                                                         name,
                                                         &raw,
                                                         read_offset_protection.as_ref(),
-                                                    )
+                                                    );
+                                                    if let Some(trace) = read_trace.as_ref() {
+                                                        let call = tool_trace_by_index
+                                                            .entry(index)
+                                                            .or_insert_with(|| trace.new_call());
+                                                        trace.upstream_complete(
+                                                            call,
+                                                            event_name,
+                                                            None,
+                                                            data.get("output_index").and_then(Value::as_u64),
+                                                            tool_call_id_by_index
+                                                                .get(&index)
+                                                                .map(String::as_str)
+                                                                .or(item_id),
+                                                            "Read",
+                                                            &raw,
+                                                            if item.get("arguments").is_some() {
+                                                                "output_item_arguments"
+                                                            } else {
+                                                                "delta_buffer"
+                                                            },
+                                                        );
+                                                        let raw_offset = serde_json::from_str::<Value>(&raw)
+                                                            .ok()
+                                                            .and_then(|value| value.get("offset").cloned());
+                                                        let sanitized_value = serde_json::from_str::<Value>(&sanitized)
+                                                            .unwrap_or(Value::Null);
+                                                        trace.anthropic_emitted(
+                                                            call,
+                                                            tool_call_id_by_index
+                                                                .get(&index)
+                                                                .map(String::as_str)
+                                                                .unwrap_or_default(),
+                                                            "Read",
+                                                            &sanitized_value,
+                                                            raw_offset != sanitized_value.get("offset").cloned(),
+                                                        );
+                                                    }
+                                                    sanitized
                                                 } else {
                                                     raw
                                                 };

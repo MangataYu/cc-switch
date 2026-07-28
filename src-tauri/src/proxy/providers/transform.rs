@@ -3,6 +3,7 @@
 //! 实现 Anthropic ↔ OpenAI 格式转换，用于 OpenRouter 支持
 //! 参考: anthropic-proxy-rs
 
+use crate::proxy::providers::read_trace::ReadTrace;
 use crate::proxy::{
     error::ProxyError,
     json_canonical::canonical_json_string,
@@ -556,9 +557,25 @@ pub fn openai_to_anthropic(body: Value) -> Result<Value, ProxyError> {
     openai_to_anthropic_with_read_offset_protection(body, None)
 }
 
+pub(crate) fn openai_to_anthropic_with_read_offset_protection_and_trace(
+    body: Value,
+    read_offset_protection: Option<&super::tool_compat::ReadOffsetProtection>,
+    read_trace: Option<&ReadTrace>,
+) -> Result<Value, ProxyError> {
+    openai_to_anthropic_with_read_offset_protection_impl(body, read_offset_protection, read_trace)
+}
+
 pub(crate) fn openai_to_anthropic_with_read_offset_protection(
     body: Value,
     read_offset_protection: Option<&super::tool_compat::ReadOffsetProtection>,
+) -> Result<Value, ProxyError> {
+    openai_to_anthropic_with_read_offset_protection_impl(body, read_offset_protection, None)
+}
+
+fn openai_to_anthropic_with_read_offset_protection_impl(
+    body: Value,
+    read_offset_protection: Option<&super::tool_compat::ReadOffsetProtection>,
+    read_trace: Option<&ReadTrace>,
 ) -> Result<Value, ProxyError> {
     let choices = body
         .get("choices")
@@ -634,11 +651,34 @@ pub(crate) fn openai_to_anthropic_with_read_offset_protection(
                 .and_then(|a| a.as_str())
                 .unwrap_or("{}");
             let input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+            let raw_offset = input.get("offset").cloned();
             let input = super::tool_compat::sanitize_anthropic_tool_use_input_with_protection(
                 name,
                 input,
                 read_offset_protection,
             );
+            if name == "Read" {
+                if let Some(trace) = read_trace {
+                    let call = trace.new_call();
+                    trace.upstream_complete(
+                        &call,
+                        "chat.completion",
+                        None,
+                        None,
+                        (!id.is_empty()).then_some(id),
+                        name,
+                        args_str,
+                        "json_arguments",
+                    );
+                    trace.anthropic_emitted(
+                        &call,
+                        id,
+                        name,
+                        &input,
+                        raw_offset != input.get("offset").cloned(),
+                    );
+                }
+            }
 
             content.push(json!({
                 "type": "tool_use",
@@ -666,11 +706,47 @@ pub(crate) fn openai_to_anthropic_with_read_offset_protection(
                 Some(v @ Value::Object(_)) | Some(v @ Value::Array(_)) => v.clone(),
                 _ => json!({}),
             };
+            let raw_offset = input.get("offset").cloned();
             let input = super::tool_compat::sanitize_anthropic_tool_use_input_with_protection(
                 name,
                 input,
                 read_offset_protection,
             );
+            if name == "Read" {
+                if let Some(trace) = read_trace {
+                    let call = trace.new_call();
+                    let raw_arguments = function_call
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| {
+                            function_call
+                                .get("arguments")
+                                .map(serde_json::to_string)
+                                .transpose()
+                                .ok()
+                                .flatten()
+                        })
+                        .unwrap_or_else(|| "{}".to_string());
+                    trace.upstream_complete(
+                        &call,
+                        "chat.function_call",
+                        None,
+                        None,
+                        (!id.is_empty()).then_some(id),
+                        name,
+                        &raw_arguments,
+                        "json_arguments",
+                    );
+                    trace.anthropic_emitted(
+                        &call,
+                        id,
+                        name,
+                        &input,
+                        raw_offset != input.get("offset").cloned(),
+                    );
+                }
+            }
 
             if !name.is_empty() || has_arguments {
                 content.push(json!({
