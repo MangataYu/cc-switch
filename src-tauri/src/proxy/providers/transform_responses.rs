@@ -252,8 +252,6 @@ fn responses_image_from_chat_media(part: &Value) -> Option<Value> {
     Some(image)
 }
 
-pub(crate) use super::tool_compat::sanitize_anthropic_tool_use_input;
-
 /// Anthropic 请求 → OpenAI Responses 请求
 ///
 /// `cache_key`: optional prompt_cache_key to inject for improved cache routing
@@ -818,6 +816,13 @@ fn convert_messages_to_input(messages: &[Value]) -> Result<Vec<Value>, ProxyErro
 
 /// OpenAI Responses 响应 → Anthropic 响应
 pub fn responses_to_anthropic(body: Value) -> Result<Value, ProxyError> {
+    responses_to_anthropic_with_read_offset_protection(body, None)
+}
+
+pub(crate) fn responses_to_anthropic_with_read_offset_protection(
+    body: Value,
+    read_offset_protection: Option<&super::tool_compat::ReadOffsetProtection>,
+) -> Result<Value, ProxyError> {
     // A Responses failure can arrive inside an HTTP 2xx response object. Reject it
     // before looking at `output`; otherwise `{status:"failed", output:[]}` becomes
     // a successful empty Anthropic `end_turn` and hides the upstream error.
@@ -900,7 +905,11 @@ pub fn responses_to_anthropic(body: Value) -> Result<Value, ProxyError> {
                         "Function call arguments for '{name}' must be a JSON object"
                     )));
                 }
-                let input = sanitize_anthropic_tool_use_input(name, input);
+                let input = super::tool_compat::sanitize_anthropic_tool_use_input_with_protection(
+                    name,
+                    input,
+                    read_offset_protection,
+                );
 
                 content.push(json!({
                     "type": "tool_use",
@@ -1447,6 +1456,32 @@ mod tests {
     }
 
     #[test]
+    fn test_responses_to_anthropic_removes_known_past_eof_read_offset() {
+        let request = json!({
+            "messages": [
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "past-read", "name": "Read", "input": {"file_path": "file", "offset": 25000}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "past-read", "content": "Warning: the file exists but is shorter than the provided offset (25000). The file has 2494 lines."}]}
+            ]
+        });
+        let protection =
+            super::super::tool_compat::ReadOffsetProtection::from_anthropic_request(&request);
+        let response = json!({
+            "id": "resp_read",
+            "status": "completed",
+            "model": "gpt-4o",
+            "output": [{"type": "function_call", "call_id": "new-read", "name": "Read", "arguments": "{\"file_path\":\"file\",\"offset\":2495,\"limit\":2000}"}]
+        });
+
+        let result =
+            responses_to_anthropic_with_read_offset_protection(response, Some(&protection))
+                .unwrap();
+        let tool_input = &result["content"][0]["input"];
+        assert!(tool_input.get("offset").is_none());
+        assert_eq!(tool_input["file_path"], "file");
+        assert_eq!(tool_input["limit"], 2000);
+    }
+
+    #[test]
     fn test_responses_to_anthropic_drops_invalid_read_offset() {
         let input = json!({
             "id": "resp_read",
@@ -1679,11 +1714,9 @@ mod tests {
         let anthropic = responses_to_anthropic(response).unwrap();
         let thinking = anthropic["content"][0].clone();
         assert_eq!(thinking["type"], "thinking");
-        assert!(
-            thinking["signature"]
-                .as_str()
-                .is_some_and(|value| value.starts_with("ccswitch-openai-reasoning-v1:"))
-        );
+        assert!(thinking["signature"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("ccswitch-openai-reasoning-v1:")));
 
         let replay = anthropic_to_responses(
             json!({
@@ -1724,11 +1757,9 @@ mod tests {
         assert_eq!(thinking["type"], "thinking");
         assert_eq!(thinking["thinking"], "");
         assert!(thinking.get("data").is_none());
-        assert!(
-            thinking["signature"]
-                .as_str()
-                .is_some_and(|value| value.starts_with("ccswitch-openai-reasoning-v1:"))
-        );
+        assert!(thinking["signature"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("ccswitch-openai-reasoning-v1:")));
 
         let replay = anthropic_to_responses(
             json!({
@@ -1907,11 +1938,9 @@ mod tests {
         });
 
         let result = anthropic_to_responses(input, None, false, false).unwrap();
-        assert!(
-            result["input"][0]["content"][0]
-                .get("cache_control")
-                .is_none()
-        );
+        assert!(result["input"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
     }
 
     #[test]
@@ -2124,17 +2153,13 @@ mod tests {
             .expect("include should be array");
 
         // 原有项必须保留
-        assert!(
-            includes
-                .iter()
-                .any(|v| v.as_str() == Some("something.else"))
-        );
+        assert!(includes
+            .iter()
+            .any(|v| v.as_str() == Some("something.else")));
         // marker 必须存在
-        assert!(
-            includes
-                .iter()
-                .any(|v| v.as_str() == Some("reasoning.encrypted_content"))
-        );
+        assert!(includes
+            .iter()
+            .any(|v| v.as_str() == Some("reasoning.encrypted_content")));
         // 不重复：marker 只出现一次
         let marker_count = includes
             .iter()

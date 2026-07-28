@@ -1,8 +1,119 @@
+use std::collections::HashMap;
+
 use serde_json::Value;
 
 const JSON_SAFE_INTEGER_MAX: u64 = 9_007_199_254_740_991;
 const READ_OFFSET_MAX: u64 = 1_000_000_000;
 const READ_OFFSET_GUIDANCE: &str = "Use 0 or omit this field for the first read. Only advance it using the line range returned by a previous Read call; do not guess it from file size.";
+const SHORT_FILE_WARNING_PREFIX: &str =
+    "Warning: the file exists but is shorter than the provided offset (";
+const SHORT_FILE_WARNING_MIDDLE: &str = "). The file has ";
+const SHORT_FILE_WARNING_SUFFIX: &str = " lines.";
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ReadOffsetProtection {
+    total_lines_by_path: HashMap<String, u64>,
+}
+
+impl ReadOffsetProtection {
+    pub(crate) fn from_anthropic_request(body: &Value) -> Self {
+        let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+            return Self::default();
+        };
+        let Some([assistant, user]) = messages.windows(2).last() else {
+            return Self::default();
+        };
+        if assistant.get("role").and_then(Value::as_str) != Some("assistant")
+            || user.get("role").and_then(Value::as_str) != Some("user")
+        {
+            return Self::default();
+        }
+
+        let mut reads_by_id = HashMap::new();
+        for block in content_blocks(assistant) {
+            let Some((id, path, offset)) = read_tool_use(block) else {
+                continue;
+            };
+            reads_by_id.insert(id, (path, offset));
+        }
+
+        let mut total_lines_by_path: HashMap<String, u64> = HashMap::new();
+        for block in content_blocks(user) {
+            if block.get("type").and_then(Value::as_str) != Some("tool_result")
+                || block.get("is_error").and_then(Value::as_bool) == Some(true)
+            {
+                continue;
+            }
+            let Some(tool_use_id) = block.get("tool_use_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some((path, requested_offset)) = reads_by_id.get(tool_use_id) else {
+                continue;
+            };
+            let Some((warning_offset, total_lines)) = short_file_warning_from_result(block) else {
+                continue;
+            };
+            if warning_offset != *requested_offset || warning_offset <= total_lines {
+                continue;
+            }
+
+            total_lines_by_path
+                .entry(path.clone())
+                .and_modify(|known_total| *known_total = (*known_total).min(total_lines))
+                .or_insert(total_lines);
+        }
+
+        Self {
+            total_lines_by_path,
+        }
+    }
+
+    fn total_lines_for(&self, path: &str) -> Option<u64> {
+        self.total_lines_by_path.get(path).copied()
+    }
+}
+
+fn content_blocks(message: &Value) -> Vec<&Value> {
+    message
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|blocks| blocks.iter().collect())
+        .unwrap_or_default()
+}
+
+fn read_tool_use(block: &Value) -> Option<(String, String, u64)> {
+    if block.get("type").and_then(Value::as_str) != Some("tool_use")
+        || block.get("name").and_then(Value::as_str) != Some("Read")
+    {
+        return None;
+    }
+
+    let id = block.get("id").and_then(Value::as_str)?;
+    let input = block.get("input")?;
+    let path = input.get("file_path").and_then(Value::as_str)?;
+    let offset = input.get("offset").and_then(Value::as_u64)?;
+    Some((id.to_string(), path.to_string(), offset))
+}
+
+fn short_file_warning_from_result(block: &Value) -> Option<(u64, u64)> {
+    match block.get("content") {
+        Some(Value::String(content)) => parse_short_file_warning(content),
+        Some(Value::Array(blocks)) => blocks.iter().find_map(|block| {
+            (block.get("type").and_then(Value::as_str) == Some("text"))
+                .then(|| block.get("text").and_then(Value::as_str))
+                .flatten()
+                .and_then(parse_short_file_warning)
+        }),
+        _ => None,
+    }
+}
+
+fn parse_short_file_warning(content: &str) -> Option<(u64, u64)> {
+    let offset = content.strip_prefix(SHORT_FILE_WARNING_PREFIX)?;
+    let (offset, total_lines) = offset.split_once(SHORT_FILE_WARNING_MIDDLE)?;
+    let total_lines = total_lines.strip_suffix(SHORT_FILE_WARNING_SUFFIX)?;
+    Some((offset.parse().ok()?, total_lines.parse().ok()?))
+}
 
 pub(crate) fn clean_anthropic_tool_schema(name: &str, mut schema: Value) -> Value {
     if name != "Read" {
@@ -68,6 +179,14 @@ pub(crate) fn clean_anthropic_tool_schema(name: &str, mut schema: Value) -> Valu
 }
 
 pub(crate) fn sanitize_anthropic_tool_use_input(name: &str, input: Value) -> Value {
+    sanitize_anthropic_tool_use_input_with_protection(name, input, None)
+}
+
+pub(crate) fn sanitize_anthropic_tool_use_input_with_protection(
+    name: &str,
+    input: Value,
+    protection: Option<&ReadOffsetProtection>,
+) -> Value {
     if name != "Read" {
         return input;
     }
@@ -99,10 +218,34 @@ pub(crate) fn sanitize_anthropic_tool_use_input(name: &str, input: Value) -> Val
         }
     }
 
+    let generated_path = object.get("file_path").and_then(Value::as_str);
+    let generated_offset = object.get("offset").and_then(Value::as_u64);
+    if let (Some(protection), Some(path), Some(offset)) =
+        (protection, generated_path, generated_offset)
+    {
+        if protection
+            .total_lines_for(path)
+            .is_some_and(|total_lines| offset > total_lines)
+        {
+            log::warn!(
+                "[Tool compatibility] Removed Read offset known to exceed prior file length"
+            );
+            object.remove("offset");
+        }
+    }
+
     Value::Object(object)
 }
 
 pub(crate) fn sanitize_anthropic_tool_use_input_json(name: &str, raw: &str) -> String {
+    sanitize_anthropic_tool_use_input_json_with_protection(name, raw, None)
+}
+
+pub(crate) fn sanitize_anthropic_tool_use_input_json_with_protection(
+    name: &str,
+    raw: &str,
+    protection: Option<&ReadOffsetProtection>,
+) -> String {
     if name != "Read" || raw.is_empty() {
         return raw.to_string();
     }
@@ -111,14 +254,35 @@ pub(crate) fn sanitize_anthropic_tool_use_input_json(name: &str, raw: &str) -> S
         return raw.to_string();
     };
 
-    serde_json::to_string(&sanitize_anthropic_tool_use_input(name, input))
-        .unwrap_or_else(|_| raw.to_string())
+    serde_json::to_string(&sanitize_anthropic_tool_use_input_with_protection(
+        name, input, protection,
+    ))
+    .unwrap_or_else(|_| raw.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    const SHORT_FILE_WARNING: &str = "Warning: the file exists but is shorter than the provided offset (25000). The file has 2494 lines.";
+
+    fn request_with_last_exchange(tool_result: Value) -> Value {
+        json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "read-1",
+                        "name": "Read",
+                        "input": {"file_path": "C:\\repo\\file.rs", "offset": 25000}
+                    }]
+                },
+                {"role": "user", "content": [tool_result]}
+            ]
+        })
+    }
 
     #[test]
     fn read_schema_drops_only_generic_safe_integer_maximum() {
@@ -203,6 +367,78 @@ mod tests {
         });
 
         assert_eq!(clean_anthropic_tool_schema("Read", schema.clone()), schema);
+    }
+
+    #[test]
+    fn read_offset_protection_only_uses_matching_latest_exchange() {
+        let protection =
+            ReadOffsetProtection::from_anthropic_request(&request_with_last_exchange(json!({
+                "type": "tool_result",
+                "tool_use_id": "read-1",
+                "content": SHORT_FILE_WARNING
+            })));
+
+        let rejected = sanitize_anthropic_tool_use_input_with_protection(
+            "Read",
+            json!({"file_path": "C:\\repo\\file.rs", "offset": 2495, "limit": 50}),
+            Some(&protection),
+        );
+        assert!(rejected.get("offset").is_none());
+        assert_eq!(rejected["limit"], 50);
+
+        let boundary = sanitize_anthropic_tool_use_input_with_protection(
+            "Read",
+            json!({"file_path": "C:\\repo\\file.rs", "offset": 2494}),
+            Some(&protection),
+        );
+        assert_eq!(boundary["offset"], 2494);
+
+        let other_path = sanitize_anthropic_tool_use_input_with_protection(
+            "Read",
+            json!({"file_path": "C:/repo/file.rs", "offset": 2495}),
+            Some(&protection),
+        );
+        assert_eq!(other_path["offset"], 2495);
+    }
+
+    #[test]
+    fn read_offset_protection_rejects_unmatched_or_invalid_history() {
+        for result in [
+            json!({"type": "tool_result", "tool_use_id": "other", "content": SHORT_FILE_WARNING}),
+            json!({"type": "tool_result", "tool_use_id": "read-1", "is_error": true, "content": SHORT_FILE_WARNING}),
+            json!({"type": "tool_result", "tool_use_id": "read-1", "content": "Warning: the file exists but is shorter than the provided offset (25000). The file has 2494 lines!"}),
+            json!({"type": "tool_result", "tool_use_id": "read-1", "content": "Warning: the file exists but is shorter than the provided offset (24999).\nThe file has 2494 lines."}),
+        ] {
+            let protection =
+                ReadOffsetProtection::from_anthropic_request(&request_with_last_exchange(result));
+            let cleaned = sanitize_anthropic_tool_use_input_with_protection(
+                "Read",
+                json!({"file_path": "C:\\repo\\file.rs", "offset": 2495}),
+                Some(&protection),
+            );
+            assert_eq!(cleaned["offset"], 2495);
+        }
+    }
+
+    #[test]
+    fn read_offset_protection_does_not_fall_back_to_older_exchanges() {
+        let mut request = request_with_last_exchange(json!({
+            "type": "tool_result",
+            "tool_use_id": "read-1",
+            "content": SHORT_FILE_WARNING
+        }));
+        request["messages"].as_array_mut().unwrap().extend([
+            json!({"role": "assistant", "content": []}),
+            json!({"role": "user", "content": []}),
+        ]);
+
+        let protection = ReadOffsetProtection::from_anthropic_request(&request);
+        let cleaned = sanitize_anthropic_tool_use_input_with_protection(
+            "Read",
+            json!({"file_path": "C:\\repo\\file.rs", "offset": 2495}),
+            Some(&protection),
+        );
+        assert_eq!(cleaned["offset"], 2495);
     }
 
     #[test]

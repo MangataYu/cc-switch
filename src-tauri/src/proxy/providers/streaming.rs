@@ -2,7 +2,9 @@
 //!
 //! 实现 OpenAI SSE → Anthropic SSE 格式转换
 
-use crate::proxy::providers::tool_compat::sanitize_anthropic_tool_use_input_json;
+use crate::proxy::providers::tool_compat::{
+    sanitize_anthropic_tool_use_input_json_with_protection, ReadOffsetProtection,
+};
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
@@ -149,6 +151,15 @@ fn build_message_delta_event(stop_reason: Option<String>, usage_json: Option<Val
 /// 创建 Anthropic SSE 流
 pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
     stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    create_anthropic_sse_stream_with_read_offset_protection(stream, None)
+}
+
+pub(crate) fn create_anthropic_sse_stream_with_read_offset_protection<
+    E: std::error::Error + Send + 'static,
+>(
+    stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+    read_offset_protection: Option<ReadOffsetProtection>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let mut buffer = String::new();
@@ -555,9 +566,10 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                                 .map(|state| {
                                                     (
                                                         state.anthropic_index,
-                                                        sanitize_anthropic_tool_use_input_json(
+                                                        sanitize_anthropic_tool_use_input_json_with_protection(
                                                             "Read",
                                                             &std::mem::take(&mut state.pending_args),
+                                                            read_offset_protection.as_ref(),
                                                         ),
                                                     )
                                                 })
@@ -603,7 +615,11 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                                 state.started = true;
                                                 let pending = std::mem::take(&mut state.pending_args);
                                                 let pending = if fallback_name == "Read" {
-                                                    sanitize_anthropic_tool_use_input_json("Read", &pending)
+                                                    sanitize_anthropic_tool_use_input_json_with_protection(
+                                                        "Read",
+                                                        &pending,
+                                                        read_offset_protection.as_ref(),
+                                                    )
                                                 } else {
                                                     pending
                                                 };
@@ -801,6 +817,55 @@ mod tests {
             map_stop_reason(Some("content_filter")),
             Some("end_turn".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_removes_known_past_eof_read_offset() {
+        let request = json!({
+            "messages": [
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "past-read", "name": "Read", "input": {"file_path": "file", "offset": 25000}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "past-read", "content": "Warning: the file exists but is shorter than the provided offset (25000). The file has 2494 lines."}]}
+            ]
+        });
+        let protection = ReadOffsetProtection::from_anthropic_request(&request);
+        let input = concat!(
+            "data: {\"id\":\"chatcmpl_read\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"new-read\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"file_path\\\":\\\"file\\\",\\\"offset\\\":2495,\\\"limit\\\":2000}\"}}]}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_read\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let upstream = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(
+            input.as_bytes().to_vec(),
+        ))]);
+        let merged =
+            create_anthropic_sse_stream_with_read_offset_protection(upstream, Some(protection))
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .map(|chunk| String::from_utf8_lossy(chunk.unwrap().as_ref()).to_string())
+                .collect::<String>();
+        let partial_json = merged
+            .split("\n\n")
+            .filter_map(|block| {
+                block
+                    .lines()
+                    .find_map(|line| strip_sse_field(line, "data"))
+                    .and_then(|data| serde_json::from_str::<Value>(data).ok())
+            })
+            .find_map(|event| {
+                (event.pointer("/delta/type").and_then(Value::as_str) == Some("input_json_delta"))
+                    .then(|| {
+                        event
+                            .pointer("/delta/partial_json")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .flatten()
+            })
+            .expect("Read partial_json delta");
+        let arguments: Value = serde_json::from_str(&partial_json).unwrap();
+        assert!(arguments.get("offset").is_none());
+        assert_eq!(arguments["file_path"], "file");
+        assert_eq!(arguments["limit"], 2000);
     }
 
     #[tokio::test]

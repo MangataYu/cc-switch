@@ -9,9 +9,12 @@
 //! 与 Chat Completions 的 delta chunk 模型完全不同，需要独立的状态机处理。
 
 use super::reasoning_bridge::anthropic_block_from_openai_reasoning_item;
-use super::tool_compat::sanitize_anthropic_tool_use_input_json;
+use super::tool_compat::{
+    sanitize_anthropic_tool_use_input_json_with_protection, ReadOffsetProtection,
+};
 use super::transform_responses::{
-    build_anthropic_usage_from_responses, map_responses_stop_reason, responses_to_anthropic,
+    build_anthropic_usage_from_responses, map_responses_stop_reason,
+    responses_to_anthropic_with_read_offset_protection,
 };
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use bytes::Bytes;
@@ -63,16 +66,20 @@ fn anthropic_error_sse(message: &str, error_type: &str) -> Bytes {
 /// Convert a compatible gateway's non-streaming Responses JSON into a complete
 /// Anthropic SSE lifecycle. This is used when the client requested streaming but
 /// the upstream ignored `stream:true` and returned `application/json`.
-fn responses_json_to_anthropic_sse(body: Value) -> Vec<Bytes> {
-    let message = match responses_to_anthropic(body) {
-        Ok(message) => message,
-        Err(error) => {
-            return vec![anthropic_error_sse(
-                &error.to_string(),
-                "response_transform_error",
-            )]
-        }
-    };
+fn responses_json_to_anthropic_sse(
+    body: Value,
+    read_offset_protection: Option<&ReadOffsetProtection>,
+) -> Vec<Bytes> {
+    let message =
+        match responses_to_anthropic_with_read_offset_protection(body, read_offset_protection) {
+            Ok(message) => message,
+            Err(error) => {
+                return vec![anthropic_error_sse(
+                    &error.to_string(),
+                    "response_transform_error",
+                )]
+            }
+        };
 
     let usage = message.get("usage").cloned().unwrap_or_else(|| json!({}));
     let mut start_usage = usage.clone();
@@ -293,6 +300,15 @@ fn resolve_content_index(
 pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 'static>(
     stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    create_anthropic_sse_stream_from_responses_with_read_offset_protection(stream, None)
+}
+
+pub(crate) fn create_anthropic_sse_stream_from_responses_with_read_offset_protection<
+    E: std::error::Error + Send + 'static,
+>(
+    stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+    read_offset_protection: Option<ReadOffsetProtection>,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let mut buffer = String::new();
         let mut utf8_remainder: Vec<u8> = Vec::new();
@@ -348,7 +364,10 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
                     if looks_like_json && is_eof {
                         match serde_json::from_str::<Value>(buffer.trim()) {
                             Ok(body) => {
-                                for event in responses_json_to_anthropic_sse(body) {
+                                for event in responses_json_to_anthropic_sse(
+                                    body,
+                                    read_offset_protection.as_ref(),
+                                ) {
                                     yield Ok(event);
                                 }
                                 terminated = true;
@@ -886,7 +905,12 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
                                                     .cloned()
                                                     .unwrap_or_default()
                                             });
-                                        let sanitized = sanitize_anthropic_tool_use_input_json("Read", &raw);
+                                        let sanitized =
+                                            sanitize_anthropic_tool_use_input_json_with_protection(
+                                                "Read",
+                                                &raw,
+                                                read_offset_protection.as_ref(),
+                                            );
                                         if !sanitized.is_empty() {
                                             let event = json!({
                                                 "type": "content_block_delta",
@@ -1324,7 +1348,11 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
                                                             .unwrap_or_default()
                                                     });
                                                 let arguments = if name == "Read" {
-                                                    sanitize_anthropic_tool_use_input_json(name, &raw)
+                                                    sanitize_anthropic_tool_use_input_json_with_protection(
+                                                        name,
+                                                        &raw,
+                                                        read_offset_protection.as_ref(),
+                                                    )
                                                 } else {
                                                     raw
                                                 };
@@ -1699,6 +1727,45 @@ mod tests {
         assert!(merged.contains("event: error"));
         assert!(merged.contains("stream_truncated"));
         assert!(!merged.contains("event: message_stop"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_request_json_fallback_removes_known_past_eof_read_offset() {
+        let request = json!({
+            "messages": [
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "past-read", "name": "Read", "input": {"file_path": "file", "offset": 25000}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "past-read", "content": "Warning: the file exists but is shorter than the provided offset (25000). The file has 2494 lines."}]}
+            ]
+        });
+        let protection = ReadOffsetProtection::from_anthropic_request(&request);
+        let input = Bytes::from_static(br#"{"id":"resp_json","status":"completed","model":"gpt-5","output":[{"type":"function_call","call_id":"new-read","name":"Read","arguments":"{\"file_path\":\"file\",\"offset\":2495,\"limit\":2000}"}]}"#);
+        let upstream = stream::iter(vec![Ok::<_, std::io::Error>(input)]);
+        let merged = create_anthropic_sse_stream_from_responses_with_read_offset_protection(
+            upstream,
+            Some(protection),
+        )
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|chunk| String::from_utf8_lossy(chunk.unwrap().as_ref()).to_string())
+        .collect::<String>();
+        let event = merged
+            .split("\n\n")
+            .filter_map(|block| block.lines().find_map(|line| line.strip_prefix("data: ")))
+            .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+            .find(|event| {
+                event.pointer("/delta/type").and_then(Value::as_str) == Some("input_json_delta")
+            })
+            .expect("input JSON delta");
+        let input: Value = serde_json::from_str(
+            event
+                .pointer("/delta/partial_json")
+                .and_then(Value::as_str)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(input.get("offset").is_none());
+        assert_eq!(input["limit"], 2000);
     }
 
     #[tokio::test]
@@ -2081,11 +2148,9 @@ mod tests {
                         == Some("signature_delta")
             })
             .expect("encrypted reasoning must emit a signature delta");
-        assert!(
-            events[signature_position]["delta"]["signature"]
-                .as_str()
-                .is_some_and(|value| value.starts_with("ccswitch-openai-reasoning-v1:"))
-        );
+        assert!(events[signature_position]["delta"]["signature"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("ccswitch-openai-reasoning-v1:")));
         let stop_position = events
             .iter()
             .position(|event| {
@@ -2094,16 +2159,12 @@ mod tests {
             })
             .expect("thinking block must stop");
         assert!(signature_position < stop_position);
-        assert!(
-            events
-                .iter()
-                .any(|event| event.get("type").and_then(Value::as_str) == Some("message_delta"))
-        );
-        assert!(
-            events
-                .iter()
-                .any(|event| event.get("type").and_then(Value::as_str) == Some("message_stop"))
-        );
+        assert!(events
+            .iter()
+            .any(|event| event.get("type").and_then(Value::as_str) == Some("message_delta")));
+        assert!(events
+            .iter()
+            .any(|event| event.get("type").and_then(Value::as_str) == Some("message_stop")));
     }
 
     #[tokio::test]

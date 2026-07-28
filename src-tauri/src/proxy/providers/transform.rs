@@ -553,6 +553,13 @@ fn clean_schema_inner(mut schema: Value, is_root: bool) -> Value {
 
 /// OpenAI 响应 → Anthropic 响应
 pub fn openai_to_anthropic(body: Value) -> Result<Value, ProxyError> {
+    openai_to_anthropic_with_read_offset_protection(body, None)
+}
+
+pub(crate) fn openai_to_anthropic_with_read_offset_protection(
+    body: Value,
+    read_offset_protection: Option<&super::tool_compat::ReadOffsetProtection>,
+) -> Result<Value, ProxyError> {
     let choices = body
         .get("choices")
         .and_then(|c| c.as_array())
@@ -627,7 +634,11 @@ pub fn openai_to_anthropic(body: Value) -> Result<Value, ProxyError> {
                 .and_then(|a| a.as_str())
                 .unwrap_or("{}");
             let input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
-            let input = super::tool_compat::sanitize_anthropic_tool_use_input(name, input);
+            let input = super::tool_compat::sanitize_anthropic_tool_use_input_with_protection(
+                name,
+                input,
+                read_offset_protection,
+            );
 
             content.push(json!({
                 "type": "tool_use",
@@ -655,7 +666,11 @@ pub fn openai_to_anthropic(body: Value) -> Result<Value, ProxyError> {
                 Some(v @ Value::Object(_)) | Some(v @ Value::Array(_)) => v.clone(),
                 _ => json!({}),
             };
-            let input = super::tool_compat::sanitize_anthropic_tool_use_input(name, input);
+            let input = super::tool_compat::sanitize_anthropic_tool_use_input_with_protection(
+                name,
+                input,
+                read_offset_protection,
+            );
 
             if !name.is_empty() || has_arguments {
                 content.push(json!({
@@ -1405,6 +1420,33 @@ mod tests {
             usage.dedup_request_id(None),
             "session:chatcmpl-claude-compatible"
         );
+    }
+
+    #[test]
+    fn test_openai_to_anthropic_removes_known_past_eof_read_offset() {
+        let request = json!({
+            "messages": [
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "past-read", "name": "Read", "input": {"file_path": "file", "offset": 25000}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "past-read", "content": "Warning: the file exists but is shorter than the provided offset (25000). The file has 2494 lines."}]}
+            ]
+        });
+        let protection =
+            super::super::tool_compat::ReadOffsetProtection::from_anthropic_request(&request);
+        let response = json!({
+            "id": "chatcmpl-read",
+            "model": "gpt-4",
+            "choices": [{
+                "message": {"tool_calls": [{"id": "new-read", "type": "function", "function": {"name": "Read", "arguments": "{\"file_path\":\"file\",\"offset\":2495,\"limit\":2000}"}}]},
+                "finish_reason": "tool_calls"
+            }]
+        });
+
+        let result =
+            openai_to_anthropic_with_read_offset_protection(response, Some(&protection)).unwrap();
+        let tool_input = &result["content"][0]["input"];
+        assert!(tool_input.get("offset").is_none());
+        assert_eq!(tool_input["file_path"], "file");
+        assert_eq!(tool_input["limit"], 2000);
     }
 
     #[test]
