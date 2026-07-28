@@ -1733,6 +1733,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_responses_usage_keeps_all_context_counters_in_message_delta() {
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_usage\",\"model\":\"gpt-5\"}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":120,\"output_tokens\":9,\"input_tokens_details\":{\"cached_tokens\":80,\"cache_write_tokens\":20}}}}\n\n"
+        );
+
+        let events: Vec<Value> = convert_stream_text(input)
+            .await
+            .split("\n\n")
+            .filter_map(|block| {
+                block
+                    .lines()
+                    .find_map(|line| strip_sse_field(line, "data"))
+                    .and_then(|data| serde_json::from_str(data).ok())
+            })
+            .collect();
+        let usage = events
+            .iter()
+            .find(|event| event.get("type").and_then(Value::as_str) == Some("message_delta"))
+            .and_then(|event| event.get("usage"))
+            .expect("terminal message_delta usage");
+
+        assert_eq!(usage["input_tokens"], json!(20));
+        assert_eq!(usage["cache_read_input_tokens"], json!(80));
+        assert_eq!(usage["cache_creation_input_tokens"], json!(20));
+        assert_eq!(usage["output_tokens"], json!(9));
+    }
+
+    #[tokio::test]
     async fn test_streaming_conversion_with_wrapped_response_events() {
         let input = concat!(
             "event: response.created\n",

@@ -13,6 +13,7 @@ use crate::config::{delete_file, get_claude_settings_path, read_json_file, write
 use crate::database::Database;
 use crate::error::AppError;
 use crate::provider::Provider;
+use crate::proxy::providers::get_claude_api_format;
 use crate::services::mcp::McpService;
 use crate::store::AppState;
 
@@ -30,6 +31,10 @@ use super::normalize_claude_models_in_value;
 const CODEX_OAUTH_CLAUDE_MAX_CONTEXT_TOKENS: &str = "372000";
 const CODEX_OAUTH_CLAUDE_AUTO_COMPACT_WINDOW: &str = "372000";
 const KIMI_FOR_CODING_CONTEXT_TOKENS: &str = "262144";
+/// Claude Code defaults unknown model ids to a 200K window. Responses-only
+/// providers often expose non-Claude model IDs, so make the fallback explicit
+/// in the live config and ensure the VS Code session UI has a context window.
+const GENERIC_RESPONSES_CLAUDE_CONTEXT_TOKENS: &str = "200000";
 
 /// Model env keys Claude Code may route requests through. The defaults above
 /// are calibrated against gpt-5.6's Codex catalog, so every configured model
@@ -129,6 +134,45 @@ fn apply_codex_oauth_claude_context_defaults(settings: &mut Value, provider: &Pr
             None => {
                 env.remove(key);
             }
+        }
+    }
+}
+
+fn apply_generic_responses_claude_context_defaults(settings: &mut Value, provider: &Provider) {
+    if provider.is_codex_oauth()
+        || is_kimi_for_coding_provider(provider)
+        || get_claude_api_format(provider) != "openai_responses"
+    {
+        return;
+    }
+
+    let provider_env = provider
+        .settings_config
+        .get("env")
+        .and_then(Value::as_object);
+    let Some(root) = settings.as_object_mut() else {
+        return;
+    };
+    let env = root.entry("env".to_string()).or_insert_with(|| json!({}));
+    let Some(env) = env.as_object_mut() else {
+        log::warn!(
+            "Cannot apply Responses Claude context defaults for '{}': env is not an object",
+            provider.id
+        );
+        return;
+    };
+
+    for key in [
+        "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+        "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+    ] {
+        if let Some(value) = provider_env.and_then(|provider_env| provider_env.get(key)) {
+            env.insert(key.to_string(), value.clone());
+        } else if !env.contains_key(key) {
+            env.insert(
+                key.to_string(),
+                Value::String(GENERIC_RESPONSES_CLAUDE_CONTEXT_TOKENS.to_string()),
+            );
         }
     }
 }
@@ -690,6 +734,7 @@ pub(crate) fn build_effective_settings_with_common_config(
     if matches!(app_type, AppType::Claude) {
         apply_codex_oauth_claude_context_defaults(&mut effective_settings, provider);
         apply_kimi_for_coding_context_defaults(&mut effective_settings, provider);
+        apply_generic_responses_claude_context_defaults(&mut effective_settings, provider);
     }
 
     Ok(effective_settings)
@@ -822,6 +867,38 @@ fn strip_injected_kimi_for_coding_context_defaults(settings: &mut Value, provide
     }
 }
 
+fn strip_injected_generic_responses_claude_context_defaults(
+    settings: &mut Value,
+    provider: &Provider,
+) {
+    if provider.is_codex_oauth()
+        || is_kimi_for_coding_provider(provider)
+        || get_claude_api_format(provider) != "openai_responses"
+    {
+        return;
+    }
+
+    let provider_env = provider
+        .settings_config
+        .get("env")
+        .and_then(Value::as_object);
+    let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) else {
+        return;
+    };
+
+    for key in [
+        "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+        "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+    ] {
+        if provider_env.is_some_and(|provider_env| provider_env.contains_key(key)) {
+            continue;
+        }
+        if env.get(key).and_then(Value::as_str) == Some(GENERIC_RESPONSES_CLAUDE_CONTEXT_TOKENS) {
+            env.remove(key);
+        }
+    }
+}
+
 fn restore_live_settings_for_provider_backfill(
     app_type: &AppType,
     provider: &Provider,
@@ -831,6 +908,7 @@ fn restore_live_settings_for_provider_backfill(
         let mut settings = live_settings;
         strip_injected_codex_oauth_context_defaults(&mut settings, provider);
         strip_injected_kimi_for_coding_context_defaults(&mut settings, provider);
+        strip_injected_generic_responses_claude_context_defaults(&mut settings, provider);
         return settings;
     }
     if matches!(app_type, AppType::GrokBuild) {
@@ -1977,6 +2055,85 @@ pub fn remove_openclaw_provider_from_live(provider_id: &str) -> Result<(), AppEr
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn generic_responses_context_defaults_enable_claude_code_context_tracking() {
+        let db = Database::memory().expect("create memory db");
+        let mut provider = Provider::with_id(
+            "responses".to_string(),
+            "Responses".to_string(),
+            json!({ "env": { "ANTHROPIC_MODEL": "gpt-5" } }),
+            None,
+        );
+        provider.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("openai_responses".to_string()),
+            ..Default::default()
+        });
+
+        let effective =
+            build_effective_settings_with_common_config(&db, &AppType::Claude, &provider)
+                .expect("build effective settings");
+        assert_eq!(
+            effective["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
+            json!("200000")
+        );
+        assert_eq!(
+            effective["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
+            json!("200000")
+        );
+    }
+
+    #[test]
+    fn generic_responses_context_defaults_preserve_explicit_values_and_backfill_cleanly() {
+        let db = Database::memory().expect("create memory db");
+        let mut provider = Provider::with_id(
+            "responses".to_string(),
+            "Responses".to_string(),
+            json!({
+                "env": {
+                    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "300000"
+                }
+            }),
+            None,
+        );
+        provider.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("openai_responses".to_string()),
+            ..Default::default()
+        });
+
+        let effective =
+            build_effective_settings_with_common_config(&db, &AppType::Claude, &provider)
+                .expect("build effective settings");
+        assert_eq!(
+            effective["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
+            json!("300000")
+        );
+        assert_eq!(
+            effective["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
+            json!("200000")
+        );
+
+        let backfilled =
+            strip_common_config_from_live_settings(&db, &AppType::Claude, &provider, effective);
+        assert_eq!(
+            backfilled["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
+            json!("300000")
+        );
+        assert!(backfilled["env"]
+            .get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+            .is_none());
+    }
+
+    #[test]
+    fn non_responses_providers_do_not_receive_generic_context_defaults() {
+        let db = Database::memory().expect("create memory db");
+        let provider = Provider::with_id("chat".to_string(), "Chat".to_string(), json!({}), None);
+
+        let effective =
+            build_effective_settings_with_common_config(&db, &AppType::Claude, &provider)
+                .expect("build effective settings");
+        assert!(effective.get("env").is_none());
+    }
 
     #[test]
     fn kimi_for_coding_effective_settings_backfill_256k_context() {
