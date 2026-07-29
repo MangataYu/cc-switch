@@ -1695,6 +1695,27 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                     terminated = true;
                                     continue;
                                 }
+                                if !duplicate_completed_registry_args.is_empty() {
+                                    let duplicate_conflict =
+                                        duplicate_completed_registry_args.iter().any(
+                                            |(index, arguments)| {
+                                                completed_registry_tools
+                                                    .get(index)
+                                                    .is_none_or(|(_, _, completed)| {
+                                                        completed != arguments
+                                                    })
+                                            },
+                                        );
+                                    duplicate_completed_registry_args.clear();
+                                    if duplicate_conflict {
+                                        yield Ok(anthropic_error_sse(
+                                            "duplicate registered tool arguments did not match the validated call",
+                                            "tool_registry_violation",
+                                        ));
+                                        terminated = true;
+                                        continue;
+                                    }
+                                }
                                 if !has_sent_message_start {
                                     if let Some(id) = response_obj.get("id").and_then(Value::as_str) {
                                         message_id = Some(id.to_string());
@@ -2187,6 +2208,24 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                     terminated = true;
                     break;
                 }
+            }
+        }
+
+        if !terminated && !duplicate_completed_registry_args.is_empty() {
+            let duplicate_conflict = duplicate_completed_registry_args.iter().any(
+                |(index, arguments)| {
+                    completed_registry_tools
+                        .get(index)
+                        .is_none_or(|(_, _, completed)| completed != arguments)
+                },
+            );
+            duplicate_completed_registry_args.clear();
+            if duplicate_conflict {
+                yield Ok(anthropic_error_sse(
+                    "duplicate registered tool arguments did not match the validated call",
+                    "tool_registry_violation",
+                ));
+                terminated = true;
             }
         }
 
@@ -3011,6 +3050,30 @@ mod tests {
         assert_eq!(converted.matches("\"type\":\"tool_use\"").count(), 1);
         assert_eq!(converted.matches("partial_json").count(), 1);
         assert!(!converted.contains("tool_registry_violation"));
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_rejects_unfinished_conflicting_duplicate_arguments_at_terminal() {
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-test\"}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"item_1\",\"output_index\":0,\"delta\":\"{\\\"file_path\\\":\\\"src/main.rs\\\"}\"}\n\n",
+            "event: response.function_call_arguments.done\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"item_1\",\"output_index\":0}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"item_1\",\"output_index\":0,\"name\":\"read_file\",\"call_id\":\"call_1\",\"delta\":\"{\\\"file_path\\\":\\\"different.rs\\\"}\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        );
+
+        let converted = convert_stream_with_registry(input).await;
+
+        assert_eq!(converted.matches("\"type\":\"tool_use\"").count(), 1);
+        assert!(converted.contains("tool_registry_violation"));
+        assert!(!converted.contains("\"type\":\"message_stop\""));
     }
 
     #[tokio::test]
