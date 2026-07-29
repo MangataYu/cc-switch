@@ -6,6 +6,7 @@ pub mod body_filter;
 pub mod bridge_forensics;
 pub mod cache_injector;
 pub mod circuit_breaker;
+pub mod claude_codex_bridge;
 pub(crate) mod content_encoding;
 pub mod copilot_optimizer;
 pub mod error;
