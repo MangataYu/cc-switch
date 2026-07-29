@@ -4,10 +4,11 @@
 //! rely on the per-user application config directory ACL; this module never
 //! shells out to mutate ACLs.
 
-use std::fs;
+use std::fs::{self, File};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -15,11 +16,13 @@ use sha2::{Digest, Sha256};
 #[cfg(test)]
 use super::EvidenceErrorKind;
 use super::{
-    redact_protocol_value, EvidenceArtifact, EvidenceArtifactKind, EvidenceBundleId, EvidenceError,
-    EvidenceManifest, EvidenceStage,
+    redact_protocol_value, EvidenceArtifact, EvidenceArtifactKind, EvidenceBundleId,
+    EvidenceBundleSummary, EvidenceError, EvidenceManifest, EvidenceStage, RetentionReport,
 };
 use crate::config::atomic_write;
 use crate::error::AppError;
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, ZipWriter};
 
 pub const FORENSIC_FORMAT_VERSION: u32 = 1;
 pub const RETENTION_DAYS: i64 = 7;
@@ -88,6 +91,208 @@ impl BridgeForensicStore {
             full_capture_allowed: true,
             suppression_reasons: Vec::new(),
         })
+    }
+
+    pub fn list_bundles(&self) -> Result<Vec<EvidenceBundleSummary>, AppError> {
+        let mut summaries = self.load_bundle_records()?;
+        summaries.sort_by(|left, right| {
+            right
+                .manifest
+                .created_at
+                .cmp(&left.manifest.created_at)
+                .then_with(|| right.manifest.bundle_id.0.cmp(&left.manifest.bundle_id.0))
+        });
+        Ok(summaries
+            .into_iter()
+            .map(|record| record.summary())
+            .collect())
+    }
+
+    pub fn delete_bundle(&self, id: &EvidenceBundleId) -> Result<(), AppError> {
+        let path = self.bundle_path(id)?;
+        fs::remove_dir_all(&path).map_err(|error| AppError::io(&path, error))
+    }
+
+    pub fn export_bundle(&self, id: &EvidenceBundleId, destination: &Path) -> Result<(), AppError> {
+        let bundle_path = self.bundle_path(id)?;
+        let manifest = load_manifest(&bundle_path)?;
+        if manifest.bundle_id != *id {
+            return Err(AppError::InvalidInput(
+                "evidence manifest bundle id does not match directory".to_string(),
+            ));
+        }
+        if destination.exists() {
+            return Err(AppError::InvalidInput(
+                "evidence export destination already exists".to_string(),
+            ));
+        }
+        let destination_parent = destination.parent().ok_or_else(|| {
+            AppError::InvalidInput("invalid evidence export destination".to_string())
+        })?;
+        fs::create_dir_all(destination_parent)
+            .map_err(|error| AppError::io(destination_parent, error))?;
+        let destination_name = destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                AppError::InvalidInput("invalid evidence export destination".to_string())
+            })?;
+        let temporary_path = destination_parent.join(format!(
+            ".{destination_name}.{}.tmp",
+            EvidenceBundleId::new().0
+        ));
+
+        let result = self.write_bundle_zip(&bundle_path, &manifest, &temporary_path);
+        if let Err(error) = result {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(error);
+        }
+        if let Err(error) = fs::rename(&temporary_path, destination) {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(AppError::io(&temporary_path, error));
+        }
+        Ok(())
+    }
+
+    pub fn enforce_retention(&self) -> Result<RetentionReport, AppError> {
+        self.enforce_retention_at(Utc::now(), RETENTION_MAX_BYTES)
+    }
+
+    fn enforce_retention_at(
+        &self,
+        now: DateTime<Utc>,
+        max_bytes: u64,
+    ) -> Result<RetentionReport, AppError> {
+        let mut records = self.load_bundle_records()?;
+        records.sort_by(|left, right| {
+            left.manifest
+                .created_at
+                .cmp(&right.manifest.created_at)
+                .then_with(|| left.manifest.bundle_id.0.cmp(&right.manifest.bundle_id.0))
+        });
+
+        let expiry_cutoff = now - Duration::days(RETENTION_DAYS);
+        let mut report = RetentionReport::default();
+        let mut retained = Vec::new();
+        for record in records {
+            if record.manifest.created_at < expiry_cutoff {
+                fs::remove_dir_all(&record.path)
+                    .map_err(|error| AppError::io(&record.path, error))?;
+                report.removed_expired += 1;
+            } else {
+                retained.push(record);
+            }
+        }
+
+        let mut remaining_bytes: u64 = retained.iter().map(BundleRecord::byte_len).sum();
+        let mut remove_count = 0usize;
+        while remaining_bytes > max_bytes && remove_count < retained.len() {
+            let record = &retained[remove_count];
+            fs::remove_dir_all(&record.path).map_err(|error| AppError::io(&record.path, error))?;
+            remaining_bytes = remaining_bytes.saturating_sub(record.byte_len());
+            report.removed_over_limit += 1;
+            remove_count += 1;
+        }
+
+        report.remaining_bundles = (retained.len() - remove_count) as u64;
+        report.remaining_bytes = remaining_bytes;
+        Ok(report)
+    }
+
+    fn load_bundle_records(&self) -> Result<Vec<BundleRecord>, AppError> {
+        let bundles_root = self.root.join("bundles");
+        match fs::read_dir(&bundles_root) {
+            Ok(entries) => {
+                let mut records = Vec::new();
+                for entry in entries {
+                    let entry = entry.map_err(|error| AppError::io(&bundles_root, error))?;
+                    let file_type = entry
+                        .file_type()
+                        .map_err(|error| AppError::io(entry.path(), error))?;
+                    if !file_type.is_dir() {
+                        continue;
+                    }
+                    let Some(id) = entry.file_name().to_str().map(str::to_string) else {
+                        continue;
+                    };
+                    if !is_valid_bundle_id(&id) {
+                        continue;
+                    }
+                    let path = entry.path();
+                    let manifest = load_manifest(&path)?;
+                    if manifest.bundle_id.0 != id {
+                        return Err(AppError::InvalidInput(
+                            "evidence manifest bundle id does not match directory".to_string(),
+                        ));
+                    }
+                    records.push(BundleRecord { path, manifest });
+                }
+                Ok(records)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(AppError::io(&bundles_root, error)),
+        }
+    }
+
+    fn bundle_path(&self, id: &EvidenceBundleId) -> Result<PathBuf, AppError> {
+        if !is_valid_bundle_id(&id.0) {
+            return Err(AppError::InvalidInput(
+                "invalid evidence bundle id".to_string(),
+            ));
+        }
+        Ok(self.root.join("bundles").join(&id.0))
+    }
+
+    fn write_bundle_zip(
+        &self,
+        bundle_path: &Path,
+        manifest: &EvidenceManifest,
+        destination: &Path,
+    ) -> Result<(), AppError> {
+        let file = File::create(destination).map_err(|error| AppError::io(destination, error))?;
+        let mut writer = ZipWriter::new(file);
+        let options = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Deflated)
+            .unix_permissions(0o600);
+
+        add_zip_file(&mut writer, bundle_path, "manifest.json", options)?;
+        for artifact in &manifest.artifacts {
+            validate_artifact_file_name(&artifact.file_name)?;
+            add_zip_file(&mut writer, bundle_path, &artifact.file_name, options)?;
+        }
+        writer.finish().map_err(|error| {
+            AppError::Message(format!("failed to finish evidence ZIP: {error}"))
+        })?;
+        Ok(())
+    }
+}
+
+struct BundleRecord {
+    path: PathBuf,
+    manifest: EvidenceManifest,
+}
+
+impl BundleRecord {
+    fn byte_len(&self) -> u64 {
+        self.manifest
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.byte_len)
+            .sum()
+    }
+
+    fn summary(self) -> EvidenceBundleSummary {
+        let byte_len = self.byte_len();
+        EvidenceBundleSummary {
+            bundle_id: self.manifest.bundle_id,
+            created_at: self.manifest.created_at,
+            provider_id: self.manifest.provider_id,
+            model: self.manifest.model,
+            stage: self.manifest.stage,
+            error_kind: self.manifest.error.kind,
+            full_capture: self.manifest.full_capture,
+            byte_len,
+        }
     }
 }
 
@@ -265,6 +470,65 @@ fn artifact_file_name(kind: EvidenceArtifactKind, extension: &str) -> String {
     format!("{stem}.{extension}")
 }
 
+fn is_valid_bundle_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn validate_artifact_file_name(file_name: &str) -> Result<(), AppError> {
+    let path = Path::new(file_name);
+    let mut components = path.components();
+    let is_single_normal_component =
+        matches!(components.next(), Some(std::path::Component::Normal(_)))
+            && components.next().is_none();
+    if !is_single_normal_component || file_name == "manifest.json" {
+        return Err(AppError::InvalidInput(
+            "invalid evidence artifact file name".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn load_manifest(bundle_path: &Path) -> Result<EvidenceManifest, AppError> {
+    let path = bundle_path.join("manifest.json");
+    let bytes = fs::read(&path).map_err(|error| AppError::io(&path, error))?;
+    serde_json::from_slice(&bytes).map_err(|error| AppError::json(&path, error))
+}
+
+fn add_zip_file(
+    writer: &mut ZipWriter<File>,
+    bundle_path: &Path,
+    file_name: &str,
+    options: SimpleFileOptions,
+) -> Result<(), AppError> {
+    let path = bundle_path.join(file_name);
+    let metadata = fs::symlink_metadata(&path).map_err(|error| AppError::io(&path, error))?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(AppError::InvalidInput(
+            "evidence artifact is not a regular file".to_string(),
+        ));
+    }
+    let mut source = File::open(&path).map_err(|error| AppError::io(&path, error))?;
+    writer
+        .start_file(file_name, options)
+        .map_err(|error| AppError::Message(format!("failed to add evidence ZIP entry: {error}")))?;
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        let read = source
+            .read(&mut buffer)
+            .map_err(|error| AppError::io(&path, error))?;
+        if read == 0 {
+            break;
+        }
+        writer.write_all(&buffer[..read]).map_err(|error| {
+            AppError::Message(format!("failed to write evidence ZIP entry: {error}"))
+        })?;
+    }
+    Ok(())
+}
+
 fn create_private_dir(path: &Path) -> Result<(), AppError> {
     fs::create_dir_all(path).map_err(|error| AppError::io(path, error))?;
     restrict_dir_permissions(path)
@@ -306,6 +570,53 @@ impl CaptureMetadata {
 }
 
 #[cfg(test)]
+impl BridgeForensicStore {
+    fn write_test_bundle(
+        &self,
+        id: &str,
+        created_at: DateTime<Utc>,
+        byte_len: usize,
+    ) -> Result<PathBuf, AppError> {
+        let bundle_id = EvidenceBundleId(id.to_string());
+        let bundle_path = self.bundle_path(&bundle_id)?;
+        create_private_dir(&bundle_path)?;
+
+        let mut payload = vec![b'x'; byte_len];
+        if byte_len >= 2 {
+            payload[0] = b'"';
+            payload[byte_len - 1] = b'"';
+        }
+        let artifact_path = bundle_path.join("claude-request.json");
+        atomic_write(&artifact_path, &payload)?;
+        restrict_file_permissions(&artifact_path)?;
+        let manifest = EvidenceManifest {
+            format_version: FORENSIC_FORMAT_VERSION,
+            bundle_id,
+            created_at,
+            provider_id: "test-provider".to_string(),
+            model: "gpt-test".to_string(),
+            session_id_hash: "test-session".to_string(),
+            stage: EvidenceStage::ResponseTransform,
+            error: EvidenceError::test_fixture(),
+            full_capture: true,
+            suppression_reason: None,
+            artifacts: vec![EvidenceArtifact {
+                kind: EvidenceArtifactKind::ClaudeRequest,
+                file_name: "claude-request.json".to_string(),
+                byte_len: payload.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(&payload)),
+            }],
+        };
+        let manifest_path = bundle_path.join("manifest.json");
+        let bytes = serde_json::to_vec_pretty(&manifest)
+            .map_err(|source| AppError::JsonSerialize { source })?;
+        atomic_write(&manifest_path, &bytes)?;
+        restrict_file_permissions(&manifest_path)?;
+        Ok(bundle_path)
+    }
+}
+
+#[cfg(test)]
 impl EvidenceError {
     fn test_fixture() -> Self {
         Self {
@@ -319,16 +630,17 @@ impl EvidenceError {
 
 #[cfg(test)]
 fn read_manifest(bundle_path: &Path) -> Result<EvidenceManifest, AppError> {
-    let path = bundle_path.join("manifest.json");
-    let bytes = fs::read(&path).map_err(|error| AppError::io(&path, error))?;
-    serde_json::from_slice(&bytes).map_err(|error| AppError::json(&path, error))
+    load_manifest(bundle_path)
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::fs::File;
 
+    use chrono::{DateTime, Duration, Utc};
     use serde_json::{json, Value};
+    use zip::ZipArchive;
 
     use super::*;
     use crate::proxy::bridge_forensics::{EvidenceArtifactKind, EvidenceError, EvidenceManifest};
@@ -421,5 +733,97 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0]["access_token"], "[REDACTED]");
         assert_eq!(lines[1]["type"], "response.completed");
+    }
+
+    #[test]
+    fn retention_removes_expired_then_oldest_until_under_size_limit() {
+        let fixture = RetentionFixture::new();
+        fixture.bundle("expired", days_ago(8), 10);
+        fixture.bundle("old", days_ago(2), 120);
+        fixture.bundle("new", days_ago(1), 120);
+
+        fixture.store.enforce_retention_at(now(), 200).unwrap();
+
+        assert!(!fixture.bundle_path("expired").exists());
+        assert!(!fixture.bundle_path("old").exists());
+        assert!(fixture.bundle_path("new").exists());
+    }
+
+    #[test]
+    fn delete_rejects_path_traversal_bundle_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BridgeForensicStore::new(temp.path().to_path_buf());
+
+        let error = store
+            .delete_bundle(&EvidenceBundleId("../config".into()))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("invalid evidence bundle id"));
+    }
+
+    #[test]
+    fn list_bundles_sorts_newest_first() {
+        let fixture = RetentionFixture::new();
+        fixture.bundle("older", days_ago(2), 10);
+        fixture.bundle("newer", days_ago(1), 10);
+
+        let summaries = fixture.store.list_bundles().unwrap();
+
+        let ids: Vec<&str> = summaries
+            .iter()
+            .map(|summary| summary.bundle_id.0.as_str())
+            .collect();
+        assert_eq!(ids, vec!["newer", "older"]);
+    }
+
+    #[test]
+    fn export_includes_only_manifest_enumerated_artifacts() {
+        let fixture = RetentionFixture::new();
+        let bundle_path = fixture.bundle("exportable", days_ago(1), 10);
+        fs::write(bundle_path.join("unexpected.tmp"), b"must not export").unwrap();
+        let destination = fixture.temp.path().join("evidence.zip");
+
+        fixture
+            .store
+            .export_bundle(&EvidenceBundleId("exportable".into()), &destination)
+            .unwrap();
+
+        let mut archive = ZipArchive::new(File::open(destination).unwrap()).unwrap();
+        let mut names: Vec<String> = (0..archive.len())
+            .map(|index| archive.by_index(index).unwrap().name().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["claude-request.json", "manifest.json"]);
+    }
+
+    struct RetentionFixture {
+        temp: tempfile::TempDir,
+        store: BridgeForensicStore,
+    }
+
+    impl RetentionFixture {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let store = BridgeForensicStore::new(temp.path().to_path_buf());
+            Self { temp, store }
+        }
+
+        fn bundle(&self, id: &str, created_at: DateTime<Utc>, byte_len: usize) -> PathBuf {
+            self.store
+                .write_test_bundle(id, created_at, byte_len)
+                .unwrap()
+        }
+
+        fn bundle_path(&self, id: &str) -> PathBuf {
+            self.temp.path().join("bundles").join(id)
+        }
+    }
+
+    fn now() -> DateTime<Utc> {
+        Utc::now()
+    }
+
+    fn days_ago(days: i64) -> DateTime<Utc> {
+        now() - Duration::days(days)
     }
 }

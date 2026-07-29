@@ -85,6 +85,26 @@ pub enum EvidenceArtifactKind {
     TransformDecisions,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EvidenceBundleSummary {
+    pub bundle_id: EvidenceBundleId,
+    pub created_at: DateTime<Utc>,
+    pub provider_id: String,
+    pub model: String,
+    pub stage: EvidenceStage,
+    pub error_kind: EvidenceErrorKind,
+    pub full_capture: bool,
+    pub byte_len: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct RetentionReport {
+    pub removed_expired: u64,
+    pub removed_over_limit: u64,
+    pub remaining_bundles: u64,
+    pub remaining_bytes: u64,
+}
+
 #[cfg(test)]
 impl EvidenceManifest {
     fn new_for_test(stage: EvidenceStage, kind: EvidenceErrorKind) -> Self {
