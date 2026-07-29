@@ -1497,6 +1497,10 @@ pub fn run() {
             commands::get_proxy_status,
             commands::get_proxy_config,
             commands::update_proxy_config,
+            commands::list_bridge_evidence,
+            commands::delete_bridge_evidence,
+            commands::export_bridge_evidence,
+            commands::cleanup_bridge_evidence,
             // Global & Per-App Config
             commands::get_global_proxy_config,
             commands::update_global_proxy_config,
