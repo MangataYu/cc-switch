@@ -1,7 +1,7 @@
 # Claude Code → Codex OAuth Agent Bridge Design
 
 **Date:** 2026-07-29
-**Status:** Stages 0–2 implemented; Stage 3 pending
+**Status:** Stages 0–3 implemented; Stage 4 pending
 **Scope:** Claude Code client to the built-in Codex OAuth backend only
 
 ## 1. Summary
@@ -594,6 +594,10 @@ Implemented on 2026-07-29. Each prepared turn freezes a request-scoped registry 
 ### Stage 3: Conversation ledger
 
 Track session/turn identity, calls, reasoning items, retries, and compaction epochs. Replace post-hoc orphan cleanup in the new path with explicit ledger decisions.
+
+Implemented on 2026-07-29. The enabled bridge now uses a concurrency-safe, process-local ledger with hashed session/request/history identities, frozen turn registries and capability snapshots, monotonic parallel tool-call state, matching `tool_result` closure, provider/model/profile-bound encrypted-reasoning identity, prefix-based compaction epochs, protected active-state retention, safe structural snapshots, and zero-network lifecycle replay. Exact same-session retries reuse the original turn, registry, schema-loss report, and capability snapshot; orphan or conflicting results fail closed. Legacy never creates or reads ledger state, while shadow uses an isolated ledger and still makes only the served legacy upstream request.
+
+The default limits are 128 sessions, 32 evictable turns per session, and a 30-minute idle TTL. Active calls, calls already returned to Claude Code, and incomplete reasoning items can temporarily exceed those bounds rather than being evicted. State is intentionally lost on restart and is never shared across processes. The existing Responses SSE codec reports validated tool/reasoning completion into the ledger, but typed event ownership, strict SSE sequencing, arbitrary fragmentation/property testing, and full event replay remain Stage 4.
 
 ### Stage 4: Strict streaming state machine
 

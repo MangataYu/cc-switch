@@ -77,10 +77,10 @@ pub enum ToolCallState {
 
 **Interfaces:** `ConversationLedger::with_limits`, `register_turn`, `transition_call`, `snapshot`, `cleanup`; `LedgerLimits { max_sessions, max_turns_per_session, ttl }`; `ConversationConflictKind` enumerating unknown identity, call-ID conflict, state regression, argument conflict, result conflict, orphan result, and reasoning-binding conflict.
 
-- [ ] Add failing tests proving bounded sessions/turns, TTL metadata, no content-bearing fields, parallel calls, the full legal lifecycle, identical-event idempotency, and every forbidden conflict.
-- [ ] Run `cargo test conversation_ledger --lib -- --nocapture`; confirm RED is caused by missing ledger APIs.
-- [ ] Implement the minimal mutex-protected state and monotonic transition table. Store only SHA-256 hashes for arguments/results and reject unknown tool identities through the frozen registry.
-- [ ] Re-run `cargo test conversation_ledger --lib -- --nocapture` and `cargo check`; commit as `feat(proxy): add conversation ledger lifecycle`.
+- [x] Add failing tests proving bounded sessions/turns, TTL metadata, no content-bearing fields, parallel calls, the full legal lifecycle, identical-event idempotency, and every forbidden conflict.
+- [x] Run `cargo test conversation_ledger --lib -- --nocapture`; confirm RED is caused by missing ledger APIs.
+- [x] Implement the minimal mutex-protected state and monotonic transition table. Store only SHA-256 hashes for arguments/results and reject unknown tool identities through the frozen registry.
+- [x] Re-run `cargo test conversation_ledger --lib -- --nocapture` and `cargo check`; commit as `feat(proxy): add conversation ledger lifecycle`.
 
 ### Task 2: Canonical retry identity and tool-result observation
 
@@ -88,10 +88,10 @@ pub enum ToolCallState {
 
 **Interfaces:** `canonical_request_fingerprint(&Value) -> String`, `history_fingerprints(&Value) -> Vec<String>`, `observe_tool_results(&TurnBinding, &Value)`, and `TurnBinding { session_identity_hash, generation, compaction_epoch, turn_id }`.
 
-- [ ] Add failing tests showing JSON key order produces one fingerprint; exact retry reuses turn ID, registry `Arc`, and capability `Arc`; a changed request creates a new turn; matching later `tool_result` completes a returned call; duplicate identical results are idempotent; conflicting or orphan results fail closed and are never converted to text.
-- [ ] Run the focused ledger/bridge tests and observe expected RED failures.
-- [ ] Hash canonical request/history values without storing them. Scan Claude history before codec conversion, match `tool_use_id` only to ledger-known returned calls, and keep the original prepared registry/profile on retry.
-- [ ] Run `cargo test conversation_ledger --lib -- --nocapture` and `cargo test proxy::claude_codex_bridge --lib -- --nocapture`; commit as `feat(proxy): reuse safe Claude Codex turns`.
+- [x] Add failing tests showing JSON key order produces one fingerprint; exact retry reuses turn ID, registry `Arc`, and capability `Arc`; a changed request creates a new turn; matching later `tool_result` completes a returned call; duplicate identical results are idempotent; conflicting or orphan results fail closed and are never converted to text.
+- [x] Run the focused ledger/bridge tests and observe expected RED failures.
+- [x] Hash canonical request/history values without storing them. Scan Claude history before codec conversion, match `tool_use_id` only to ledger-known returned calls, and keep the original prepared registry/profile on retry.
+- [x] Run `cargo test conversation_ledger --lib -- --nocapture` and `cargo test proxy::claude_codex_bridge --lib -- --nocapture`; commit as `feat(proxy): reuse safe Claude Codex turns`.
 
 ### Task 3: Reasoning identity, compaction, and child-session isolation
 
@@ -99,10 +99,10 @@ pub enum ToolCallState {
 
 **Interfaces:** `ReasoningBinding { item_id, content_hash, identity_hash, state, provider_id_hash, model_hash, capability_profile_version }`, `observe_reasoning_item`, and history-prefix observation that advances `compaction_epoch` only when the previously observed hash sequence is not a prefix of the new sequence.
 
-- [ ] Add failing tests for same-binding idempotency, cross-session/turn/model/provider/profile rejection, normal incremental history without epoch change, discontinuous stable-session history incrementing exactly once, retained active/returned calls and incomplete reasoning across cleanup, and independent child session identities.
-- [ ] Run focused tests and observe RED.
-- [ ] Implement hashed reasoning bindings and prefix-based compaction detection. Evict only closed prior-epoch records and expired sessions without protected active state.
-- [ ] Run `cargo test conversation_ledger --lib -- --nocapture` and bridge regressions; commit as `feat(proxy): bind reasoning and compaction epochs`.
+- [x] Add failing tests for same-binding idempotency, cross-session/turn/model/provider/profile rejection, normal incremental history without epoch change, discontinuous stable-session history incrementing exactly once, retained active/returned calls and incomplete reasoning across cleanup, and independent child session identities.
+- [x] Run focused tests and observe RED.
+- [x] Implement hashed reasoning bindings and prefix-based compaction detection. Evict only closed prior-epoch records and expired sessions without protected active state.
+- [x] Run `cargo test conversation_ledger --lib -- --nocapture` and bridge regressions; commit as `feat(proxy): bind reasoning and compaction epochs`.
 
 ### Task 4: Routing, visibility, retry/failover safety, and safe forensic snapshot
 
@@ -110,10 +110,10 @@ pub enum ToolCallState {
 
 **Interfaces:** enabled uses the process-shared ledger; shadow creates an isolated ledger for one local comparison; legacy has no ledger binding. `LedgerSnapshot` serializes only session hash, generation, epoch, turn ID, request/registry fingerprints, call ID, binding identity, state, and optional error kind.
 
-- [ ] Add failing routing tests proving enabled registers once and reuses on retry, legacy performs zero ledger operations, shadow performs local isolated operations with one upstream request total, and a call marked `ReturnedToClaude` disables bridge automatic retry/failover.
-- [ ] Add failing snapshot tests that serialize a real ledger and assert forbidden prompt/code/argument/result/credential/reasoning strings are absent.
-- [ ] Implement mode ownership, record the snapshot through existing forensic capture, and report completed calls from non-stream and existing validated stream tool completion hooks. Do not add typed SSE events.
-- [ ] Run `cargo test bridge_forensics --lib -- --nocapture`, `cargo test proxy::claude_codex_bridge --lib -- --nocapture`, `cargo test proxy::forwarder --lib -- --nocapture`, and relevant streaming/handler tests; commit as `feat(proxy): route conversation ledger safely`.
+- [x] Add failing routing tests proving enabled registers once and reuses on retry, legacy performs zero ledger operations, shadow performs local isolated operations with one upstream request total, and a call marked `ReturnedToClaude` disables bridge automatic retry/failover.
+- [x] Add failing snapshot tests that serialize a real ledger and assert forbidden prompt/code/argument/result/credential/reasoning strings are absent.
+- [x] Implement mode ownership, record the snapshot through existing forensic capture, and report completed calls from non-stream and existing validated stream tool completion hooks. Do not add typed SSE events.
+- [x] Run `cargo test bridge_forensics --lib -- --nocapture`, `cargo test proxy::claude_codex_bridge --lib -- --nocapture`, `cargo test proxy::forwarder --lib -- --nocapture`, and relevant streaming/handler tests; commit as `feat(proxy): route conversation ledger safely`.
 
 ### Task 5: Minimal offline lifecycle replay
 
@@ -121,20 +121,20 @@ pub enum ToolCallState {
 
 **Interfaces:** replay prepares one enabled turn against an isolated ledger, observes one function call through `ReturnedToClaude`, feeds a matching next-history `tool_result`, and asserts `Completed`; `ReplayReport.network_requests` remains literal zero.
 
-- [ ] Add a failing replay test for request -> tool call -> `ReturnedToClaude` -> tool result -> `Completed`, including snapshot structural comparison and `network_requests == 0`.
-- [ ] Run the focused replay test and observe RED.
-- [ ] Implement only the minimal ledger replay path and safe artifact comparison.
-- [ ] Run `cargo test bridge_forensics --lib -- --nocapture` and the replay example; commit as `test(proxy): replay conversation ledger lifecycle`.
+- [x] Add a failing replay test for request -> tool call -> `ReturnedToClaude` -> tool result -> `Completed`, including snapshot structural comparison and `network_requests == 0`.
+- [x] Run the focused replay test and observe RED.
+- [x] Implement only the minimal ledger replay path and safe artifact comparison.
+- [x] Run `cargo test bridge_forensics --lib -- --nocapture` and the replay example; commit as `test(proxy): replay conversation ledger lifecycle`.
 
 ### Task 6: Acceptance, scope audit, and design status
 
 **Files:** Modify the design document and mark this plan complete; make behavioral fixes only with a new failing regression test.
 
-- [ ] Run from `src-tauri`: `cargo fmt --all -- --check`, `cargo test --lib`, `cargo test conversation_ledger --lib`, `cargo test bridge_forensics --lib`, `cargo test proxy::claude_codex_bridge --lib`, and `cargo test proxy::forwarder --lib`.
-- [ ] Run `git diff --check`; inspect `git status --short`, all Stage 3 diffs, and untracked files while treating `.codegraph/` as untouched user-owned local data.
-- [ ] Scan changed files for credentials and forbidden stored content; confirm no temporary bundle, persistent ledger, Stage 4 event model, online probe, other-provider change, or `.codegraph/` modification exists.
-- [ ] Update the design status to exactly `Stages 0–3 implemented; Stage 4 pending`, recording scope, retry safety, compaction support, and known limitations.
-- [ ] Re-run the complete acceptance commands after documentation changes, then commit as `docs: record Claude Codex bridge stage 3`.
+- [x] Run from `src-tauri`: `cargo fmt --all -- --check`, `cargo test --lib`, `cargo test conversation_ledger --lib`, `cargo test bridge_forensics --lib`, `cargo test proxy::claude_codex_bridge --lib`, and `cargo test proxy::forwarder --lib`.
+- [x] Run `git diff --check`; inspect `git status --short`, all Stage 3 diffs, and untracked files while treating `.codegraph/` as untouched user-owned local data.
+- [x] Scan changed files for credentials and forbidden stored content; confirm no temporary bundle, persistent ledger, Stage 4 event model, online probe, other-provider change, or `.codegraph/` modification exists.
+- [x] Update the design status to exactly `Stages 0–3 implemented; Stage 4 pending`, recording scope, retry safety, compaction support, and known limitations.
+- [x] Re-run the complete acceptance commands after documentation changes, then commit as `docs: record Claude Codex bridge stage 3`.
 
 ## Acceptance Criteria
 
