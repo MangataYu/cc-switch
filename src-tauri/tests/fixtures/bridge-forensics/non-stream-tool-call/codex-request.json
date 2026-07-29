@@ -9,8 +9,8 @@
   "tools": [
     {
       "type": "function",
-      "name": "Read",
-      "description": "Read a file",
+      "name": "read_file",
+      "description": "Read a file This function is executed by Claude Code in the local Claude Code workspace. Exact local paths are not vector-store identifiers. Wait for the later tool result before claiming success.",
       "parameters": {
         "type": "object",
         "properties": {"file_path": {"type": "string"}},

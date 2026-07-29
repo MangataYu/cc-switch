@@ -9,12 +9,12 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{EvidenceArtifact, EvidenceArtifactKind, EvidenceManifest, FORENSIC_FORMAT_VERSION};
+use crate::app_config::AppType;
 use crate::error::AppError;
+use crate::provider::{Provider, ProviderMeta};
+use crate::proxy::claude_codex_bridge::{ClaudeCodexBridge, PreparedCodexTurn};
 use crate::proxy::json_canonical::canonicalize_value;
-use crate::proxy::providers::streaming_responses::create_anthropic_sse_stream_from_responses;
-use crate::proxy::providers::transform_responses::{
-    anthropic_to_responses, responses_to_anthropic,
-};
+use crate::proxy::providers::streaming_responses::create_anthropic_sse_stream_from_responses_with_registry;
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
 
 #[derive(Debug, Serialize)]
@@ -57,8 +57,10 @@ pub fn replay_bundle(path: &Path) -> Result<ReplayReport, AppError> {
     let claude_request = load_json_artifact(path, &manifest, EvidenceArtifactKind::ClaudeRequest)?;
     let expected_codex_request =
         load_json_artifact(path, &manifest, EvidenceArtifactKind::CodexRequest)?;
-    let actual_codex_request = anthropic_to_responses(claude_request, None, true, false)
+    let prepared = ClaudeCodexBridge::builtin()
+        .prepare_turn(&AppType::Claude, claude_request, &replay_provider(), None)
         .map_err(|error| AppError::Message(format!("request replay failed: {error}")))?;
+    let actual_codex_request = prepared.request.clone();
 
     let mut differences = Vec::new();
     compare_values(
@@ -82,6 +84,7 @@ pub fn replay_bundle(path: &Path) -> Result<ReplayReport, AppError> {
             codex_response_artifact,
             codex_request_matches,
             differences,
+            prepared,
         )
     } else {
         replay_non_streaming(
@@ -90,6 +93,7 @@ pub fn replay_bundle(path: &Path) -> Result<ReplayReport, AppError> {
             codex_response_artifact,
             codex_request_matches,
             differences,
+            prepared,
         )
     }
 }
@@ -100,11 +104,13 @@ fn replay_non_streaming(
     response_artifact: &EvidenceArtifact,
     codex_request_matches: bool,
     mut differences: Vec<StructuralDifference>,
+    prepared: PreparedCodexTurn,
 ) -> Result<ReplayReport, AppError> {
     let codex_response = parse_json_artifact(root, response_artifact)?;
     let expected_claude_response =
         load_json_artifact(root, manifest, EvidenceArtifactKind::ClaudeResponse)?;
-    let actual_claude_response = responses_to_anthropic(codex_response)
+    let actual_claude_response = prepared
+        .consume_response(codex_response, None, None)
         .map_err(|error| AppError::Message(format!("response replay failed: {error}")))?;
     compare_values(
         "$/claude_response",
@@ -130,6 +136,7 @@ fn replay_streaming(
     response_artifact: &EvidenceArtifact,
     codex_request_matches: bool,
     mut differences: Vec<StructuralDifference>,
+    prepared: PreparedCodexTurn,
 ) -> Result<ReplayReport, AppError> {
     let upstream_events = parse_ndjson_artifact(root, response_artifact)?;
     let expected_artifact =
@@ -150,9 +157,12 @@ fn replay_streaming(
         upstream_sse.push_str("\n\n");
     }
     let converted = futures::executor::block_on(async {
-        create_anthropic_sse_stream_from_responses(stream::iter(vec![Ok::<_, std::io::Error>(
-            Bytes::from(upstream_sse),
-        )]))
+        create_anthropic_sse_stream_from_responses_with_registry(
+            stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(upstream_sse))]),
+            None,
+            None,
+            prepared.tool_registry.clone(),
+        )
         .collect::<Vec<_>>()
         .await
     });
@@ -174,6 +184,27 @@ fn replay_streaming(
         structural_differences: differences,
         network_requests: 0,
     })
+}
+
+fn replay_provider() -> Provider {
+    Provider {
+        id: "bridge-replay".to_string(),
+        name: "Bridge Replay".to_string(),
+        settings_config: serde_json::json!({}),
+        website_url: None,
+        category: Some("claude".to_string()),
+        created_at: None,
+        sort_index: None,
+        notes: None,
+        meta: Some(ProviderMeta {
+            provider_type: Some("codex_oauth".to_string()),
+            api_format: Some("openai_responses".to_string()),
+            ..ProviderMeta::default()
+        }),
+        icon: None,
+        icon_color: None,
+        in_failover_queue: false,
+    }
 }
 
 fn load_json_artifact(

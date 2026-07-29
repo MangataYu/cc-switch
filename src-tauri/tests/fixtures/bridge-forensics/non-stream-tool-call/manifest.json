@@ -16,8 +16,8 @@
   "suppression_reason": null,
   "artifacts": [
     {"kind": "claude_request", "file_name": "claude-request.json", "byte_len": 358, "sha256": "01d9f7de35436bc1ac51dbddfc704b7ffaad98633775736d9b00c589d7b1cab8"},
-    {"kind": "codex_request", "file_name": "codex-request.json", "byte_len": 545, "sha256": "3f9ab0d443ec105d812bb04872b0b02e251205e8541217561b0f63aedf894c7d"},
-    {"kind": "codex_response", "file_name": "codex-response.json", "byte_len": 304, "sha256": "8f34ba2e9d31f022cf51c313f871b70c6c870953d11b2fbb306ea9a5dc1ee4e5"},
+    {"kind": "codex_request", "file_name": "codex-request.json", "byte_len": 735, "sha256": "41c65f2658449738116da99ee402a8644ca1910731e596f80f21321f778ffdec"},
+    {"kind": "codex_response", "file_name": "codex-response.json", "byte_len": 309, "sha256": "f1725b8a2a7955018b43d884aa4c74621d8474f3119ee00e75bd9fd5ff94098c"},
     {"kind": "claude_response", "file_name": "expected-claude-response.json", "byte_len": 340, "sha256": "c1d73cdacd5e62c29a3dab8a29785e1ca5df9e0963bec146b2cdb47210a79b68"}
   ]
 }

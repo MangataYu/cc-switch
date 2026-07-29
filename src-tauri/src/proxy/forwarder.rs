@@ -80,8 +80,11 @@ fn record_prepared_turn_evidence(
     capture: &mut ForensicTurnCapture,
     prepared: &PreparedCodexTurn,
 ) -> Result<(), crate::error::AppError> {
-    let registry = serde_json::to_value(prepared.tool_registry.as_ref())
-        .map_err(|source| crate::error::AppError::JsonSerialize { source })?;
+    let registry = serde_json::json!({
+        "bindings": prepared.tool_registry.bindings(),
+        "identity_fingerprint": prepared.tool_registry.identity_fingerprint(),
+        "schema_fingerprint": prepared.tool_registry.schema_fingerprint()
+    });
     capture.record_json(EvidenceArtifactKind::ToolRegistry, &registry)?;
     let report = serde_json::to_value(&prepared.negotiation_report)
         .map_err(|source| crate::error::AppError::JsonSerialize { source })?;
