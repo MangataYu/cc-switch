@@ -1,7 +1,7 @@
 # Claude Code → Codex OAuth Agent Bridge Design
 
 **Date:** 2026-07-29
-**Status:** Stage 0 implemented; Stage 1 pending
+**Status:** Stages 0–1 implemented; Stage 2 pending
 **Scope:** Claude Code client to the built-in Codex OAuth backend only
 
 ## 1. Summary
@@ -582,6 +582,8 @@ Add safe structural tracing, failed-conversion quarantine bundles, retention, ex
 ### Stage 1: Bridge seam and Codex OAuth profile
 
 Add `ClaudeCodexBridge`, `PreparedCodexTurn`, the static capability profile, and the provider-level `legacy/shadow/enabled` switch. Initially delegate protocol encoding to the current codec.
+
+Implemented on 2026-07-29. Providers without `bridgeMode` remain on `legacy`; `shadow` compiles and compares locally without an additional upstream request; `enabled` carries the finalized outbound request and capability snapshot in its prepared turn. Non-stream responses are consumed through that turn, while strict per-event streaming ownership remains Stage 4.
 
 ### Stage 2: Tool registry and semantic aliases
 
