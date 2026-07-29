@@ -1,7 +1,7 @@
 # Claude Code → Codex OAuth Agent Bridge Design
 
 **Date:** 2026-07-29
-**Status:** Approved design, pending implementation plan
+**Status:** Stage 0 implemented; Stage 1 pending
 **Scope:** Claude Code client to the built-in Codex OAuth backend only
 
 ## 1. Summary
