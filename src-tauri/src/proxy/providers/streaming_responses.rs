@@ -447,6 +447,7 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
         let mut tool_call_id_by_index: HashMap<u32, String> = HashMap::new();
         let mut pending_registry_tools: HashSet<u32> = HashSet::new();
         let mut completed_registry_tools: HashMap<u32, (String, String, String)> = HashMap::new();
+        let mut duplicate_completed_registry_args: HashMap<u32, String> = HashMap::new();
         let mut last_tool_index: Option<u32> = None;
         let mut reasoning_index_by_item_id: HashMap<String, u32> = HashMap::new();
         let mut reasoning_item_by_index: HashMap<u32, Value> = HashMap::new();
@@ -871,6 +872,26 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                         {
                                             tool_index_by_item_id.insert(item_id.to_string(), index);
                                         }
+                                        if tool_registry.is_some() {
+                                            if let Some((completed_name, completed_id, _)) =
+                                                completed_registry_tools.get(&index)
+                                            {
+                                                if codex_name != completed_name
+                                                    || call_id != completed_id
+                                                {
+                                                    yield Ok(anthropic_error_sse(
+                                                        "duplicate registered tool start conflicts with the validated call",
+                                                        "tool_registry_violation",
+                                                    ));
+                                                    terminated = true;
+                                                } else {
+                                                    duplicate_completed_registry_args
+                                                        .entry(index)
+                                                        .or_default();
+                                                }
+                                                continue;
+                                            }
+                                        }
                                         if tool_registry.is_some()
                                             && (tool_codex_name_by_index
                                                 .get(&index)
@@ -990,6 +1011,35 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
 
                                     if let Some(id) = item_id {
                                         tool_index_by_item_id.insert(id.to_string(), index);
+                                    }
+                                    if tool_registry.is_some() {
+                                        if let Some((completed_name, completed_id, _)) =
+                                            completed_registry_tools.get(&index)
+                                        {
+                                            let duplicate_name = data
+                                                .get("name")
+                                                .and_then(Value::as_str);
+                                            let duplicate_id = data
+                                                .get("call_id")
+                                                .and_then(Value::as_str);
+                                            if duplicate_name
+                                                .is_some_and(|name| name != completed_name)
+                                                || duplicate_id
+                                                    .is_some_and(|id| id != completed_id)
+                                            {
+                                                yield Ok(anthropic_error_sse(
+                                                    "duplicate registered tool arguments conflict with the validated call",
+                                                    "tool_registry_violation",
+                                                ));
+                                                terminated = true;
+                                            } else {
+                                                duplicate_completed_registry_args
+                                                    .entry(index)
+                                                    .or_default()
+                                                    .push_str(delta);
+                                            }
+                                            continue;
+                                        }
                                     }
                                     if let Some(codex_name) = data.get("name").and_then(Value::as_str) {
                                         if tool_registry.is_some()
@@ -1165,6 +1215,11 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                                 .get("arguments")
                                                 .or_else(|| data.pointer("/item/arguments"))
                                                 .and_then(Value::as_str)
+                                                .or_else(|| {
+                                                    duplicate_completed_registry_args
+                                                        .get(&index)
+                                                        .map(String::as_str)
+                                                })
                                                 .unwrap_or("");
                                             let duplicate_name = data
                                                 .get("name")
@@ -1186,6 +1241,7 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                                 ));
                                                 terminated = true;
                                             }
+                                            duplicate_completed_registry_args.remove(&index);
                                             continue;
                                         }
                                         if !pending_registry_tools.remove(&index) {
@@ -1787,6 +1843,11 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                                     let duplicate_raw = item
                                                         .get("arguments")
                                                         .and_then(Value::as_str)
+                                                        .or_else(|| {
+                                                            duplicate_completed_registry_args
+                                                                .get(&index)
+                                                                .map(String::as_str)
+                                                        })
                                                         .unwrap_or("");
                                                     let duplicate_name = item
                                                         .get("name")
@@ -1806,6 +1867,8 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                                         ));
                                                         terminated = true;
                                                     }
+                                                    duplicate_completed_registry_args
+                                                        .remove(&index);
                                                     if let Some(id) = item_id {
                                                         tool_index_by_item_id.remove(id);
                                                     }
@@ -2911,6 +2974,34 @@ mod tests {
             "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"item_1\",\"output_index\":0,\"arguments\":\"{\\\"file_path\\\":\\\"src/main.rs\\\"}\"}\n\n",
             "event: response.output_item.done\n",
             "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":\"{\\\"file_path\\\":\\\"src/main.rs\\\"}\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        );
+
+        let converted = convert_stream_with_registry(input).await;
+
+        assert_eq!(converted.matches("\"type\":\"tool_use\"").count(), 1);
+        assert_eq!(converted.matches("partial_json").count(), 1);
+        assert!(!converted.contains("tool_registry_violation"));
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_does_not_reopen_a_completed_call_for_duplicate_events() {
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-test\"}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"item_1\",\"output_index\":0,\"delta\":\"{\\\"file_path\\\":\\\"src/main.rs\\\"}\"}\n\n",
+            "event: response.function_call_arguments.done\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"item_1\",\"output_index\":0,\"arguments\":\"{\\\"file_path\\\":\\\"src/main.rs\\\"}\"}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"item_1\",\"output_index\":0,\"name\":\"read_file\",\"call_id\":\"call_1\",\"delta\":\"{\\\"file_path\\\":\\\"src/main.rs\\\"}\"}\n\n",
+            "event: response.function_call_arguments.done\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"item_1\",\"output_index\":0}\n\n",
             "event: response.completed\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
         );
