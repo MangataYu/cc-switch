@@ -388,6 +388,8 @@ struct ClaudeCodexResponseDispatch {
 fn dispatch_claude_codex_response<F>(
     prepared_turn: Option<&PreparedCodexTurn>,
     response: Value,
+    read_offset_protection: Option<&crate::proxy::providers::tool_compat::ReadOffsetProtection>,
+    read_trace: Option<&ReadTrace>,
     legacy_codec: F,
 ) -> Result<ClaudeCodexResponseDispatch, ProxyError>
 where
@@ -395,7 +397,7 @@ where
 {
     match prepared_turn {
         Some(prepared_turn) => prepared_turn
-            .consume_response_with(response, legacy_codec)
+            .consume_response(response, read_offset_protection, read_trace)
             .map(|response| ClaudeCodexResponseDispatch {
                 response,
                 used_prepared_turn: true,
@@ -660,6 +662,8 @@ async fn handle_claude_transform(
             dispatch_claude_codex_response(
                 prepared_codex_turn.as_ref(),
                 upstream_response,
+                read_offset_protection.as_ref(),
+                read_trace.as_ref(),
                 |upstream_response| {
                     transform_responses::responses_to_anthropic_with_read_offset_protection_and_trace(
                         upstream_response,
@@ -670,7 +674,13 @@ async fn handle_claude_transform(
             )
             .map(|dispatch| {
                 if dispatch.used_prepared_turn {
-                    log::debug!("[ClaudeCodexBridge] response delegated through prepared turn");
+                    log::debug!(
+                        "[ClaudeCodexBridge] response delegated through prepared turn_id={}",
+                        prepared_codex_turn
+                            .as_ref()
+                            .map(|turn| turn.turn_id.as_str())
+                            .unwrap_or("missing")
+                    );
                 }
                 dispatch.response
             })
@@ -2870,17 +2880,36 @@ mod tests {
             )
             .unwrap();
 
-        let enabled =
-            dispatch_claude_codex_response(Some(&prepared), json!({"status": "completed"}), |_| {
-                Ok(json!({"served": "bridge"}))
-            })
-            .unwrap();
+        let enabled = dispatch_claude_codex_response(
+            Some(&prepared),
+            json!({
+                "id": "resp_1",
+                "status": "completed",
+                "model": "gpt-test",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "bridge response"}]
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
+            }),
+            None,
+            None,
+            |_| panic!("prepared turn must own enabled response conversion"),
+        )
+        .unwrap();
         assert!(enabled.used_prepared_turn);
-        assert_eq!(enabled.response, json!({"served": "bridge"}));
+        assert_eq!(enabled.response["id"], "resp_1");
+        assert_eq!(enabled.response["content"][0]["text"], "bridge response");
 
-        let legacy = dispatch_claude_codex_response(None, json!({"status": "completed"}), |_| {
-            Ok(json!({"served": "legacy"}))
-        })
+        let legacy = dispatch_claude_codex_response(
+            None,
+            json!({"status": "completed"}),
+            None,
+            None,
+            |_| Ok(json!({"served": "legacy"})),
+        )
         .unwrap();
         assert!(!legacy.used_prepared_turn);
         assert_eq!(legacy.response, json!({"served": "legacy"}));

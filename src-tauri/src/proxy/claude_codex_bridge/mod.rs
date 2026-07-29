@@ -7,7 +7,10 @@ pub use error::*;
 use crate::{
     app_config::AppType,
     provider::Provider,
-    proxy::providers::{transform_claude_request_for_api_format, transform_responses},
+    proxy::providers::{
+        read_trace::ReadTrace, tool_compat::ReadOffsetProtection,
+        transform_claude_request_for_api_format, transform_responses,
+    },
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -73,19 +76,22 @@ impl ClaudeCodexBridge {
 }
 
 impl PreparedCodexTurn {
-    pub fn consume_response(&self, response: Value) -> Result<Value, BridgeError> {
-        self.consume_response_with(response, transform_responses::responses_to_anthropic)
+    pub(crate) fn finalize_request(&mut self, request: Value) {
+        self.request = request;
     }
 
-    pub(crate) fn consume_response_with<F>(
+    pub fn consume_response(
         &self,
         response: Value,
-        codec: F,
-    ) -> Result<Value, BridgeError>
-    where
-        F: FnOnce(Value) -> Result<Value, crate::proxy::ProxyError>,
-    {
-        codec(response).map_err(BridgeError::from)
+        read_offset_protection: Option<&ReadOffsetProtection>,
+        read_trace: Option<&ReadTrace>,
+    ) -> Result<Value, BridgeError> {
+        transform_responses::responses_to_anthropic_with_read_offset_protection_and_trace(
+            response,
+            read_offset_protection,
+            read_trace,
+        )
+        .map_err(BridgeError::from)
     }
 }
 
@@ -185,7 +191,7 @@ mod tests {
             transform_responses::responses_to_anthropic(response.clone()).unwrap();
 
         assert_eq!(
-            prepared.consume_response(response).unwrap(),
+            prepared.consume_response(response, None, None).unwrap(),
             legacy_response
         );
     }

@@ -111,6 +111,15 @@ where
     }
 }
 
+fn synchronize_prepared_codex_request(
+    prepared_turn: Option<&mut PreparedCodexTurn>,
+    finalized_request: &Value,
+) {
+    if let Some(prepared_turn) = prepared_turn {
+        prepared_turn.finalize_request(finalized_request.clone());
+    }
+}
+
 fn validate_codex_official_authorization(headers: &http::HeaderMap) -> Result<(), ProxyError> {
     let authorization = headers
         .get(http::header::AUTHORIZATION)
@@ -1729,6 +1738,7 @@ impl RequestForwarder {
                 }
             }
         }
+        synchronize_prepared_codex_request(prepared_codex_turn.as_mut(), &filtered_body);
         if let (Some(evidence), Some(prepared)) =
             (bridge_evidence.as_mut(), prepared_codex_turn.as_ref())
         {
@@ -3660,13 +3670,7 @@ fn prepare_upstream_request_body(request_body: Value) -> Value {
 }
 
 fn should_capture_bridge_evidence(app_type: &AppType, provider: &Provider) -> bool {
-    matches!(app_type, AppType::Claude)
-        && provider.is_codex_oauth()
-        && provider
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.api_format.as_deref())
-            == Some("openai_responses")
+    bridge_scope_matches(app_type, provider)
 }
 
 fn begin_bridge_evidence_capture(
@@ -4018,6 +4022,33 @@ mod tests {
 
         assert_eq!(dispatch.request, json!({"served": "legacy"}));
         assert!(dispatch.prepared_turn.is_none());
+    }
+
+    #[test]
+    fn prepared_codex_turn_tracks_the_finalized_outbound_request() {
+        let provider = bridge_provider("codex_oauth", "openai_responses");
+        let mut prepared = ClaudeCodexBridge::builtin()
+            .prepare_turn(
+                &AppType::Claude,
+                json!({
+                    "model": "gpt-test",
+                    "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "hello"}]
+                }),
+                &provider,
+                Some("session-1"),
+            )
+            .unwrap();
+        let finalized = json!({
+            "model": "gpt-test",
+            "input": [{"role": "user", "content": "overridden"}],
+            "stream": true,
+            "store": false
+        });
+
+        synchronize_prepared_codex_request(Some(&mut prepared), &finalized);
+
+        assert_eq!(prepared.request, finalized);
     }
 
     #[test]
