@@ -17,11 +17,13 @@ use super::transform_responses::{
     build_anthropic_usage_from_responses, map_responses_stop_reason,
     responses_to_anthropic_with_read_offset_protection_and_trace,
 };
+use crate::proxy::bridge_forensics::ForensicStreamObserver;
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 #[inline]
 fn response_object_from_event(data: &Value) -> &Value {
@@ -326,6 +328,32 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_read_offset_protec
 pub(crate) fn create_anthropic_sse_stream_from_responses_with_read_offset_protection_and_trace<
     E: std::error::Error + Send + 'static,
 >(
+    stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+    read_offset_protection: Option<ReadOffsetProtection>,
+    read_trace: Option<ReadTrace>,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    create_anthropic_sse_stream_from_responses_core(stream, read_offset_protection, read_trace)
+}
+
+pub(crate) fn create_anthropic_sse_stream_from_responses_with_evidence<
+    E: std::error::Error + Send + 'static,
+>(
+    stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+    read_offset_protection: Option<ReadOffsetProtection>,
+    read_trace: Option<ReadTrace>,
+    evidence: Option<ForensicStreamObserver>,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    let observer = Arc::new(Mutex::new(evidence));
+    let upstream = observe_upstream_stream(stream, observer.clone());
+    let converted = create_anthropic_sse_stream_from_responses_core(
+        upstream,
+        read_offset_protection,
+        read_trace,
+    );
+    observe_claude_stream(converted, observer)
+}
+
+fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send + 'static>(
     stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
     read_offset_protection: Option<ReadOffsetProtection>,
     read_trace: Option<ReadTrace>,
@@ -1690,6 +1718,161 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_read_offset_protec
     }
 }
 
+type SharedForensicObserver = Arc<Mutex<Option<ForensicStreamObserver>>>;
+
+fn observe_upstream_stream<E: std::error::Error + Send + 'static>(
+    stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+    observer: SharedForensicObserver,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    async_stream::stream! {
+        let mut stream = Box::pin(stream);
+        let mut buffer = String::new();
+        let mut utf8_remainder = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(bytes) => {
+                    observe_protocol_bytes(
+                        &observer,
+                        &mut buffer,
+                        &mut utf8_remainder,
+                        &bytes,
+                        false,
+                        true,
+                    );
+                    yield Ok(bytes);
+                }
+                Err(error) => {
+                    mark_observer_stream_error(&observer);
+                    yield Err(std::io::Error::other(error.to_string()));
+                    break;
+                }
+            }
+        }
+        observe_protocol_bytes(
+            &observer,
+            &mut buffer,
+            &mut utf8_remainder,
+            &[],
+            true,
+            true,
+        );
+    }
+}
+
+fn observe_claude_stream(
+    stream: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+    observer: SharedForensicObserver,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    async_stream::stream! {
+        let mut stream = Box::pin(stream);
+        let mut buffer = String::new();
+        let mut utf8_remainder = Vec::new();
+        while let Some(item) = stream.next().await {
+            match &item {
+                Ok(bytes) => observe_protocol_bytes(
+                    &observer,
+                    &mut buffer,
+                    &mut utf8_remainder,
+                    bytes,
+                    false,
+                    false,
+                ),
+                Err(_) => mark_observer_stream_error(&observer),
+            }
+            yield item;
+        }
+        observe_protocol_bytes(
+            &observer,
+            &mut buffer,
+            &mut utf8_remainder,
+            &[],
+            true,
+            false,
+        );
+
+        let evidence = observer.lock().ok().and_then(|mut guard| guard.take());
+        if let Some(evidence) = evidence {
+            match evidence.finish(None) {
+                Ok(Some(bundle)) => log::error!(
+                    "[BridgeEvidence] bundle_id={} stage=stream_transform summary=codex_stream_failed",
+                    bundle.bundle_id.0
+                ),
+                Ok(None) => {}
+                Err(error) => log::warn!(
+                    "[BridgeEvidence] capture_failed stage=stream_transform error={error}"
+                ),
+            }
+        }
+    }
+}
+
+fn observe_protocol_bytes(
+    observer: &SharedForensicObserver,
+    buffer: &mut String,
+    utf8_remainder: &mut Vec<u8>,
+    bytes: &[u8],
+    eof: bool,
+    upstream: bool,
+) {
+    crate::proxy::sse::append_utf8_safe(buffer, utf8_remainder, bytes);
+    let trimmed = buffer.trim_start_matches(|ch: char| ch.is_whitespace() || ch == '\u{feff}');
+    let looks_like_json = matches!(trimmed.as_bytes().first(), Some(b'{') | Some(b'['));
+    if looks_like_json {
+        if eof {
+            if let Ok(value) = serde_json::from_str::<Value>(buffer.trim()) {
+                offer_observer_event(observer, &value, upstream);
+            } else {
+                mark_observer_stream_error(observer);
+            }
+            buffer.clear();
+        }
+        return;
+    }
+    if eof && !buffer.trim().is_empty() {
+        buffer.push_str("\n\n");
+    }
+    while let Some(block) = take_sse_block(buffer) {
+        let mut data_parts = Vec::new();
+        for line in block.lines() {
+            if let Some(data) = strip_sse_field(line, "data") {
+                data_parts.push(data.to_string());
+            }
+        }
+        if data_parts.is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(&data_parts.join("\n")) {
+            offer_observer_event(observer, &value, upstream);
+        }
+    }
+}
+
+fn offer_observer_event(observer: &SharedForensicObserver, event: &Value, upstream: bool) {
+    let Ok(mut guard) = observer.lock() else {
+        return;
+    };
+    let Some(evidence) = guard.as_mut() else {
+        return;
+    };
+    let result = if upstream {
+        evidence.upstream_event(event)
+    } else {
+        evidence.claude_event(event)
+    };
+    if let Err(error) = result {
+        log::warn!("[BridgeEvidence] capture_failed stage=stream_event error={error}");
+        *guard = None;
+    }
+}
+
+fn mark_observer_stream_error(observer: &SharedForensicObserver) {
+    if let Ok(mut guard) = observer.lock() {
+        if let Some(evidence) = guard.as_mut() {
+            evidence.mark_stream_error();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1705,6 +1888,100 @@ mod tests {
             .into_iter()
             .map(|chunk| String::from_utf8_lossy(chunk.unwrap().as_ref()).to_string())
             .collect()
+    }
+
+    fn evidence_capture(
+        store: &crate::proxy::bridge_forensics::BridgeForensicStore,
+    ) -> crate::proxy::bridge_forensics::ForensicStreamObserver {
+        use crate::proxy::bridge_forensics::{CaptureMetadata, ForensicStreamObserver};
+
+        let capture = store
+            .begin_turn(CaptureMetadata {
+                provider_id: "provider-1".to_string(),
+                model: "gpt-test".to_string(),
+                session_id_hash: "session-hash".to_string(),
+            })
+            .unwrap();
+        ForensicStreamObserver::new(capture)
+    }
+
+    #[tokio::test]
+    async fn successful_stream_discards_staging_capture() {
+        use crate::proxy::bridge_forensics::BridgeForensicStore;
+
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-test\"}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
+        );
+        let baseline =
+            create_anthropic_sse_stream_from_responses(stream::iter(vec![
+                Ok::<_, std::io::Error>(Bytes::from(input)),
+            ]))
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        let temp = tempfile::tempdir().unwrap();
+        let store = BridgeForensicStore::new(temp.path().to_path_buf());
+        let observed = create_anthropic_sse_stream_from_responses_with_evidence(
+            stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(input))]),
+            None,
+            None,
+            Some(evidence_capture(&store)),
+        )
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+
+        assert_eq!(observed, baseline);
+        assert!(store.list_bundles().unwrap().is_empty());
+        assert!(std::fs::read_dir(temp.path().join("staging"))
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn truncated_stream_commits_raw_event_evidence() {
+        use crate::proxy::bridge_forensics::{
+            BridgeForensicStore, EvidenceErrorKind, EvidenceManifest, EvidenceStage,
+        };
+
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-test\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"item_1\",\"name\":\"Read\",\"delta\":\"{\\\"file_path\\\":\"}\n\n"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let store = BridgeForensicStore::new(temp.path().to_path_buf());
+
+        let _output = create_anthropic_sse_stream_from_responses_with_evidence(
+            stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(input))]),
+            None,
+            None,
+            Some(evidence_capture(&store)),
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        let bundles = store.list_bundles().unwrap();
+        assert_eq!(bundles.len(), 1);
+        let bundle_path = temp.path().join("bundles").join(&bundles[0].bundle_id.0);
+        let manifest: EvidenceManifest =
+            serde_json::from_slice(&std::fs::read(bundle_path.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest.stage, EvidenceStage::StreamTransform);
+        assert_eq!(manifest.error.kind, EvidenceErrorKind::IncompleteStream);
+        assert!(bundle_path.join("codex-response.ndjson").is_file());
+        assert!(bundle_path.join("claude-response.ndjson").is_file());
     }
 
     #[test]

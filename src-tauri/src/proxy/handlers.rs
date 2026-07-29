@@ -9,7 +9,8 @@
 
 use super::{
     bridge_forensics::{
-        EvidenceArtifactKind, EvidenceError, EvidenceErrorKind, EvidenceStage, ForensicTurnCapture,
+        EvidenceArtifactKind, EvidenceError, EvidenceErrorKind, EvidenceStage,
+        ForensicStreamObserver, ForensicTurnCapture,
     },
     content_encoding::{decompress_body, get_content_encoding, is_supported_content_encoding},
     error_mapper::{get_error_message, map_proxy_error_to_status},
@@ -31,7 +32,10 @@ use super::{
         },
         streaming_codex_chat::create_responses_sse_stream_from_chat_with_context,
         streaming_gemini::create_anthropic_sse_stream_from_gemini,
-        streaming_responses::create_anthropic_sse_stream_from_responses_with_read_offset_protection_and_trace,
+        streaming_responses::{
+            create_anthropic_sse_stream_from_responses_with_evidence,
+            create_anthropic_sse_stream_from_responses_with_read_offset_protection_and_trace,
+        },
         transform, transform_codex_anthropic, transform_codex_chat,
         transform_codex_responses_namespace, transform_gemini, transform_responses,
     },
@@ -427,13 +431,24 @@ async fn handle_claude_transform(
         let sse_stream: Box<
             dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin,
         > = if api_format == "openai_responses" {
-            Box::new(Box::pin(
-                create_anthropic_sse_stream_from_responses_with_read_offset_protection_and_trace(
-                    stream,
-                    read_offset_protection.clone(),
-                    read_trace.clone(),
-                ),
-            ))
+            if let Some(capture) = evidence.take() {
+                Box::new(Box::pin(
+                    create_anthropic_sse_stream_from_responses_with_evidence(
+                        stream,
+                        read_offset_protection.clone(),
+                        read_trace.clone(),
+                        Some(ForensicStreamObserver::new(capture)),
+                    ),
+                ))
+            } else {
+                Box::new(Box::pin(
+                    create_anthropic_sse_stream_from_responses_with_read_offset_protection_and_trace(
+                        stream,
+                        read_offset_protection.clone(),
+                        read_trace.clone(),
+                    ),
+                ))
+            }
         } else if api_format == "gemini_native" {
             Box::new(Box::pin(create_anthropic_sse_stream_from_gemini(
                 stream,

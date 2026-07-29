@@ -4,7 +4,7 @@
 //! rely on the per-user application config directory ACL; this module never
 //! shells out to mutate ACLs.
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -13,11 +13,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-#[cfg(test)]
-use super::EvidenceErrorKind;
 use super::{
     redact_protocol_value, EvidenceArtifact, EvidenceArtifactKind, EvidenceBundleId,
-    EvidenceBundleSummary, EvidenceError, EvidenceManifest, EvidenceStage, RetentionReport,
+    EvidenceBundleSummary, EvidenceError, EvidenceErrorKind, EvidenceManifest, EvidenceStage,
+    RetentionReport,
 };
 use crate::config::atomic_write;
 use crate::error::AppError;
@@ -56,8 +55,6 @@ struct PendingArtifact {
     kind: EvidenceArtifactKind,
     file_name: String,
     path: PathBuf,
-    byte_len: u64,
-    sha256: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -65,6 +62,107 @@ pub struct EvidenceBundleInfo {
     pub bundle_id: EvidenceBundleId,
     pub path: PathBuf,
     pub full_capture: bool,
+}
+
+pub struct ForensicStreamObserver {
+    capture: Option<ForensicTurnCapture>,
+    saw_terminal_event: bool,
+    output_visible: bool,
+    invalid_event: bool,
+}
+
+impl ForensicStreamObserver {
+    pub fn new(capture: ForensicTurnCapture) -> Self {
+        Self {
+            capture: Some(capture),
+            saw_terminal_event: false,
+            output_visible: false,
+            invalid_event: false,
+        }
+    }
+
+    pub fn upstream_event(&mut self, event: &Value) -> Result<(), AppError> {
+        if let Some(capture) = self.capture.as_mut() {
+            capture.append_ndjson(EvidenceArtifactKind::CodexResponse, event)?;
+        }
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.completed" | "response.incomplete") => self.mark_terminal(),
+            Some("response.failed" | "error") => {
+                self.mark_terminal();
+                self.invalid_event = true;
+            }
+            _ => {}
+        }
+        let status = event
+            .get("status")
+            .or_else(|| event.pointer("/response/status"))
+            .and_then(Value::as_str);
+        if matches!(status, Some("completed" | "incomplete")) {
+            self.mark_terminal();
+        } else if status == Some("failed") {
+            self.mark_terminal();
+            self.invalid_event = true;
+        }
+        Ok(())
+    }
+
+    pub fn claude_event(&mut self, event: &Value) -> Result<(), AppError> {
+        if let Some(capture) = self.capture.as_mut() {
+            capture.append_ndjson(EvidenceArtifactKind::ClaudeResponse, event)?;
+        }
+        match event.get("type").and_then(Value::as_str) {
+            Some("content_block_start" | "content_block_delta" | "message_delta") => {
+                self.mark_output_visible()
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub fn mark_output_visible(&mut self) {
+        self.output_visible = true;
+    }
+
+    pub fn mark_terminal(&mut self) {
+        self.saw_terminal_event = true;
+    }
+
+    pub fn mark_stream_error(&mut self) {
+        self.invalid_event = true;
+    }
+
+    pub fn finish(
+        mut self,
+        stream_error: Option<&str>,
+    ) -> Result<Option<EvidenceBundleInfo>, AppError> {
+        let Some(mut capture) = self.capture.take() else {
+            return Ok(None);
+        };
+        if stream_error.is_none() && !self.invalid_event && self.saw_terminal_event {
+            capture.discard_success()?;
+            return Ok(None);
+        }
+
+        capture.set_stage(EvidenceStage::StreamTransform);
+        let kind = if stream_error.is_some() || self.invalid_event {
+            EvidenceErrorKind::InvalidUpstreamEvent
+        } else {
+            EvidenceErrorKind::IncompleteStream
+        };
+        let safe_summary = match kind {
+            EvidenceErrorKind::InvalidUpstreamEvent => {
+                "Codex stream contained an invalid or failed event"
+            }
+            _ => "Codex stream ended before a terminal event",
+        };
+        let info = capture.commit_failure(EvidenceError {
+            kind,
+            safe_summary: safe_summary.to_string(),
+            retryable: true,
+            output_already_visible: self.output_visible,
+        })?;
+        Ok(Some(info))
+    }
 }
 
 impl BridgeForensicStore {
@@ -335,16 +433,21 @@ impl ForensicTurnCapture {
 
         let file_name = artifact_file_name(kind, "ndjson");
         let path = self.staging_dir.join(&file_name);
-        let mut bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => return Err(AppError::io(&path, error)),
-        };
-        serde_json::to_writer(&mut bytes, &outcome.value)
+        let mut line = Vec::new();
+        serde_json::to_writer(&mut line, &outcome.value)
             .map_err(|source| AppError::JsonSerialize { source })?;
-        bytes.push(b'\n');
-
-        self.write_artifact(kind, file_name, &bytes)
+        line.push(b'\n');
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|error| AppError::io(&path, error))?;
+        file.write_all(&line)
+            .map_err(|error| AppError::io(&path, error))?;
+        file.flush().map_err(|error| AppError::io(&path, error))?;
+        restrict_file_permissions(&path)?;
+        self.track_artifact(kind, file_name, path);
+        Ok(())
     }
 
     pub fn commit_failure(mut self, error: EvidenceError) -> Result<EvidenceBundleInfo, AppError> {
@@ -353,16 +456,17 @@ impl ForensicTurnCapture {
             self.remove_staged_artifacts()?;
         }
 
-        let artifacts = self
-            .artifacts
-            .iter()
-            .map(|artifact| EvidenceArtifact {
+        let mut artifacts = Vec::with_capacity(self.artifacts.len());
+        for artifact in &self.artifacts {
+            let bytes =
+                fs::read(&artifact.path).map_err(|error| AppError::io(&artifact.path, error))?;
+            artifacts.push(EvidenceArtifact {
                 kind: artifact.kind,
                 file_name: artifact.file_name.clone(),
-                byte_len: artifact.byte_len,
-                sha256: artifact.sha256.clone(),
-            })
-            .collect();
+                byte_len: bytes.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(&bytes)),
+            });
+        }
         let manifest = EvidenceManifest {
             format_version: FORENSIC_FORMAT_VERSION,
             bundle_id: self.bundle_id.clone(),
@@ -415,12 +519,15 @@ impl ForensicTurnCapture {
         atomic_write(&path, bytes)?;
         restrict_file_permissions(&path)?;
 
+        self.track_artifact(kind, file_name, path);
+        Ok(())
+    }
+
+    fn track_artifact(&mut self, kind: EvidenceArtifactKind, file_name: String, path: PathBuf) {
         let pending = PendingArtifact {
             kind,
             file_name: file_name.clone(),
             path,
-            byte_len: bytes.len() as u64,
-            sha256: format!("{:x}", Sha256::digest(bytes)),
         };
         if let Some(existing) = self
             .artifacts
@@ -431,7 +538,6 @@ impl ForensicTurnCapture {
         } else {
             self.artifacts.push(pending);
         }
-        Ok(())
     }
 
     fn note_redaction_uncertainty(&mut self, safe_for_full_capture: bool) {
