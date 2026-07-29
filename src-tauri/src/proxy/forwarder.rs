@@ -61,6 +61,16 @@ struct ClaudeCodexShadowComparison {
     request_structure_matches: bool,
 }
 
+fn claude_codex_bridge_for_mode(provider: &Provider) -> Option<ClaudeCodexBridge> {
+    match provider.claude_codex_bridge_mode() {
+        ClaudeCodexBridgeMode::Legacy => None,
+        ClaudeCodexBridgeMode::Shadow => Some(ClaudeCodexBridge::with_ledger(
+            super::claude_codex_bridge::ConversationLedger::default(),
+        )),
+        ClaudeCodexBridgeMode::Enabled => Some(ClaudeCodexBridge::builtin()),
+    }
+}
+
 fn compare_shadow_turn(
     prepared: &PreparedCodexTurn,
     legacy_request: &Value,
@@ -97,6 +107,13 @@ fn record_prepared_turn_evidence(
             .map_err(|source| crate::error::AppError::JsonSerialize { source })?;
         capture.append_ndjson(EvidenceArtifactKind::TransformDecisions, &decision)?;
     }
+    if let Some(snapshot) = prepared.ledger_snapshot(None) {
+        capture.record_json(
+            EvidenceArtifactKind::LedgerSnapshot,
+            &serde_json::to_value(snapshot)
+                .map_err(|source| crate::error::AppError::JsonSerialize { source })?,
+        )?;
+    }
     Ok(())
 }
 
@@ -117,6 +134,11 @@ fn bridge_error_kind(error: &ProxyError) -> EvidenceErrorKind {
             if message.contains("Claude tool schema cannot be represented safely") =>
         {
             EvidenceErrorKind::SchemaAdaptationLoss
+        }
+        ProxyError::InvalidRequest(message)
+            if message.contains("Claude Codex conversation state conflict") =>
+        {
+            EvidenceErrorKind::ConversationStateConflict
         }
         _ => EvidenceErrorKind::LegacyTransformFailure,
     }
@@ -1766,7 +1788,6 @@ impl RequestForwarder {
                     .unwrap_or_else(|| super::providers::get_claude_api_format(provider));
                 let (dispatch, evidence) =
                     finish_bridge_request_transform(bridge_evidence.take(), || {
-                        let bridge = ClaudeCodexBridge::builtin();
                         dispatch_claude_codex_request_with(
                             app_type,
                             provider,
@@ -1782,10 +1803,13 @@ impl RequestForwarder {
                                 )
                             },
                             |body| {
-                                bridge.prepare_turn(
+                                let bridge = claude_codex_bridge_for_mode(provider)
+                                    .expect("legacy bridge compilation must not be invoked");
+                                bridge.prepare_turn_with_session_identity(
                                     app_type,
                                     body,
                                     provider,
+                                    self.session_id.as_str(),
                                     self.session_client_provided
                                         .then_some(self.session_id.as_str()),
                                 )
@@ -1794,6 +1818,12 @@ impl RequestForwarder {
                     })?;
                 bridge_evidence = evidence;
                 prepared_codex_turn = dispatch.prepared_turn;
+                if prepared_codex_turn
+                    .as_ref()
+                    .is_some_and(|turn| turn.reused_turn)
+                {
+                    log::debug!("[ClaudeCodexBridge] reused prepared conversation turn");
+                }
                 dispatch.request
             } else {
                 adapter.transform_request(mapped_body, provider)?
@@ -4104,6 +4134,67 @@ mod tests {
     }
 
     #[test]
+    fn bridge_mode_ledger_ownership_is_legacy_none_shadow_isolated_enabled_shared() {
+        let request = json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+
+        let mut legacy = bridge_provider("codex_oauth", "openai_responses");
+        legacy.meta.as_mut().unwrap().bridge_mode = Some(ClaudeCodexBridgeMode::Legacy);
+        assert!(claude_codex_bridge_for_mode(&legacy).is_none());
+
+        let mut shadow = legacy.clone();
+        shadow.meta.as_mut().unwrap().bridge_mode = Some(ClaudeCodexBridgeMode::Shadow);
+        let shadow_first = claude_codex_bridge_for_mode(&shadow)
+            .unwrap()
+            .prepare_turn_with_session_identity(
+                &AppType::Claude,
+                request.clone(),
+                &shadow,
+                "ownership-shadow-session",
+                None,
+            )
+            .unwrap();
+        let shadow_second = claude_codex_bridge_for_mode(&shadow)
+            .unwrap()
+            .prepare_turn_with_session_identity(
+                &AppType::Claude,
+                request.clone(),
+                &shadow,
+                "ownership-shadow-session",
+                None,
+            )
+            .unwrap();
+        assert_ne!(shadow_first.turn_id, shadow_second.turn_id);
+
+        let mut enabled = legacy;
+        enabled.meta.as_mut().unwrap().bridge_mode = Some(ClaudeCodexBridgeMode::Enabled);
+        let enabled_first = claude_codex_bridge_for_mode(&enabled)
+            .unwrap()
+            .prepare_turn_with_session_identity(
+                &AppType::Claude,
+                request.clone(),
+                &enabled,
+                "ownership-enabled-session",
+                None,
+            )
+            .unwrap();
+        let enabled_retry = claude_codex_bridge_for_mode(&enabled)
+            .unwrap()
+            .prepare_turn_with_session_identity(
+                &AppType::Claude,
+                request,
+                &enabled,
+                "ownership-enabled-session",
+                None,
+            )
+            .unwrap();
+        assert_eq!(enabled_first.turn_id, enabled_retry.turn_id);
+        assert!(enabled_retry.reused_turn);
+    }
+
+    #[test]
     fn claude_codex_bridge_dispatch_enabled_returns_prepared_turn() {
         let mut provider = bridge_provider("codex_oauth", "openai_responses");
         provider.meta.as_mut().unwrap().bridge_mode =
@@ -4330,6 +4421,7 @@ mod tests {
         for kind in [
             EvidenceArtifactKind::ToolRegistry,
             EvidenceArtifactKind::CapabilityReport,
+            EvidenceArtifactKind::LedgerSnapshot,
             EvidenceArtifactKind::TransformDecisions,
         ] {
             assert!(manifest
@@ -4347,6 +4439,11 @@ mod tests {
         assert!(decisions.contains("renamed"));
         assert!(decisions.contains("normalized"));
         assert!(decisions.contains("dropped"));
+        let ledger = std::fs::read_to_string(bundle.path.join("ledger-snapshot.json")).unwrap();
+        assert!(ledger.contains("session_hash"));
+        for forbidden in ["api_key", "file_path", "prompt", "tool_result", "reasoning"] {
+            assert!(!ledger.contains(forbidden));
+        }
     }
 
     #[test]

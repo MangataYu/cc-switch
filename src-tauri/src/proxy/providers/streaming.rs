@@ -151,12 +151,14 @@ fn build_message_delta_event(stop_reason: Option<String>, usage_json: Option<Val
 }
 
 /// 创建 Anthropic SSE 流
+#[cfg(test)]
 pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
     stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     create_anthropic_sse_stream_with_read_offset_protection_and_trace(stream, None, None)
 }
 
+#[cfg(test)]
 pub(crate) fn create_anthropic_sse_stream_with_read_offset_protection<
     E: std::error::Error + Send + 'static,
 >(

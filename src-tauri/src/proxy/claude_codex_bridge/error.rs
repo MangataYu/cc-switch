@@ -38,6 +38,7 @@ impl BridgeError {
         }
     }
 
+    #[cfg(test)]
     pub fn conversation_conflict_kind(&self) -> Option<ConversationConflictKind> {
         match self {
             Self::ConversationStateConflict { kind, .. } => Some(*kind),

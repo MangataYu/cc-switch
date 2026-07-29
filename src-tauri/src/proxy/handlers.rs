@@ -35,9 +35,9 @@ use super::{
         streaming_gemini::create_anthropic_sse_stream_from_gemini,
         streaming_responses::{
             create_anthropic_sse_stream_from_responses_with_evidence,
+            create_anthropic_sse_stream_from_responses_with_prepared_turn,
+            create_anthropic_sse_stream_from_responses_with_prepared_turn_and_evidence,
             create_anthropic_sse_stream_from_responses_with_read_offset_protection_and_trace,
-            create_anthropic_sse_stream_from_responses_with_registry,
-            create_anthropic_sse_stream_from_responses_with_registry_and_evidence,
         },
         transform, transform_codex_anthropic, transform_codex_chat,
         transform_codex_responses_namespace, transform_gemini, transform_responses,
@@ -467,17 +467,14 @@ async fn handle_claude_transform(
         let sse_stream: Box<
             dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin,
         > = if api_format == "openai_responses" {
-            let tool_registry = prepared_codex_turn
-                .as_ref()
-                .map(|turn| turn.tool_registry.clone());
             if let Some(capture) = evidence.take() {
-                if let Some(tool_registry) = tool_registry {
+                if let Some(prepared_turn) = prepared_codex_turn {
                     Box::new(Box::pin(
-                        create_anthropic_sse_stream_from_responses_with_registry_and_evidence(
+                        create_anthropic_sse_stream_from_responses_with_prepared_turn_and_evidence(
                             stream,
                             read_offset_protection.clone(),
                             read_trace.clone(),
-                            tool_registry,
+                            prepared_turn,
                             Some(ForensicStreamObserver::new(capture)),
                         ),
                     ))
@@ -491,13 +488,13 @@ async fn handle_claude_transform(
                         ),
                     ))
                 }
-            } else if let Some(tool_registry) = tool_registry {
+            } else if let Some(prepared_turn) = prepared_codex_turn {
                 Box::new(Box::pin(
-                    create_anthropic_sse_stream_from_responses_with_registry(
+                    create_anthropic_sse_stream_from_responses_with_prepared_turn(
                         stream,
                         read_offset_protection.clone(),
                         read_trace.clone(),
-                        tool_registry,
+                        prepared_turn,
                     ),
                 ))
             } else {

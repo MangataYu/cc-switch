@@ -12,9 +12,11 @@ use super::{EvidenceArtifact, EvidenceArtifactKind, EvidenceManifest, FORENSIC_F
 use crate::app_config::AppType;
 use crate::error::AppError;
 use crate::provider::{Provider, ProviderMeta};
-use crate::proxy::claude_codex_bridge::{ClaudeCodexBridge, PreparedCodexTurn};
+use crate::proxy::claude_codex_bridge::{
+    ClaudeCodexBridge, ConversationLedger, PreparedCodexTurn, ToolCallState,
+};
 use crate::proxy::json_canonical::canonicalize_value;
-use crate::proxy::providers::streaming_responses::create_anthropic_sse_stream_from_responses_with_registry;
+use crate::proxy::providers::streaming_responses::create_anthropic_sse_stream_from_responses_with_prepared_turn;
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
 
 #[derive(Debug, Serialize)]
@@ -51,6 +53,53 @@ pub struct StructuralDifference {
     pub reason: String,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ConversationLedgerReplayReport {
+    pub final_state: ToolCallState,
+    pub network_requests: u32,
+}
+
+pub fn replay_conversation_lifecycle(
+    request: Value,
+    response: Value,
+    followup_request: Value,
+) -> Result<ConversationLedgerReplayReport, AppError> {
+    let bridge = ClaudeCodexBridge::with_ledger(ConversationLedger::default());
+    let provider = replay_provider();
+    let prepared = bridge
+        .prepare_turn_with_session_identity(
+            &AppType::Claude,
+            request,
+            &provider,
+            "offline-replay-session",
+            None,
+        )
+        .map_err(|error| AppError::Message(format!("request replay failed: {error}")))?;
+    let binding = prepared.ledger_binding().clone();
+    prepared
+        .consume_response(response, None, None)
+        .map_err(|error| AppError::Message(format!("response replay failed: {error}")))?;
+    bridge
+        .prepare_turn_with_session_identity(
+            &AppType::Claude,
+            followup_request,
+            &provider,
+            "offline-replay-session",
+            None,
+        )
+        .map_err(|error| AppError::Message(format!("tool_result replay failed: {error}")))?;
+    let final_state = bridge
+        .ledger()
+        .call_state(&binding, "call-1")
+        .ok_or_else(|| {
+            AppError::Message("replayed tool call did not retain a terminal state".to_string())
+        })?;
+    Ok(ConversationLedgerReplayReport {
+        final_state,
+        network_requests: 0,
+    })
+}
+
 pub fn replay_bundle(path: &Path) -> Result<ReplayReport, AppError> {
     let manifest_path = path.join("manifest.json");
     let manifest_bytes =
@@ -67,8 +116,14 @@ pub fn replay_bundle(path: &Path) -> Result<ReplayReport, AppError> {
     let claude_request = load_json_artifact(path, &manifest, EvidenceArtifactKind::ClaudeRequest)?;
     let expected_codex_request =
         load_json_artifact(path, &manifest, EvidenceArtifactKind::CodexRequest)?;
-    let prepared = ClaudeCodexBridge::builtin()
-        .prepare_turn(&AppType::Claude, claude_request, &replay_provider(), None)
+    let prepared = ClaudeCodexBridge::with_ledger(ConversationLedger::default())
+        .prepare_turn_with_session_identity(
+            &AppType::Claude,
+            claude_request,
+            &replay_provider(),
+            &manifest.session_id_hash,
+            None,
+        )
         .map_err(|error| AppError::Message(format!("request replay failed: {error}")))?;
     let actual_codex_request = prepared.request.clone();
 
@@ -175,11 +230,11 @@ fn replay_streaming(
         upstream_sse.push_str("\n\n");
     }
     let converted = futures::executor::block_on(async {
-        create_anthropic_sse_stream_from_responses_with_registry(
+        create_anthropic_sse_stream_from_responses_with_prepared_turn(
             stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(upstream_sse))]),
             None,
             None,
-            prepared.tool_registry.clone(),
+            prepared,
         )
         .collect::<Vec<_>>()
         .await
@@ -527,6 +582,8 @@ fn escape_json_pointer(value: &str) -> String {
 mod tests {
     use std::path::{Path, PathBuf};
 
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -543,9 +600,68 @@ mod tests {
     }
 
     #[test]
-    fn replays_stream_events_without_network() {
-        use serde_json::json;
+    fn replays_conversation_tool_lifecycle_without_network() {
+        use crate::proxy::claude_codex_bridge::ToolCallState;
 
+        let report = replay_conversation_lifecycle(
+            json!({
+                "model": "gpt-test",
+                "messages": [{"role": "user", "content": "read"}],
+                "tools": [{
+                    "name": "Read",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"file_path": {"type": "string"}},
+                        "required": ["file_path"]
+                    }
+                }]
+            }),
+            json!({
+                "id": "resp-1",
+                "model": "gpt-test",
+                "status": "completed",
+                "output": [{
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "read_file",
+                    "arguments": "{\"file_path\":\"src/main.rs\"}"
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }),
+            json!({
+                "model": "gpt-test",
+                "messages": [
+                    {"role": "user", "content": "read"},
+                    {"role": "assistant", "content": [{
+                        "type": "tool_use",
+                        "id": "call-1",
+                        "name": "Read",
+                        "input": {"file_path": "src/main.rs"}
+                    }]},
+                    {"role": "user", "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "call-1",
+                        "content": "contents"
+                    }]}
+                ],
+                "tools": [{
+                    "name": "Read",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"file_path": {"type": "string"}},
+                        "required": ["file_path"]
+                    }
+                }]
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(report.final_state, ToolCallState::Completed);
+        assert_eq!(report.network_requests, 0);
+    }
+
+    #[test]
+    fn replays_stream_events_without_network() {
         use crate::proxy::bridge_forensics::{
             BridgeForensicStore, CaptureMetadata, EvidenceArtifactKind, EvidenceError,
             EvidenceErrorKind,

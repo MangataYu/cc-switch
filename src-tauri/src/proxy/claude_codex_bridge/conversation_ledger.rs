@@ -67,7 +67,6 @@ pub struct ToolCallRecord {
 pub struct TurnSafeSummary {
     pub tool_call_count: usize,
     pub reasoning_item_count: usize,
-    pub last_error_kind: Option<ConversationConflictKind>,
 }
 
 #[derive(Clone, Debug)]
@@ -141,6 +140,7 @@ pub struct TurnRegistration {
     pub schema_losses: Vec<SchemaLoss>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct SessionSnapshot {
     pub session_identity_hash: String,
@@ -152,12 +152,23 @@ pub struct SessionSnapshot {
     pub expires_at: SystemTime,
 }
 
-#[derive(Clone, Debug)]
-pub struct TurnSnapshot {
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LedgerSnapshot {
+    pub session_hash: String,
+    pub generation: u64,
+    pub epoch: u64,
     pub turn_id: String,
-    pub request_fingerprint: String,
-    pub compaction_epoch: u64,
-    pub safe_summary: TurnSafeSummary,
+    pub fingerprint: String,
+    pub registry_fingerprint: String,
+    pub calls: Vec<LedgerCallSnapshot>,
+    pub error_kind: Option<ConversationConflictKind>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LedgerCallSnapshot {
+    pub tool_call_id: String,
+    pub binding_identity: String,
+    pub state: ToolCallState,
 }
 
 #[derive(Debug, Default)]
@@ -197,15 +208,24 @@ impl ConversationLedger {
         schema_losses: Vec<SchemaLoss>,
         history_fingerprints: &[String],
     ) -> Result<TurnRegistration, BridgeError> {
+        self.cleanup_expired();
         let now = SystemTime::now();
         let mut inner = self.inner.lock().expect("conversation ledger poisoned");
         touch_order(&mut inner.session_order, session_identity_hash);
         if !inner.sessions.contains_key(session_identity_hash) {
             while inner.sessions.len() >= self.limits.max_sessions {
-                let Some(oldest) = inner.session_order.pop_front() else {
+                let evictable = inner.session_order.iter().find_map(|key| {
+                    inner
+                        .sessions
+                        .get(key)
+                        .is_some_and(|session| session.turns.iter().all(turn_is_evictable))
+                        .then_some(key.clone())
+                });
+                let Some(oldest) = evictable else {
                     break;
                 };
                 inner.sessions.remove(&oldest);
+                inner.session_order.retain(|key| key != &oldest);
             }
             inner.sessions.insert(
                 session_identity_hash.to_string(),
@@ -227,6 +247,11 @@ impl ConversationLedger {
             .expect("inserted session missing");
         session.last_access = now;
         session.expires_at = now + self.limits.ttl;
+        if session.capability_profile_version != capability_snapshot.profile_version {
+            session.generation += 1;
+            session.compaction_epoch += 1;
+            session.capability_profile_version = capability_snapshot.profile_version.clone();
+        }
 
         if !session.history_fingerprints.is_empty()
             && !history_fingerprints.starts_with(&session.history_fingerprints)
@@ -235,7 +260,10 @@ impl ConversationLedger {
             for turn in &mut session.turns {
                 if turn.compaction_epoch < session.compaction_epoch {
                     turn.calls.retain(|_, call| {
-                        !matches!(call.state, ToolCallState::Completed | ToolCallState::Aborted)
+                        !matches!(
+                            call.state,
+                            ToolCallState::Completed | ToolCallState::Aborted
+                        )
                     });
                     turn.reasoning_items.retain(|_, item| {
                         !matches!(
@@ -285,8 +313,13 @@ impl ConversationLedger {
         session_identity_hash: &str,
         request_fingerprint: &str,
     ) -> Option<TurnRegistration> {
-        let inner = self.inner.lock().ok()?;
-        let session = inner.sessions.get(session_identity_hash)?;
+        self.cleanup_expired();
+        let now = SystemTime::now();
+        let mut inner = self.inner.lock().ok()?;
+        touch_order(&mut inner.session_order, session_identity_hash);
+        let session = inner.sessions.get_mut(session_identity_hash)?;
+        session.last_access = now;
+        session.expires_at = now + self.limits.ttl;
         let turn = session
             .turns
             .iter()
@@ -378,7 +411,8 @@ impl ConversationLedger {
     ) -> Result<(), BridgeError> {
         self.with_call_mut(binding, call_id, |call| match call.state {
             ToolCallState::Declared | ToolCallState::ArgumentsStreaming => {
-                call.argument_fragment_hashes.insert(fragment_hash.to_string());
+                call.argument_fragment_hashes
+                    .insert(fragment_hash.to_string());
                 call.state = ToolCallState::ArgumentsStreaming;
                 Ok(())
             }
@@ -420,11 +454,7 @@ impl ConversationLedger {
         })
     }
 
-    pub fn mark_returned(
-        &self,
-        binding: &TurnBinding,
-        call_id: &str,
-    ) -> Result<(), BridgeError> {
+    pub fn mark_returned(&self, binding: &TurnBinding, call_id: &str) -> Result<(), BridgeError> {
         self.with_call_mut(binding, call_id, |call| match call.state {
             ToolCallState::Ready => {
                 call.state = ToolCallState::ReturnedToClaude;
@@ -550,6 +580,7 @@ impl ConversationLedger {
             .map(|call| call.state)
     }
 
+    #[cfg(test)]
     pub fn session_snapshot(&self, session_identity_hash: &str) -> Option<SessionSnapshot> {
         let inner = self.inner.lock().ok()?;
         let session = inner.sessions.get(session_identity_hash)?;
@@ -564,15 +595,64 @@ impl ConversationLedger {
         })
     }
 
-    pub fn turn_snapshot(&self, binding: &TurnBinding) -> Option<TurnSnapshot> {
+    pub fn snapshot(
+        &self,
+        binding: &TurnBinding,
+        error_kind: Option<ConversationConflictKind>,
+    ) -> Option<LedgerSnapshot> {
         let inner = self.inner.lock().ok()?;
         let turn = find_turn(&inner, binding)?;
-        Some(TurnSnapshot {
+        let mut calls = turn
+            .calls
+            .values()
+            .map(|call| LedgerCallSnapshot {
+                tool_call_id: call.call_id.clone(),
+                binding_identity: call.binding_identity.clone(),
+                state: call.state,
+            })
+            .collect::<Vec<_>>();
+        calls.sort_by(|left, right| left.tool_call_id.cmp(&right.tool_call_id));
+        Some(LedgerSnapshot {
+            session_hash: binding.session_identity_hash.clone(),
+            generation: binding.generation,
+            epoch: turn.compaction_epoch,
             turn_id: turn.turn_id.clone(),
-            request_fingerprint: turn.request_fingerprint.clone(),
-            compaction_epoch: turn.compaction_epoch,
-            safe_summary: turn.safe_summary.clone(),
+            fingerprint: turn.request_fingerprint.clone(),
+            registry_fingerprint: turn.tool_registry.identity_fingerprint().to_string(),
+            calls,
+            error_kind,
         })
+    }
+
+    #[cfg(test)]
+    pub fn reasoning_state(
+        &self,
+        binding: &TurnBinding,
+        item_id: &str,
+    ) -> Option<ReasoningIdentityState> {
+        let inner = self.inner.lock().ok()?;
+        find_turn(&inner, binding)?
+            .reasoning_items
+            .get(item_id)
+            .cloned()
+    }
+
+    pub fn cleanup_expired(&self) -> usize {
+        let now = SystemTime::now();
+        let mut inner = self.inner.lock().expect("conversation ledger poisoned");
+        let expired = inner
+            .sessions
+            .iter()
+            .filter_map(|(key, session)| {
+                let protected = session.turns.iter().any(|turn| !turn_is_evictable(turn));
+                (session.expires_at <= now && !protected).then_some(key.clone())
+            })
+            .collect::<Vec<_>>();
+        for key in &expired {
+            inner.sessions.remove(key);
+        }
+        inner.session_order.retain(|key| !expired.contains(key));
+        expired.len()
     }
 
     fn with_call_mut<T>(
@@ -655,7 +735,10 @@ fn touch_order(order: &mut VecDeque<String>, session_identity_hash: &str) {
 
 fn turn_is_evictable(turn: &TurnState) -> bool {
     turn.calls.values().all(|call| {
-        matches!(call.state, ToolCallState::Completed | ToolCallState::Aborted)
+        matches!(
+            call.state,
+            ToolCallState::Completed | ToolCallState::Aborted
+        )
     }) && turn.reasoning_items.values().all(|item| {
         matches!(
             item.state,
@@ -853,10 +936,13 @@ mod tests {
 
         assert_eq!(snapshot.session_identity_hash, "session-hash");
         assert_eq!(snapshot.generation, 1);
-        assert_eq!(snapshot.capability_profile_version, "codex-oauth-2026-07-29.v1");
+        assert_eq!(
+            snapshot.capability_profile_version,
+            "codex-oauth-2026-07-29.v1"
+        );
         assert_eq!(snapshot.turn_count, 1);
         assert!(snapshot.expires_at > snapshot.last_access);
-        assert!(ledger.turn_snapshot(&first.binding).is_none());
+        assert!(ledger.snapshot(&first.binding, None).is_none());
     }
 
     #[test]
@@ -975,21 +1061,25 @@ mod tests {
             .observe_reasoning(&turn.binding, binding.clone(), ReasoningItemState::Declared)
             .unwrap();
         ledger
-            .observe_reasoning(&turn.binding, binding.clone(), ReasoningItemState::Completed)
+            .observe_reasoning(
+                &turn.binding,
+                binding.clone(),
+                ReasoningItemState::Completed,
+            )
             .unwrap();
         ledger
-            .observe_reasoning(&turn.binding, binding.clone(), ReasoningItemState::Completed)
+            .observe_reasoning(
+                &turn.binding,
+                binding.clone(),
+                ReasoningItemState::Completed,
+            )
             .unwrap();
 
         let mut wrong_model = binding;
         wrong_model.model_hash = "other-model".to_string();
         assert_eq!(
             ledger
-                .observe_reasoning(
-                    &turn.binding,
-                    wrong_model,
-                    ReasoningItemState::Completed
-                )
+                .observe_reasoning(&turn.binding, wrong_model, ReasoningItemState::Completed)
                 .unwrap_err()
                 .conversation_conflict_kind()
                 .unwrap(),
@@ -1017,5 +1107,87 @@ mod tests {
             child.binding.session_identity_hash
         );
         assert_ne!(parent.binding.turn_id, child.binding.turn_id);
+    }
+
+    #[test]
+    fn ledger_snapshot_contains_only_safe_structural_state() {
+        let ledger = ConversationLedger::default();
+        let turn = registered_turn(&ledger);
+        ledger
+            .declare_call(&turn.binding, "call-secret", "read_file")
+            .unwrap();
+        ledger
+            .mark_ready(&turn.binding, "call-secret", "hashed-arguments")
+            .unwrap();
+        ledger.mark_returned(&turn.binding, "call-secret").unwrap();
+
+        let snapshot = ledger.snapshot(&turn.binding, None).unwrap();
+        let serialized = serde_json::to_string(&snapshot).unwrap();
+
+        assert!(serialized.contains("call-secret"));
+        assert!(serialized.contains("read_file"));
+        for forbidden in [
+            "super secret prompt",
+            "fn main()",
+            "raw tool arguments",
+            "raw tool result",
+            "access_token",
+            "plaintext reasoning",
+        ] {
+            assert!(!serialized.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn ttl_cleanup_preserves_sessions_with_visible_or_active_calls() {
+        let ledger = ConversationLedger::with_limits(LedgerLimits {
+            max_sessions: 4,
+            max_turns_per_session: 4,
+            ttl: Duration::ZERO,
+        });
+        let protected = registered_turn(&ledger);
+        ledger
+            .declare_call(&protected.binding, "call-1", "read_file")
+            .unwrap();
+        ledger
+            .mark_ready(&protected.binding, "call-1", "args-hash")
+            .unwrap();
+        ledger.mark_returned(&protected.binding, "call-1").unwrap();
+
+        let removed = ledger.cleanup_expired();
+
+        assert_eq!(removed, 0);
+        assert!(ledger.session_snapshot("session-hash").is_some());
+    }
+
+    #[test]
+    fn session_capacity_never_evicts_visible_or_active_calls() {
+        let ledger = ConversationLedger::with_limits(LedgerLimits {
+            max_sessions: 1,
+            max_turns_per_session: 2,
+            ttl: Duration::from_secs(60),
+        });
+        let protected = registered_turn(&ledger);
+        ledger
+            .declare_call(&protected.binding, "call-1", "read_file")
+            .unwrap();
+        ledger
+            .mark_ready(&protected.binding, "call-1", "args-hash")
+            .unwrap();
+        ledger.mark_returned(&protected.binding, "call-1").unwrap();
+
+        ledger
+            .register_turn(
+                "second-session",
+                "second-request",
+                registry(),
+                CodexOAuthCapabilities::builtin(),
+                Vec::new(),
+                &[],
+            )
+            .unwrap();
+
+        assert!(ledger.session_snapshot("session-hash").is_some());
+        assert!(ledger.session_snapshot("second-session").is_some());
     }
 }

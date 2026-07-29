@@ -20,7 +20,10 @@ use crate::{
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::sync::{Arc, OnceLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 
 use crate::proxy::json_canonical::canonical_json_string;
 
@@ -40,9 +43,23 @@ pub struct PreparedCodexTurn {
     pub reused_turn: bool,
     ledger: ConversationLedger,
     ledger_binding: TurnBinding,
+    provider_hash: String,
+    model_hash: String,
 }
 
 static BUILTIN_LEDGER: OnceLock<ConversationLedger> = OnceLock::new();
+
+#[derive(Clone)]
+struct HistoricalToolUse {
+    claude_name: String,
+    arguments_hash: String,
+}
+
+struct HistoricalToolResult {
+    call_id: String,
+    result_hash: String,
+    matching_use: Option<HistoricalToolUse>,
+}
 
 pub fn canonical_request_fingerprint(request: &Value) -> String {
     format!(
@@ -61,7 +78,7 @@ pub fn history_fingerprints(request: &Value) -> Vec<String> {
         .collect()
 }
 
-fn session_identity_hash(session_identity: &str) -> String {
+fn stable_identity_hash(session_identity: &str) -> String {
     format!("{:x}", Sha256::digest(session_identity.as_bytes()))
 }
 
@@ -79,7 +96,9 @@ impl ClaudeCodexBridge {
     pub fn builtin() -> Self {
         Self {
             capabilities: CodexOAuthCapabilities::builtin(),
-            ledger: BUILTIN_LEDGER.get_or_init(ConversationLedger::default).clone(),
+            ledger: BUILTIN_LEDGER
+                .get_or_init(ConversationLedger::default)
+                .clone(),
         }
     }
 
@@ -94,6 +113,7 @@ impl ClaudeCodexBridge {
         &self.ledger
     }
 
+    #[cfg(test)]
     pub fn prepare_turn(
         &self,
         app_type: &AppType,
@@ -124,10 +144,17 @@ impl ClaudeCodexBridge {
             return Err(BridgeError::OutOfScope);
         }
 
-        let session_identity_hash = session_identity_hash(session_identity);
-        self.observe_tool_results(&session_identity_hash, &request)?;
+        let session_identity_hash = stable_identity_hash(session_identity);
+        let historical_results = collect_historical_tool_results(&request)?;
         let request_fingerprint = canonical_request_fingerprint(&request);
         let history_fingerprints = history_fingerprints(&request);
+        let provider_hash = stable_identity_hash(&provider.id);
+        let model_hash = stable_identity_hash(
+            request
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+        );
 
         let claude_tools = request
             .get("tools")
@@ -160,6 +187,12 @@ impl ClaudeCodexBridge {
         };
         let tool_registry = registration.tool_registry.clone();
         let capability_snapshot = registration.capability_snapshot.clone();
+        self.observe_tool_results(
+            &session_identity_hash,
+            &registration.binding,
+            tool_registry.as_ref(),
+            &historical_results,
+        )?;
         let mut request = transform_claude_request_for_api_format(
             request,
             provider,
@@ -186,46 +219,191 @@ impl ClaudeCodexBridge {
             reused_turn: registration.reused,
             ledger: self.ledger.clone(),
             ledger_binding: registration.binding,
+            provider_hash,
+            model_hash,
         })
     }
 
     fn observe_tool_results(
         &self,
         session_identity_hash: &str,
-        request: &Value,
+        turn_binding: &TurnBinding,
+        tool_registry: &ToolRegistry,
+        results: &[HistoricalToolResult],
     ) -> Result<(), BridgeError> {
-        for message in request
-            .get("messages")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            for block in message
-                .get("content")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
-            {
-                let call_id = block
-                    .get("tool_use_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let result_hash = canonical_request_fingerprint(block);
-                self.ledger.observe_result_for_session(
-                    session_identity_hash,
-                    call_id,
-                    &result_hash,
-                )?;
+        for result in results {
+            match self.ledger.observe_result_for_session(
+                session_identity_hash,
+                &result.call_id,
+                &result.result_hash,
+            ) {
+                Ok(()) => {}
+                Err(BridgeError::ConversationStateConflict {
+                    kind: ConversationConflictKind::OrphanToolResult,
+                    ..
+                }) => {
+                    let historical_use = result.matching_use.as_ref().ok_or_else(|| {
+                        BridgeError::ConversationStateConflict {
+                            kind: ConversationConflictKind::OrphanToolResult,
+                            summary: "tool_result has no matching tool_use identity".to_string(),
+                        }
+                    })?;
+                    let codex_name = tool_registry
+                        .codex_name_for_claude(&historical_use.claude_name)
+                        .map_err(|_| BridgeError::ConversationStateConflict {
+                            kind: ConversationConflictKind::UnknownToolIdentity,
+                            summary: "historical tool_use is not registered for this turn"
+                                .to_string(),
+                        })?;
+                    self.ledger
+                        .declare_call(turn_binding, &result.call_id, codex_name)?;
+                    self.ledger.arguments_streaming(
+                        turn_binding,
+                        &result.call_id,
+                        &historical_use.arguments_hash,
+                    )?;
+                    self.ledger.mark_ready(
+                        turn_binding,
+                        &result.call_id,
+                        &historical_use.arguments_hash,
+                    )?;
+                    self.ledger.mark_returned(turn_binding, &result.call_id)?;
+                    self.ledger.observe_result(
+                        turn_binding,
+                        &result.call_id,
+                        &result.result_hash,
+                    )?;
+                }
+                Err(error) => return Err(error),
             }
         }
         Ok(())
     }
 }
 
+fn collect_historical_tool_results(
+    request: &Value,
+) -> Result<Vec<HistoricalToolResult>, BridgeError> {
+    let mut tool_uses: HashMap<String, HistoricalToolUse> = HashMap::new();
+    let mut results = Vec::new();
+    for message in request
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for block in message
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            match block.get("type").and_then(Value::as_str) {
+                Some("tool_use") => {
+                    let call_id = block.get("id").and_then(Value::as_str).unwrap_or("");
+                    let claude_name = block.get("name").and_then(Value::as_str).unwrap_or("");
+                    if call_id.is_empty() || claude_name.is_empty() {
+                        return Err(BridgeError::ConversationStateConflict {
+                            kind: ConversationConflictKind::CallIdConflict,
+                            summary: "historical tool_use requires identity and name".to_string(),
+                        });
+                    }
+                    let historical_use = HistoricalToolUse {
+                        claude_name: claude_name.to_string(),
+                        arguments_hash: canonical_request_fingerprint(
+                            block.get("input").unwrap_or(&Value::Null),
+                        ),
+                    };
+                    if let Some(existing) = tool_uses.get(call_id) {
+                        if existing.claude_name != historical_use.claude_name
+                            || existing.arguments_hash != historical_use.arguments_hash
+                        {
+                            return Err(BridgeError::ConversationStateConflict {
+                                kind: ConversationConflictKind::CallIdConflict,
+                                summary: "historical call_id has conflicting tool_use identity"
+                                    .to_string(),
+                            });
+                        }
+                    } else {
+                        tool_uses.insert(call_id.to_string(), historical_use);
+                    }
+                }
+                Some("tool_result") => {
+                    let call_id = block
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    results.push(HistoricalToolResult {
+                        call_id: call_id.to_string(),
+                        result_hash: canonical_request_fingerprint(block),
+                        matching_use: tool_uses.get(call_id).cloned(),
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(results)
+}
+
 impl PreparedCodexTurn {
     pub fn ledger_binding(&self) -> &TurnBinding {
         &self.ledger_binding
+    }
+
+    pub fn ledger_snapshot(
+        &self,
+        error_kind: Option<ConversationConflictKind>,
+    ) -> Option<LedgerSnapshot> {
+        self.ledger.snapshot(&self.ledger_binding, error_kind)
+    }
+
+    pub(crate) fn observe_returned_tool_call(
+        &self,
+        codex_name: &str,
+        call_id: &str,
+        arguments: &str,
+    ) -> Result<(), BridgeError> {
+        let restored = self
+            .tool_registry
+            .restore_call(codex_name, call_id, arguments)?;
+        let arguments_hash = canonical_request_fingerprint(&restored.input);
+        self.ledger
+            .declare_call(&self.ledger_binding, call_id, codex_name)?;
+        self.ledger
+            .arguments_streaming(&self.ledger_binding, call_id, &arguments_hash)?;
+        self.ledger
+            .mark_ready(&self.ledger_binding, call_id, &arguments_hash)?;
+        self.ledger.mark_returned(&self.ledger_binding, call_id)
+    }
+
+    pub(crate) fn observe_reasoning_item(&self, item: &Value) -> Result<(), BridgeError> {
+        let item_id = item.get("id").and_then(Value::as_str).unwrap_or("");
+        if item_id.is_empty() {
+            return Err(BridgeError::ConversationStateConflict {
+                kind: ConversationConflictKind::ReasoningBindingConflict,
+                summary: "reasoning item requires a non-empty identity".to_string(),
+            });
+        }
+        let encrypted = item
+            .get("encrypted_content")
+            .cloned()
+            .unwrap_or(Value::Null);
+        self.ledger.observe_reasoning(
+            &self.ledger_binding,
+            ReasoningBinding {
+                item_id: item_id.to_string(),
+                content_hash: canonical_request_fingerprint(&encrypted),
+                identity_hash: canonical_request_fingerprint(&serde_json::json!({
+                    "id": item_id,
+                    "type": "reasoning"
+                })),
+                provider_hash: self.provider_hash.clone(),
+                model_hash: self.model_hash.clone(),
+                capability_profile_version: self.capability_snapshot.profile_version.clone(),
+            },
+            ReasoningItemState::Completed,
+        )
     }
 
     pub(crate) fn finalize_request(&mut self, request: Value) -> Result<(), BridgeError> {
@@ -249,6 +427,15 @@ impl PreparedCodexTurn {
         read_offset_protection: Option<&ReadOffsetProtection>,
         read_trace: Option<&ReadTrace>,
     ) -> Result<Value, BridgeError> {
+        for item in response
+            .get("output")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
+        {
+            self.observe_reasoning_item(item)?;
+        }
         let tool_calls = response
             .get("output")
             .and_then(Value::as_array)
@@ -258,10 +445,7 @@ impl PreparedCodexTurn {
             .map(|item| {
                 let codex_name = item.get("name").and_then(Value::as_str).unwrap_or("");
                 let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
-                let arguments = item
-                    .get("arguments")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+                let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or("");
                 let restored = self
                     .tool_registry
                     .restore_call(codex_name, call_id, arguments)?;
@@ -275,6 +459,8 @@ impl PreparedCodexTurn {
         for (call_id, codex_name, arguments_hash) in &tool_calls {
             self.ledger
                 .declare_call(&self.ledger_binding, call_id, codex_name)?;
+            self.ledger
+                .arguments_streaming(&self.ledger_binding, call_id, arguments_hash)?;
             self.ledger
                 .mark_ready(&self.ledger_binding, call_id, arguments_hash)?;
         }
@@ -291,8 +477,7 @@ impl PreparedCodexTurn {
             .tool_registry
             .restore_anthropic_message(&upstream_response, &anthropic)?;
         for (call_id, _, _) in &tool_calls {
-            self.ledger
-                .mark_returned(&self.ledger_binding, call_id)?;
+            self.ledger.mark_returned(&self.ledger_binding, call_id)?;
         }
         Ok(anthropic)
     }
@@ -747,11 +932,103 @@ mod tests {
         );
 
         assert_eq!(
-            result
-                .unwrap_err()
-                .conversation_conflict_kind()
-                .unwrap(),
+            result.unwrap_err().conversation_conflict_kind().unwrap(),
             ConversationConflictKind::OrphanToolResult
+        );
+    }
+
+    #[test]
+    fn response_reasoning_is_recorded_as_bound_hashes_without_plaintext() {
+        let bridge = ClaudeCodexBridge::with_ledger(ConversationLedger::default());
+        let prepared = bridge
+            .prepare_turn_with_session_identity(
+                &AppType::Claude,
+                json!({
+                    "model": "gpt-test",
+                    "messages": [{"role": "user", "content": "think"}]
+                }),
+                &provider("codex_oauth", "openai_responses"),
+                "session-1",
+                Some("session-1"),
+            )
+            .unwrap();
+
+        prepared
+            .consume_response(
+                json!({
+                    "id": "resp-1",
+                    "model": "gpt-test",
+                    "status": "completed",
+                    "output": [{
+                        "type": "reasoning",
+                        "id": "rs-1",
+                        "summary": [],
+                        "encrypted_content": "opaque-ciphertext"
+                    }, {
+                        "type": "message",
+                        "id": "msg-1",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "done"}]
+                    }],
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                }),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let state = bridge
+            .ledger()
+            .reasoning_state(prepared.ledger_binding(), "rs-1")
+            .unwrap();
+        assert_eq!(state.state, ReasoningItemState::Completed);
+        assert_ne!(state.content_hash, "opaque-ciphertext");
+        assert_ne!(state.provider_hash, "bridge-test");
+        assert_ne!(state.model_hash, "gpt-test");
+    }
+
+    #[test]
+    fn paired_history_rebuilds_completed_call_after_process_local_state_loss() {
+        let bridge = ClaudeCodexBridge::with_ledger(ConversationLedger::default());
+        let prepared = bridge
+            .prepare_turn_with_session_identity(
+                &AppType::Claude,
+                json!({
+                    "model": "gpt-test",
+                    "messages": [
+                        {"role": "user", "content": "read"},
+                        {"role": "assistant", "content": [{
+                            "type": "tool_use",
+                            "id": "historical-call",
+                            "name": "Read",
+                            "input": {"file_path": "src/main.rs"}
+                        }]},
+                        {"role": "user", "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "historical-call",
+                            "content": "contents"
+                        }]}
+                    ],
+                    "tools": [{
+                        "name": "Read",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"file_path": {"type": "string"}},
+                            "required": ["file_path"]
+                        }
+                    }]
+                }),
+                &provider("codex_oauth", "openai_responses"),
+                "restarted-session",
+                Some("restarted-session"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            bridge
+                .ledger()
+                .call_state(prepared.ledger_binding(), "historical-call"),
+            Some(ToolCallState::Completed)
         );
     }
 }

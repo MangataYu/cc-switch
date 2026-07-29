@@ -30,7 +30,10 @@ mod prompt_files;
 mod provider;
 mod provider_defaults;
 mod proxy;
-pub use proxy::bridge_forensics::{replay_bundle, ReplayMode, ReplayReport, StructuralDifference};
+pub use proxy::bridge_forensics::{
+    replay_bundle, replay_conversation_lifecycle, ConversationLedgerReplayReport, ReplayMode,
+    ReplayReport, StructuralDifference,
+};
 mod services;
 mod session_manager;
 mod settings;

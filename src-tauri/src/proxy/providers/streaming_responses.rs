@@ -18,7 +18,7 @@ use super::transform_responses::{
     responses_to_anthropic_with_read_offset_protection_and_trace,
 };
 use crate::proxy::bridge_forensics::ForensicStreamObserver;
-use crate::proxy::claude_codex_bridge::ToolRegistry;
+use crate::proxy::claude_codex_bridge::{PreparedCodexTurn, ToolRegistry};
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
@@ -329,6 +329,7 @@ fn resolve_content_index(
 ///
 /// 状态机跟踪: message_id, current_model, has_sent_message_start, item/content index map
 /// SSE 解析支持 named events (event: + data: 行)
+#[cfg(test)]
 pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 'static>(
     stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
@@ -337,6 +338,7 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
     )
 }
 
+#[cfg(test)]
 pub(crate) fn create_anthropic_sse_stream_from_responses_with_read_offset_protection<
     E: std::error::Error + Send + 'static,
 >(
@@ -362,9 +364,11 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_read_offset_protec
         read_offset_protection,
         read_trace,
         None,
+        None,
     )
 }
 
+#[cfg(test)]
 pub(crate) fn create_anthropic_sse_stream_from_responses_with_registry<
     E: std::error::Error + Send + 'static,
 >(
@@ -378,6 +382,24 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_registry<
         read_offset_protection,
         read_trace,
         Some(tool_registry),
+        None,
+    )
+}
+
+pub(crate) fn create_anthropic_sse_stream_from_responses_with_prepared_turn<
+    E: std::error::Error + Send + 'static,
+>(
+    stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+    read_offset_protection: Option<ReadOffsetProtection>,
+    read_trace: Option<ReadTrace>,
+    prepared_turn: PreparedCodexTurn,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    create_anthropic_sse_stream_from_responses_core(
+        stream,
+        read_offset_protection,
+        read_trace,
+        Some(prepared_turn.tool_registry.clone()),
+        Some(prepared_turn),
     )
 }
 
@@ -396,17 +418,18 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_evidence<
         read_offset_protection,
         read_trace,
         None,
+        None,
     );
     observe_claude_stream(converted, observer)
 }
 
-pub(crate) fn create_anthropic_sse_stream_from_responses_with_registry_and_evidence<
+pub(crate) fn create_anthropic_sse_stream_from_responses_with_prepared_turn_and_evidence<
     E: std::error::Error + Send + 'static,
 >(
     stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
     read_offset_protection: Option<ReadOffsetProtection>,
     read_trace: Option<ReadTrace>,
-    tool_registry: Arc<ToolRegistry>,
+    prepared_turn: PreparedCodexTurn,
     evidence: Option<ForensicStreamObserver>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     let observer = Arc::new(Mutex::new(evidence));
@@ -415,7 +438,8 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_registry_and_evide
         upstream,
         read_offset_protection,
         read_trace,
-        Some(tool_registry),
+        Some(prepared_turn.tool_registry.clone()),
+        Some(prepared_turn),
     );
     observe_claude_stream(converted, observer)
 }
@@ -425,6 +449,7 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
     read_offset_protection: Option<ReadOffsetProtection>,
     read_trace: Option<ReadTrace>,
     tool_registry: Option<Arc<ToolRegistry>>,
+    prepared_turn: Option<PreparedCodexTurn>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let mut buffer = String::new();
@@ -487,6 +512,39 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                     if looks_like_json && is_eof {
                         match serde_json::from_str::<Value>(buffer.trim()) {
                             Ok(body) => {
+                                if let Some(prepared) = prepared_turn.as_ref() {
+                                    let ledger_result = body
+                                        .get("output")
+                                        .and_then(Value::as_array)
+                                        .into_iter()
+                                        .flatten()
+                                        .filter(|item| {
+                                            item.get("type").and_then(Value::as_str)
+                                                == Some("function_call")
+                                        })
+                                        .try_for_each(|item| {
+                                            prepared.observe_returned_tool_call(
+                                                item.get("name")
+                                                    .and_then(Value::as_str)
+                                                    .unwrap_or(""),
+                                                item.get("call_id")
+                                                    .and_then(Value::as_str)
+                                                    .unwrap_or(""),
+                                                item.get("arguments")
+                                                    .and_then(Value::as_str)
+                                                    .unwrap_or(""),
+                                            )
+                                        });
+                                    if let Err(error) = ledger_result {
+                                        yield Ok(anthropic_error_sse(
+                                            &error.to_string(),
+                                            "conversation_state_conflict",
+                                        ));
+                                        terminated = true;
+                                        buffer.clear();
+                                        continue;
+                                    }
+                                }
                                 for event in responses_json_to_anthropic_sse(
                                     body,
                                     read_offset_protection.as_ref(),
@@ -1300,6 +1358,20 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                                 continue;
                                             }
                                         };
+                                        if let Some(prepared) = prepared_turn.as_ref() {
+                                            if let Err(error) = prepared.observe_returned_tool_call(
+                                                codex_name,
+                                                call_id,
+                                                &raw,
+                                            ) {
+                                                yield Ok(anthropic_error_sse(
+                                                    &error.to_string(),
+                                                    "conversation_state_conflict",
+                                                ));
+                                                terminated = true;
+                                                continue;
+                                            }
+                                        }
                                         yield Ok(anthropic_sse(
                                             "content_block_start",
                                             &json!({
@@ -1949,6 +2021,20 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                                         continue;
                                                     }
                                                 };
+                                                if let Some(prepared) = prepared_turn.as_ref() {
+                                                    if let Err(error) = prepared.observe_returned_tool_call(
+                                                        codex_name,
+                                                        call_id,
+                                                        &raw,
+                                                    ) {
+                                                        yield Ok(anthropic_error_sse(
+                                                            &error.to_string(),
+                                                            "conversation_state_conflict",
+                                                        ));
+                                                        terminated = true;
+                                                        continue;
+                                                    }
+                                                }
                                                 yield Ok(anthropic_sse(
                                                     "content_block_start",
                                                     &json!({
@@ -2089,6 +2175,16 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                         }
                                     }
                                     Some("reasoning") => {
+                                        if let Some(prepared) = prepared_turn.as_ref() {
+                                            if let Err(error) = prepared.observe_reasoning_item(item) {
+                                                yield Ok(anthropic_error_sse(
+                                                    &error.to_string(),
+                                                    "conversation_state_conflict",
+                                                ));
+                                                terminated = true;
+                                                continue;
+                                            }
+                                        }
                                         let item_id = item
                                             .get("id")
                                             .and_then(Value::as_str)
@@ -2445,7 +2541,14 @@ fn mark_observer_stream_error(observer: &SharedForensicObserver) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proxy::claude_codex_bridge::{CodexOAuthCapabilities, ToolRegistry};
+    use crate::{
+        app_config::AppType,
+        provider::{Provider, ProviderMeta},
+        proxy::claude_codex_bridge::{
+            ClaudeCodexBridge, CodexOAuthCapabilities, ConversationLedger, ToolCallState,
+            ToolRegistry,
+        },
+    };
     use futures::stream;
     use futures::StreamExt;
     use std::collections::HashMap;
@@ -2496,6 +2599,74 @@ mod tests {
         .into_iter()
         .map(|chunk| String::from_utf8_lossy(chunk.unwrap().as_ref()).to_string())
         .collect()
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_marks_validated_tool_call_returned_to_claude() {
+        let provider = Provider {
+            id: "stream-ledger".to_string(),
+            name: "Stream Ledger".to_string(),
+            settings_config: json!({}),
+            website_url: None,
+            category: Some("claude".to_string()),
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: Some(ProviderMeta {
+                provider_type: Some("codex_oauth".to_string()),
+                api_format: Some("openai_responses".to_string()),
+                ..ProviderMeta::default()
+            }),
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        };
+        let bridge = ClaudeCodexBridge::with_ledger(ConversationLedger::default());
+        let prepared = bridge
+            .prepare_turn_with_session_identity(
+                &AppType::Claude,
+                json!({
+                    "model": "gpt-test",
+                    "messages": [{"role": "user", "content": "read"}],
+                    "tools": [{
+                        "name": "Read",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"file_path": {"type": "string"}},
+                            "required": ["file_path"]
+                        }
+                    }]
+                }),
+                &provider,
+                "session-1",
+                Some("session-1"),
+            )
+            .unwrap();
+        let binding = prepared.ledger_binding().clone();
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\",\"model\":\"gpt-test\"}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"item-1\",\"type\":\"function_call\",\"call_id\":\"call-1\",\"name\":\"read_file\"}}\n\n",
+            "event: response.function_call_arguments.done\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"item-1\",\"output_index\":0,\"arguments\":\"{\\\"file_path\\\":\\\"src/main.rs\\\"}\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
+        );
+        let chunks = create_anthropic_sse_stream_from_responses_with_prepared_turn(
+            stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(input))]),
+            None,
+            None,
+            prepared,
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        assert!(chunks.iter().all(Result::is_ok));
+        assert_eq!(
+            bridge.ledger().call_state(&binding, "call-1"),
+            Some(ToolCallState::ReturnedToClaude)
+        );
     }
 
     fn evidence_capture(
