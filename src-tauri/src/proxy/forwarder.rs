@@ -2348,7 +2348,9 @@ impl RequestForwarder {
                     // Claude→Responses gateways can also return a semantic failure in an
                     // HTTP 2xx Response object. Validate buffered/JSON bodies inside the
                     // retry loop so an early failure can still select another provider.
-                    response = self.validate_responses_success_response(response).await?;
+                    response = self
+                        .validate_responses_success_response(response, &mut bridge_evidence)
+                        .await?;
                 } else {
                     // Delay committing the downstream stream until the upstream emits
                     // either productive output or a valid non-failure terminal event.
@@ -2377,7 +2379,15 @@ impl RequestForwarder {
                 },
                 None => raw.to_vec(),
             };
+            let evidence_response = serde_json::from_slice::<Value>(&decoded).ok();
             let body_text = String::from_utf8(decoded).ok();
+
+            commit_bridge_upstream_rejection(
+                bridge_evidence.take(),
+                status_code,
+                evidence_response.as_ref(),
+                "Codex upstream rejected request",
+            );
 
             Err(ProxyError::UpstreamError {
                 status: status_code,
@@ -2449,6 +2459,7 @@ impl RequestForwarder {
     async fn validate_responses_success_response(
         &self,
         response: ProxyResponse,
+        evidence: &mut Option<ForensicTurnCapture>,
     ) -> Result<ProxyResponse, ProxyError> {
         let status = response.status();
         let headers = response.headers().clone();
@@ -2463,6 +2474,13 @@ impl RequestForwarder {
         };
 
         if let Some(message) = responses_error_envelope_message(&decoded) {
+            let evidence_response = serde_json::from_slice::<Value>(&decoded).ok();
+            commit_bridge_upstream_rejection(
+                evidence.take(),
+                status.as_u16(),
+                evidence_response.as_ref(),
+                "Codex upstream returned a semantic failure",
+            );
             return Err(ProxyError::TransformError(format!(
                 "Responses upstream returned a 2xx failure: {message}"
             )));
@@ -3601,6 +3619,45 @@ where
     }
 }
 
+fn commit_bridge_upstream_rejection(
+    evidence: Option<ForensicTurnCapture>,
+    status: u16,
+    response: Option<&Value>,
+    safe_summary: &str,
+) {
+    let Some(mut capture) = evidence else {
+        return;
+    };
+    capture.set_stage(EvidenceStage::UpstreamResponse);
+    if let Some(response) = response {
+        if let Err(error) = capture.record_json(EvidenceArtifactKind::CodexResponse, response) {
+            log::warn!("[BridgeEvidence] capture_failed stage=upstream_response error={error}");
+            let _ = capture.discard_success();
+            return;
+        }
+    } else {
+        capture.suppress_full_capture(
+            "unstructured upstream response could not be safely credential-redacted",
+        );
+    }
+
+    let evidence_error = EvidenceError {
+        kind: EvidenceErrorKind::UpstreamRejected,
+        safe_summary: format!("{safe_summary} (status {status})"),
+        retryable: status == 429 || status >= 500,
+        output_already_visible: false,
+    };
+    match capture.commit_failure(evidence_error) {
+        Ok(bundle) => log::error!(
+            "[BridgeEvidence] bundle_id={} stage=upstream_response summary=codex_upstream_rejected status={status}",
+            bundle.bundle_id.0
+        ),
+        Err(error) => {
+            log::warn!("[BridgeEvidence] capture_failed stage=upstream_response error={error}")
+        }
+    }
+}
+
 fn log_prompt_cache_trace(
     app_type: &AppType,
     provider: &Provider,
@@ -3812,6 +3869,49 @@ mod tests {
             .artifacts
             .iter()
             .any(|artifact| artifact.kind == EvidenceArtifactKind::CodexRequest));
+    }
+
+    #[test]
+    fn captures_codex_oauth_upstream_rejection() {
+        use crate::proxy::bridge_forensics::{
+            BridgeForensicStore, CaptureMetadata, EvidenceErrorKind, EvidenceManifest,
+            EvidenceStage,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = BridgeForensicStore::new(temp.path().to_path_buf());
+        let capture = store
+            .begin_turn(CaptureMetadata {
+                provider_id: "provider-1".to_string(),
+                model: "gpt-test".to_string(),
+                session_id_hash: "session-hash".to_string(),
+            })
+            .unwrap();
+        let response = json!({
+            "error": {"message": "rate limited"},
+            "access_token": "must-redact"
+        });
+
+        commit_bridge_upstream_rejection(
+            Some(capture),
+            429,
+            Some(&response),
+            "Codex upstream rejected request",
+        );
+
+        let bundles = store.list_bundles().unwrap();
+        assert_eq!(bundles.len(), 1);
+        let bundle_path = temp.path().join("bundles").join(&bundles[0].bundle_id.0);
+        let manifest: EvidenceManifest =
+            serde_json::from_slice(&std::fs::read(bundle_path.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest.stage, EvidenceStage::UpstreamResponse);
+        assert_eq!(manifest.error.kind, EvidenceErrorKind::UpstreamRejected);
+        let captured: Value = serde_json::from_slice(
+            &std::fs::read(bundle_path.join("codex-response.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(captured["access_token"], "[REDACTED]");
     }
 
     fn test_forwarder(

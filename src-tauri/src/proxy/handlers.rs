@@ -8,6 +8,9 @@
 //! - Claude 的格式转换逻辑保留在此文件（用于 OpenRouter 旧接口回退）
 
 use super::{
+    bridge_forensics::{
+        EvidenceArtifactKind, EvidenceError, EvidenceErrorKind, EvidenceStage, ForensicTurnCapture,
+    },
     content_encoding::{decompress_body, get_content_encoding, is_supported_content_encoding},
     error_mapper::{get_error_message, map_proxy_error_to_status},
     forwarder::ActiveConnectionGuard,
@@ -216,6 +219,7 @@ async fn handle_messages_for_app(
     };
 
     let connection_guard = result.connection_guard.take();
+    let bridge_evidence = result.bridge_evidence.take();
     ctx.outbound_model = result.outbound_model.take();
     ctx.provider = result.provider;
     let api_format = result
@@ -238,6 +242,7 @@ async fn handle_messages_for_app(
             &body,
             is_stream,
             &api_format,
+            bridge_evidence,
             connection_guard,
         )
         .await;
@@ -375,6 +380,7 @@ async fn handle_claude_transform(
     original_body: &Value,
     is_stream: bool,
     api_format: &str,
+    mut evidence: Option<ForensicTurnCapture>,
     connection_guard: Option<ActiveConnectionGuard>,
 ) -> Result<axum::response::Response, ProxyError> {
     let status = response.status();
@@ -601,12 +607,15 @@ async fn handle_claude_transform(
     });
 
     // 根据 api_format 选择非流式转换器
+    let bridge_capture_active = evidence.is_some();
     let transform_result = if api_format == "openai_responses" {
-        transform_responses::responses_to_anthropic_with_read_offset_protection_and_trace(
-            upstream_response,
-            read_offset_protection.as_ref(),
-            read_trace.as_ref(),
-        )
+        finish_bridge_response_transform(evidence.take(), upstream_response, |upstream_response| {
+            transform_responses::responses_to_anthropic_with_read_offset_protection_and_trace(
+                upstream_response,
+                read_offset_protection.as_ref(),
+                read_trace.as_ref(),
+            )
+        })
     } else if api_format == "gemini_native" {
         transform_gemini::gemini_to_anthropic_with_shadow_and_hints(
             upstream_response,
@@ -625,7 +634,13 @@ async fn handle_claude_transform(
     let anthropic_response = match transform_result {
         Ok(response) => response,
         Err(error) => {
-            log::error!("[Claude] 转换响应失败: {error}");
+            if bridge_capture_active {
+                log::error!(
+                    "[Claude] Codex Responses conversion failed; see BridgeEvidence bundle"
+                );
+            } else {
+                log::error!("[Claude] 转换响应失败: {error}");
+            }
             if usage_logging_enabled(state) {
                 if let Some(log) = raw_usage_response.as_ref().and_then(|response| {
                     prepare_claude_usage_log(ctx, response, status.as_u16(), false)
@@ -670,6 +685,67 @@ async fn handle_claude_transform(
         log::error!("[Claude] 构建响应失败: {e}");
         ProxyError::Internal(format!("Failed to build response: {e}"))
     })
+}
+
+fn finish_bridge_response_transform<F>(
+    mut evidence: Option<ForensicTurnCapture>,
+    upstream_response: Value,
+    transform: F,
+) -> Result<Value, ProxyError>
+where
+    F: FnOnce(Value) -> Result<Value, ProxyError>,
+{
+    if let Some(mut capture) = evidence.take() {
+        match capture.record_json(EvidenceArtifactKind::CodexResponse, &upstream_response) {
+            Ok(()) => evidence = Some(capture),
+            Err(error) => {
+                log::warn!("[BridgeEvidence] capture_failed stage=codex_response error={error}");
+                let _ = capture.discard_success();
+            }
+        }
+    }
+
+    match transform(upstream_response) {
+        Ok(response) => {
+            if let Some(mut capture) = evidence {
+                if let Err(error) =
+                    capture.record_json(EvidenceArtifactKind::ClaudeResponse, &response)
+                {
+                    log::warn!(
+                        "[BridgeEvidence] capture_failed stage=claude_response error={error}"
+                    );
+                }
+                if let Err(error) = capture.discard_success() {
+                    log::warn!(
+                        "[BridgeEvidence] capture_failed stage=discard_success error={error}"
+                    );
+                }
+            }
+            Ok(response)
+        }
+        Err(error) => {
+            if let Some(mut capture) = evidence {
+                capture.set_stage(EvidenceStage::ResponseTransform);
+                let evidence_error = EvidenceError {
+                    kind: EvidenceErrorKind::SchemaAdaptationLoss,
+                    safe_summary: "Codex response could not be converted to Claude protocol"
+                        .to_string(),
+                    retryable: false,
+                    output_already_visible: false,
+                };
+                match capture.commit_failure(evidence_error) {
+                    Ok(bundle) => log::error!(
+                        "[BridgeEvidence] bundle_id={} stage=response_transform summary=codex_response_conversion_failed",
+                        bundle.bundle_id.0
+                    ),
+                    Err(capture_error) => log::warn!(
+                        "[BridgeEvidence] capture_failed stage=response_transform error={capture_error}"
+                    ),
+                }
+            }
+            Err(error)
+        }
+    }
 }
 
 fn endpoint_with_query(uri: &axum::http::Uri, endpoint: &str) -> String {
@@ -2689,10 +2765,75 @@ async fn log_usage(
 mod tests {
     use super::{
         body_looks_like_sse, chat_sse_to_response_value, classify_body_for_diagnostics,
-        codex_proxy_error_json, responses_sse_to_response_value,
+        codex_proxy_error_json, finish_bridge_response_transform, responses_sse_to_response_value,
         should_use_claude_transform_streaming, transform, upstream_body_parse_error,
     };
     use crate::proxy::ProxyError;
+
+    #[test]
+    fn captures_non_stream_response_transform_failure() {
+        use crate::proxy::bridge_forensics::{
+            BridgeForensicStore, CaptureMetadata, EvidenceArtifactKind, EvidenceErrorKind,
+            EvidenceManifest, EvidenceStage,
+        };
+        use serde_json::json;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = BridgeForensicStore::new(temp.path().to_path_buf());
+        let mut capture = store
+            .begin_turn(CaptureMetadata {
+                provider_id: "provider-1".to_string(),
+                model: "gpt-test".to_string(),
+                session_id_hash: "session-hash".to_string(),
+            })
+            .unwrap();
+        capture
+            .record_json(
+                EvidenceArtifactKind::ClaudeRequest,
+                &json!({"messages": [{"role": "user", "content": "run tool"}]}),
+            )
+            .unwrap();
+        capture
+            .record_json(
+                EvidenceArtifactKind::CodexRequest,
+                &json!({"input": [{"role": "user", "content": "run tool"}]}),
+            )
+            .unwrap();
+        let upstream = json!({
+            "id": "resp_1",
+            "model": "gpt-test",
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "sensitive_tool_name",
+                "arguments": "{"
+            }],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+        });
+
+        let error = match finish_bridge_response_transform(Some(capture), upstream, |upstream| {
+            crate::proxy::providers::transform_responses::responses_to_anthropic(upstream)
+        }) {
+            Ok(_) => panic!("response transform should fail"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("Invalid function_call arguments"));
+        let bundles = store.list_bundles().unwrap();
+        assert_eq!(bundles.len(), 1);
+        let bundle_path = temp.path().join("bundles").join(&bundles[0].bundle_id.0);
+        let manifest: EvidenceManifest =
+            serde_json::from_slice(&std::fs::read(bundle_path.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest.stage, EvidenceStage::ResponseTransform);
+        assert_eq!(manifest.error.kind, EvidenceErrorKind::SchemaAdaptationLoss);
+        assert!(!manifest.error.safe_summary.contains("sensitive_tool_name"));
+        assert!(bundle_path.join("codex-response.json").is_file());
+        assert!(!bundle_path.join("claude-response.json").exists());
+    }
 
     #[test]
     fn body_looks_like_sse_detects_unlabeled_sse_prefixes() {

@@ -303,6 +303,14 @@ impl ForensicTurnCapture {
         self.stage = stage;
     }
 
+    pub fn suppress_full_capture(&mut self, reason: impl Into<String>) {
+        self.full_capture_allowed = false;
+        let reason = reason.into();
+        if !self.suppression_reasons.contains(&reason) {
+            self.suppression_reasons.push(reason);
+        }
+    }
+
     pub fn record_json(
         &mut self,
         kind: EvidenceArtifactKind,
