@@ -445,6 +445,7 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
         let mut tool_had_delta: HashSet<u32> = HashSet::new();
         let mut tool_trace_by_index: HashMap<u32, ReadCallTrace> = HashMap::new();
         let mut tool_call_id_by_index: HashMap<u32, String> = HashMap::new();
+        let mut pending_registry_tools: HashSet<u32> = HashSet::new();
         let mut last_tool_index: Option<u32> = None;
         let mut reasoning_index_by_item_id: HashMap<String, u32> = HashMap::new();
         let mut reasoning_item_by_index: HashMap<u32, Value> = HashMap::new();
@@ -876,11 +877,18 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                         }
                                         last_tool_index = Some(index);
 
-                                        if open_indices.contains(&index) {
+                                        if pending_registry_tools.contains(&index)
+                                            || open_indices.contains(&index)
+                                        {
                                             continue;
                                         }
 
                                         tool_args_by_index.insert(index, String::new());
+
+                                        if tool_registry.is_some() {
+                                            pending_registry_tools.insert(index);
+                                            continue;
+                                        }
 
                                         let event = json!({
                                             "type": "content_block_start",
@@ -992,6 +1000,31 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                     }
                                     last_tool_index = Some(index);
 
+                                    tool_args_by_index
+                                        .entry(index)
+                                        .or_default()
+                                        .push_str(delta);
+                                    tool_had_delta.insert(index);
+
+                                    if tool_registry.is_some() {
+                                        let has_identity = tool_codex_name_by_index
+                                            .get(&index)
+                                            .is_some_and(|name| !name.is_empty());
+                                        let has_call_id = tool_call_id_by_index
+                                            .get(&index)
+                                            .is_some_and(|id| !id.is_empty());
+                                        if !has_identity || !has_call_id {
+                                            yield Ok(anthropic_error_sse(
+                                                "registered tool argument delta requires an explicit tool name and call_id",
+                                                "tool_registry_violation",
+                                            ));
+                                            terminated = true;
+                                            continue;
+                                        }
+                                        pending_registry_tools.insert(index);
+                                        continue;
+                                    }
+
                                     if !open_indices.contains(&index) {
                                         let name = tool_name_by_index
                                             .get(&index)
@@ -1022,16 +1055,6 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                             serde_json::to_string(&start_event).unwrap_or_default());
                                         yield Ok(Bytes::from(start_sse));
                                         open_indices.insert(index);
-                                    }
-
-                                    tool_args_by_index
-                                        .entry(index)
-                                        .or_default()
-                                        .push_str(delta);
-                                    tool_had_delta.insert(index);
-
-                                    if tool_registry.is_some() {
-                                        continue;
                                     }
 
                                     if tool_registry.is_none()
@@ -1094,10 +1117,15 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                 })
                                 .or(last_tool_index);
                                 if let Some(index) = index {
-                                    if !open_indices.remove(&index) {
-                                        continue;
-                                    }
                                     if let Some(registry) = tool_registry.as_deref() {
+                                        if !pending_registry_tools.remove(&index) {
+                                            yield Ok(anthropic_error_sse(
+                                                "registered tool completion has no pending tool call",
+                                                "tool_registry_violation",
+                                            ));
+                                            terminated = true;
+                                            continue;
+                                        }
                                         let raw = data
                                             .get("arguments")
                                             .or_else(|| data.pointer("/item/arguments"))
@@ -1116,27 +1144,57 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                         let call_id = tool_call_id_by_index
                                             .get(&index)
                                             .map(String::as_str)
-                                            .or(item_id)
                                             .unwrap_or("");
-                                        if let Err(error) = registry.restore_call(codex_name, call_id, &raw) {
-                                            yield Ok(anthropic_error_sse(
-                                                &error.to_string(),
-                                                "tool_registry_violation",
-                                            ));
-                                            terminated = true;
-                                            continue;
-                                        }
-                                        if !raw.is_empty() {
-                                            let event = json!({
+                                        let call = match registry.restore_call(codex_name, call_id, &raw) {
+                                            Ok(call) => call,
+                                            Err(error) => {
+                                                yield Ok(anthropic_error_sse(
+                                                    &error.to_string(),
+                                                    "tool_registry_violation",
+                                                ));
+                                                terminated = true;
+                                                continue;
+                                            }
+                                        };
+                                        yield Ok(anthropic_sse(
+                                            "content_block_start",
+                                            &json!({
+                                                "type": "content_block_start",
+                                                "index": index,
+                                                "content_block": {
+                                                    "type": "tool_use",
+                                                    "id": call.tool_use_id,
+                                                    "name": call.claude_name
+                                                }
+                                            }),
+                                        ));
+                                        yield Ok(anthropic_sse(
+                                            "content_block_delta",
+                                            &json!({
                                                 "type": "content_block_delta",
                                                 "index": index,
                                                 "delta": {
                                                     "type": "input_json_delta",
                                                     "partial_json": raw
                                                 }
-                                            });
-                                            yield Ok(anthropic_sse("content_block_delta", &event));
+                                            }),
+                                        ));
+                                        yield Ok(anthropic_sse(
+                                            "content_block_stop",
+                                            &json!({"type": "content_block_stop", "index": index}),
+                                        ));
+                                        if let Some(item_id) = item_id {
+                                            tool_index_by_item_id.remove(item_id);
                                         }
+                                        tool_name_by_index.remove(&index);
+                                        tool_codex_name_by_index.remove(&index);
+                                        tool_args_by_index.remove(&index);
+                                        tool_had_delta.remove(&index);
+                                        tool_call_id_by_index.remove(&index);
+                                        continue;
+                                    }
+                                    if !open_indices.remove(&index) {
+                                        continue;
                                     }
                                     if tool_registry.is_none()
                                         && tool_name_by_index.get(&index).map(String::as_str) == Some("Read")
@@ -1481,6 +1539,14 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                     terminated = true;
                                     continue;
                                 }
+                                if !pending_registry_tools.is_empty() {
+                                    yield Ok(anthropic_error_sse(
+                                        "registered tool call reached terminal response before validation",
+                                        "tool_registry_violation",
+                                    ));
+                                    terminated = true;
+                                    continue;
+                                }
                                 if !has_sent_message_start {
                                     if let Some(id) = response_obj.get("id").and_then(Value::as_str) {
                                         message_id = Some(id.to_string());
@@ -1621,12 +1687,16 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                                     .and_then(|key| index_by_key.get(&key).copied())
                                             })
                                             .or(last_tool_index);
-                                        if let Some(index) = index.filter(|value| open_indices.contains(value)) {
-                                            let name = tool_name_by_index
-                                                .get(&index)
-                                                .map(String::as_str)
-                                                .unwrap_or("");
+                                        if let Some(index) = index {
                                             if let Some(registry) = tool_registry.as_deref() {
+                                                if !pending_registry_tools.remove(&index) {
+                                                    yield Ok(anthropic_error_sse(
+                                                        "registered output item has no pending tool call",
+                                                        "tool_registry_violation",
+                                                    ));
+                                                    terminated = true;
+                                                    continue;
+                                                }
                                                 let raw = item
                                                     .get("arguments")
                                                     .and_then(Value::as_str)
@@ -1645,29 +1715,62 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                                 let call_id = tool_call_id_by_index
                                                     .get(&index)
                                                     .map(String::as_str)
-                                                    .or_else(|| item.get("call_id").and_then(Value::as_str))
                                                     .unwrap_or("");
-                                                if let Err(error) = registry.restore_call(codex_name, call_id, &raw) {
-                                                    yield Ok(anthropic_error_sse(
-                                                        &error.to_string(),
-                                                        "tool_registry_violation",
-                                                    ));
-                                                    terminated = true;
-                                                    continue;
-                                                }
-                                                if !raw.is_empty() {
-                                                    let event = json!({
+                                                let call = match registry.restore_call(codex_name, call_id, &raw) {
+                                                    Ok(call) => call,
+                                                    Err(error) => {
+                                                        yield Ok(anthropic_error_sse(
+                                                            &error.to_string(),
+                                                            "tool_registry_violation",
+                                                        ));
+                                                        terminated = true;
+                                                        continue;
+                                                    }
+                                                };
+                                                yield Ok(anthropic_sse(
+                                                    "content_block_start",
+                                                    &json!({
+                                                        "type": "content_block_start",
+                                                        "index": index,
+                                                        "content_block": {
+                                                            "type": "tool_use",
+                                                            "id": call.tool_use_id,
+                                                            "name": call.claude_name
+                                                        }
+                                                    }),
+                                                ));
+                                                yield Ok(anthropic_sse(
+                                                    "content_block_delta",
+                                                    &json!({
                                                         "type": "content_block_delta",
                                                         "index": index,
                                                         "delta": {
                                                             "type": "input_json_delta",
                                                             "partial_json": raw
                                                         }
-                                                    });
-                                                    yield Ok(anthropic_sse("content_block_delta", &event));
+                                                    }),
+                                                ));
+                                                yield Ok(anthropic_sse(
+                                                    "content_block_stop",
+                                                    &json!({"type": "content_block_stop", "index": index}),
+                                                ));
+                                                if let Some(id) = item_id {
+                                                    tool_index_by_item_id.remove(id);
                                                 }
-                                                tool_had_delta.insert(index);
+                                                tool_name_by_index.remove(&index);
+                                                tool_codex_name_by_index.remove(&index);
+                                                tool_args_by_index.remove(&index);
+                                                tool_had_delta.remove(&index);
+                                                tool_call_id_by_index.remove(&index);
+                                                continue;
                                             }
+                                            if !open_indices.contains(&index) {
+                                                continue;
+                                            }
+                                            let name = tool_name_by_index
+                                                .get(&index)
+                                                .map(String::as_str)
+                                                .unwrap_or("");
                                             if !tool_had_delta.contains(&index) || name == "Read" {
                                                 let raw = item
                                                     .get("arguments")
@@ -1879,9 +1982,10 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
         }
 
         if !terminated {
-            let has_open_tool = open_indices.iter().any(|index| {
-                tool_name_by_index.contains_key(index) || tool_args_by_index.contains_key(index)
-            });
+            let has_open_tool = !pending_registry_tools.is_empty()
+                || open_indices.iter().any(|index| {
+                    tool_name_by_index.contains_key(index) || tool_args_by_index.contains_key(index)
+                });
             let has_open_reasoning = open_indices.iter().any(|index| {
                 reasoning_item_by_index.contains_key(index)
                     || reasoning_text_by_index.contains_key(index)
@@ -2114,7 +2218,11 @@ mod tests {
                 "name": "Read",
                 "input_schema": {
                     "type": "object",
-                    "properties": {"file_path": {"type": "string"}},
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "pages": {"type": "string"},
+                        "offset": {"type": "number"}
+                    },
                     "required": ["file_path"],
                     "additionalProperties": false
                 }
@@ -2582,8 +2690,49 @@ mod tests {
         let converted = convert_stream_with_registry(input).await;
 
         assert!(converted.contains("tool_registry_violation"));
+        assert!(!converted.contains("\"type\":\"tool_use\""));
         assert!(!converted.contains("\"type\":\"content_block_stop\""));
         assert!(!converted.contains("\"partial_json\":\"{}\""));
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_never_synthesizes_call_id_from_item_id() {
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-test\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"item_1\",\"name\":\"read_file\",\"delta\":\"{\\\"file_path\\\":\\\"src/main.rs\\\"}\"}\n\n",
+            "event: response.function_call_arguments.done\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"item_1\"}\n\n"
+        );
+
+        let converted = convert_stream_with_registry(input).await;
+
+        assert!(converted.contains("tool_registry_violation"));
+        assert!(!converted.contains("\"type\":\"tool_use\""));
+        assert!(!converted.contains("\"id\":\"item_1\""));
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_output_item_done_emits_exact_read_arguments_once() {
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-test\"}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\"}}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":\"{\\\"file_path\\\":\\\"src/main.rs\\\",\\\"pages\\\":\\\"\\\",\\\"offset\\\":2.300310976710655e22}\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        );
+
+        let converted = convert_stream_with_registry(input).await;
+
+        assert_eq!(converted.matches("\"type\":\"tool_use\"").count(), 1);
+        assert_eq!(converted.matches("partial_json").count(), 1);
+        assert!(converted.contains("\\\"pages\\\":\\\"\\\""));
+        assert!(converted.contains("2.300310976710655e22"));
+        assert!(!converted.contains("tool_registry_violation"));
     }
 
     #[tokio::test]
