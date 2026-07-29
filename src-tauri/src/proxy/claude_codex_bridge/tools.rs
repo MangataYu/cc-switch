@@ -1,4 +1,6 @@
-use super::{adapt_schema, BridgeError, CodexOAuthCapabilities, SchemaLoss, SupportLevel};
+use super::{
+    adapt_schema, validate_arguments, BridgeError, CodexOAuthCapabilities, SchemaLoss, SupportLevel,
+};
 use crate::proxy::json_canonical::canonical_json_string;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -28,6 +30,13 @@ pub struct ToolBinding {
     pub schema_hash: String,
     pub execution_owner: ExecutionOwner,
     pub semantics: ToolSemantics,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RestoredToolCall {
+    pub claude_name: String,
+    pub tool_use_id: String,
+    pub input: Value,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -153,6 +162,69 @@ impl ToolRegistry {
 
     pub fn schema_fingerprint(&self) -> &str {
         &self.schema_fingerprint
+    }
+
+    pub fn restore_call(
+        &self,
+        codex_name: &str,
+        call_id: &str,
+        arguments: &str,
+    ) -> Result<RestoredToolCall, BridgeError> {
+        if call_id.is_empty() {
+            return registry_error("upstream tool call requires a non-empty call_id");
+        }
+        let index = self.codex_to_index.get(codex_name).ok_or_else(|| {
+            BridgeError::ToolRegistryViolation {
+                summary: format!("upstream tool is not registered for this turn: {codex_name}"),
+            }
+        })?;
+        let binding = &self.bindings[*index];
+        let input: Value =
+            serde_json::from_str(arguments).map_err(|_| BridgeError::ToolRegistryViolation {
+                summary: format!("arguments for {codex_name} are not valid JSON"),
+            })?;
+        if !input.is_object() {
+            return registry_error(&format!("arguments for {codex_name} must be a JSON object"));
+        }
+        validate_arguments(&binding.claude_schema, &input)?;
+        Ok(RestoredToolCall {
+            claude_name: binding.claude_name.clone(),
+            tool_use_id: call_id.to_string(),
+            input,
+        })
+    }
+
+    pub fn restore_response(&self, response: &Value) -> Result<Value, BridgeError> {
+        let mut restored = response.clone();
+        let output = restored
+            .get_mut("output")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| BridgeError::ToolRegistryViolation {
+                summary: "Responses payload requires an output array".to_string(),
+            })?;
+        for item in output {
+            if item.get("type").and_then(Value::as_str) != Some("function_call") {
+                continue;
+            }
+            let codex_name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let call_id = item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let arguments = item
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let call = self.restore_call(&codex_name, &call_id, &arguments)?;
+            item["name"] = Value::String(call.claude_name);
+        }
+        Ok(restored)
     }
 }
 
@@ -373,5 +445,96 @@ mod tests {
 
         assert_eq!(left.identity_fingerprint(), right.identity_fingerprint());
         assert_eq!(left.schema_fingerprint(), right.schema_fingerprint());
+    }
+
+    #[test]
+    fn restores_every_builtin_alias_to_exact_claude_identity_and_contract() {
+        let cases = [
+            ("Read", "read_file"),
+            ("Glob", "find_files"),
+            ("Grep", "search_text"),
+            ("Search", "search_text"),
+            ("Edit", "edit_file"),
+            ("Write", "write_file"),
+            ("Bash", "shell_command"),
+            ("Shell", "shell_command"),
+            ("WebFetch", "fetch_url"),
+            ("WebSearch", "search_web"),
+            ("NotebookEdit", "edit_notebook"),
+            ("Notebook", "edit_notebook"),
+            ("Task", "spawn_agent"),
+            ("Agent", "spawn_agent"),
+        ];
+
+        for (claude_name, codex_name) in cases {
+            let (registry, _) = ToolRegistry::compile(
+                &[definition(claude_name)],
+                CodexOAuthCapabilities::builtin().as_ref(),
+            )
+            .unwrap();
+            let restored = registry
+                .restore_call(codex_name, "call_exact", r#"{"value":"literal"}"#)
+                .unwrap();
+
+            assert_eq!(restored.claude_name, claude_name);
+            assert_eq!(restored.tool_use_id, "call_exact");
+            assert_eq!(restored.input, json!({"value": "literal"}));
+        }
+    }
+
+    #[test]
+    fn restoration_rejects_unknown_identity_id_and_illegal_arguments() {
+        let (registry, _) = ToolRegistry::compile(
+            &[definition("Read")],
+            CodexOAuthCapabilities::builtin().as_ref(),
+        )
+        .unwrap();
+
+        for result in [
+            registry.restore_call("unknown", "call_1", r#"{"value":"x"}"#),
+            registry.restore_call("read_file", "", r#"{"value":"x"}"#),
+            registry.restore_call("read_file", "call_1", "{"),
+            registry.restore_call("read_file", "call_1", "[]"),
+            registry.restore_call("read_file", "call_1", "{}"),
+            registry.restore_call("read_file", "call_1", r#"{"value":3}"#),
+            registry.restore_call("read_file", "call_1", r#"{"value":"x","extra":true}"#),
+        ] {
+            assert!(matches!(
+                result,
+                Err(BridgeError::ToolRegistryViolation { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn response_restoration_changes_only_registered_function_call_identity() {
+        let (registry, _) = ToolRegistry::compile(
+            &[definition("Read")],
+            CodexOAuthCapabilities::builtin().as_ref(),
+        )
+        .unwrap();
+        let response = json!({
+            "id": "resp_1",
+            "output": [
+                {"type": "message", "content": [{"type": "output_text", "text": "before"}]},
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "read_file",
+                    "arguments": "{\"value\":\"src/main.rs\"}"
+                }
+            ]
+        });
+
+        let restored = registry.restore_response(&response).unwrap();
+
+        assert_eq!(restored["output"][0], response["output"][0]);
+        assert_eq!(restored["output"][1]["name"], "Read");
+        assert_eq!(restored["output"][1]["call_id"], "call_1");
+        assert_eq!(
+            restored["output"][1]["arguments"],
+            response["output"][1]["arguments"]
+        );
+        assert_eq!(response["output"][1]["name"], "read_file");
     }
 }
