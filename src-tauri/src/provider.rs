@@ -106,6 +106,13 @@ impl Provider {
             .unwrap_or(false)
     }
 
+    pub fn claude_codex_bridge_mode(&self) -> ClaudeCodexBridgeMode {
+        self.meta
+            .as_ref()
+            .and_then(|meta| meta.bridge_mode)
+            .unwrap_or_default()
+    }
+
     pub fn has_usage_script_enabled(&self) -> bool {
         self.meta
             .as_ref()
@@ -408,6 +415,15 @@ impl LocalProxyRequestOverrides {
 }
 
 /// 供应商元数据
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeCodexBridgeMode {
+    #[default]
+    Legacy,
+    Shadow,
+    Enabled,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderMeta {
     /// 自定义端点列表（按 URL 去重存储）
@@ -486,6 +502,9 @@ pub struct ProviderMeta {
     /// Codex OAuth FAST mode: inject `service_tier = "priority"` for ChatGPT Codex requests.
     #[serde(rename = "codexFastMode", skip_serializing_if = "Option::is_none")]
     pub codex_fast_mode: Option<bool>,
+    /// Claude Code -> Codex OAuth bridge rollout mode. Missing values retain the legacy path.
+    #[serde(rename = "bridgeMode", skip_serializing_if = "Option::is_none")]
+    pub bridge_mode: Option<ClaudeCodexBridgeMode>,
     /// Codex Responses -> Chat Completions reasoning capability metadata.
     #[serde(rename = "codexChatReasoning", skip_serializing_if = "Option::is_none")]
     pub codex_chat_reasoning: Option<CodexChatReasoningConfig>,
@@ -984,11 +1003,55 @@ pub struct OpenCodeModelLimit {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaudeModelConfig, CodexModelConfig, GeminiModelConfig, LocalProxyRequestOverrides,
-        OpenCodeProviderConfig, Provider, ProviderManager, ProviderMeta, UniversalProvider,
+        ClaudeCodexBridgeMode, ClaudeModelConfig, CodexModelConfig, GeminiModelConfig,
+        LocalProxyRequestOverrides, OpenCodeProviderConfig, Provider, ProviderManager, ProviderMeta,
+        UniversalProvider,
     };
     use serde_json::json;
     use std::collections::HashMap;
+
+    fn provider_with_meta(meta: ProviderMeta) -> Provider {
+        Provider {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            settings_config: json!({}),
+            website_url: None,
+            category: None,
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: Some(meta),
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        }
+    }
+
+    #[test]
+    fn claude_codex_bridge_mode_defaults_to_legacy() {
+        let provider = provider_with_meta(ProviderMeta::default());
+
+        assert_eq!(
+            provider.claude_codex_bridge_mode(),
+            ClaudeCodexBridgeMode::Legacy
+        );
+    }
+
+    #[test]
+    fn claude_codex_bridge_mode_round_trips_provider_json() {
+        for (raw, expected) in [
+            ("legacy", ClaudeCodexBridgeMode::Legacy),
+            ("shadow", ClaudeCodexBridgeMode::Shadow),
+            ("enabled", ClaudeCodexBridgeMode::Enabled),
+        ] {
+            let meta: ProviderMeta =
+                serde_json::from_value(json!({"bridgeMode": raw})).unwrap();
+            assert_eq!(meta.bridge_mode, Some(expected));
+
+            let serialized = serde_json::to_value(meta).unwrap();
+            assert_eq!(serialized["bridgeMode"], raw);
+        }
+    }
 
     #[test]
     fn provider_meta_serializes_pricing_model_source() {
