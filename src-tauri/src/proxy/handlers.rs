@@ -12,6 +12,7 @@ use super::{
         EvidenceArtifactKind, EvidenceError, EvidenceErrorKind, EvidenceStage,
         ForensicStreamObserver, ForensicTurnCapture,
     },
+    claude_codex_bridge::PreparedCodexTurn,
     content_encoding::{decompress_body, get_content_encoding, is_supported_content_encoding},
     error_mapper::{get_error_message, map_proxy_error_to_status},
     forwarder::ActiveConnectionGuard,
@@ -224,6 +225,7 @@ async fn handle_messages_for_app(
 
     let connection_guard = result.connection_guard.take();
     let bridge_evidence = result.bridge_evidence.take();
+    let prepared_codex_turn = result.prepared_codex_turn.take();
     ctx.outbound_model = result.outbound_model.take();
     ctx.provider = result.provider;
     let api_format = result
@@ -247,6 +249,7 @@ async fn handle_messages_for_app(
             is_stream,
             &api_format,
             bridge_evidence,
+            prepared_codex_turn,
             connection_guard,
         )
         .await;
@@ -377,6 +380,34 @@ fn spawn_claude_usage_log(
     });
 }
 
+struct ClaudeCodexResponseDispatch {
+    response: Value,
+    used_prepared_turn: bool,
+}
+
+fn dispatch_claude_codex_response<F>(
+    prepared_turn: Option<&PreparedCodexTurn>,
+    response: Value,
+    legacy_codec: F,
+) -> Result<ClaudeCodexResponseDispatch, ProxyError>
+where
+    F: FnOnce(Value) -> Result<Value, ProxyError>,
+{
+    match prepared_turn {
+        Some(prepared_turn) => prepared_turn
+            .consume_response_with(response, legacy_codec)
+            .map(|response| ClaudeCodexResponseDispatch {
+                response,
+                used_prepared_turn: true,
+            })
+            .map_err(|error| error.into_proxy_error()),
+        None => legacy_codec(response).map(|response| ClaudeCodexResponseDispatch {
+            response,
+            used_prepared_turn: false,
+        }),
+    }
+}
+
 async fn handle_claude_transform(
     response: super::hyper_client::ProxyResponse,
     ctx: &RequestContext,
@@ -385,6 +416,7 @@ async fn handle_claude_transform(
     is_stream: bool,
     api_format: &str,
     mut evidence: Option<ForensicTurnCapture>,
+    prepared_codex_turn: Option<PreparedCodexTurn>,
     connection_guard: Option<ActiveConnectionGuard>,
 ) -> Result<axum::response::Response, ProxyError> {
     let status = response.status();
@@ -625,11 +657,23 @@ async fn handle_claude_transform(
     let bridge_capture_active = evidence.is_some();
     let transform_result = if api_format == "openai_responses" {
         finish_bridge_response_transform(evidence.take(), upstream_response, |upstream_response| {
-            transform_responses::responses_to_anthropic_with_read_offset_protection_and_trace(
+            dispatch_claude_codex_response(
+                prepared_codex_turn.as_ref(),
                 upstream_response,
-                read_offset_protection.as_ref(),
-                read_trace.as_ref(),
+                |upstream_response| {
+                    transform_responses::responses_to_anthropic_with_read_offset_protection_and_trace(
+                        upstream_response,
+                        read_offset_protection.as_ref(),
+                        read_trace.as_ref(),
+                    )
+                },
             )
+            .map(|dispatch| {
+                if dispatch.used_prepared_turn {
+                    log::debug!("[ClaudeCodexBridge] response delegated through prepared turn");
+                }
+                dispatch.response
+            })
         })
     } else if api_format == "gemini_native" {
         transform_gemini::gemini_to_anthropic_with_shadow_and_hints(
@@ -2780,10 +2824,76 @@ async fn log_usage(
 mod tests {
     use super::{
         body_looks_like_sse, chat_sse_to_response_value, classify_body_for_diagnostics,
-        codex_proxy_error_json, finish_bridge_response_transform, responses_sse_to_response_value,
-        should_use_claude_transform_streaming, transform, upstream_body_parse_error,
+        codex_proxy_error_json, dispatch_claude_codex_response, finish_bridge_response_transform,
+        responses_sse_to_response_value, should_use_claude_transform_streaming, transform,
+        upstream_body_parse_error,
     };
     use crate::proxy::ProxyError;
+
+    #[test]
+    fn claude_codex_bridge_response_dispatch_uses_prepared_turn_when_present() {
+        use crate::{
+            app_config::AppType,
+            provider::{Provider, ProviderMeta},
+            proxy::claude_codex_bridge::ClaudeCodexBridge,
+        };
+        use serde_json::json;
+
+        let provider = Provider {
+            id: "bridge-test".to_string(),
+            name: "Bridge Test".to_string(),
+            settings_config: json!({}),
+            website_url: None,
+            category: Some("claude".to_string()),
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: Some(ProviderMeta {
+                provider_type: Some("codex_oauth".to_string()),
+                api_format: Some("openai_responses".to_string()),
+                ..ProviderMeta::default()
+            }),
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        };
+        let prepared = ClaudeCodexBridge::builtin()
+            .prepare_turn(
+                &AppType::Claude,
+                json!({
+                    "model": "gpt-test",
+                    "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "hello"}]
+                }),
+                &provider,
+                Some("session-1"),
+            )
+            .unwrap();
+
+        let enabled =
+            dispatch_claude_codex_response(Some(&prepared), json!({"status": "completed"}), |_| {
+                Ok(json!({"served": "bridge"}))
+            })
+            .unwrap();
+        assert!(enabled.used_prepared_turn);
+        assert_eq!(enabled.response, json!({"served": "bridge"}));
+
+        let legacy = dispatch_claude_codex_response(None, json!({"status": "completed"}), |_| {
+            Ok(json!({"served": "legacy"}))
+        })
+        .unwrap();
+        assert!(!legacy.used_prepared_turn);
+        assert_eq!(legacy.response, json!({"served": "legacy"}));
+
+        assert!(ClaudeCodexBridge::builtin()
+            .prepare_turn(
+                &AppType::ClaudeDesktop,
+                json!({"model": "gpt-test", "messages": []}),
+                &provider,
+                None,
+            )
+            .is_err());
+    }
 
     #[test]
     fn captures_non_stream_response_transform_failure() {

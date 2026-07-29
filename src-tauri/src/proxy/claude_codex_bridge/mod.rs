@@ -74,7 +74,18 @@ impl ClaudeCodexBridge {
 
 impl PreparedCodexTurn {
     pub fn consume_response(&self, response: Value) -> Result<Value, BridgeError> {
-        transform_responses::responses_to_anthropic(response).map_err(BridgeError::from)
+        self.consume_response_with(response, transform_responses::responses_to_anthropic)
+    }
+
+    pub(crate) fn consume_response_with<F>(
+        &self,
+        response: Value,
+        codec: F,
+    ) -> Result<Value, BridgeError>
+    where
+        F: FnOnce(Value) -> Result<Value, crate::proxy::ProxyError>,
+    {
+        codec(response).map_err(BridgeError::from)
     }
 }
 
