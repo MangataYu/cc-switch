@@ -52,6 +52,28 @@ struct ClaudeCodexRequestDispatch {
     prepared_turn: Option<PreparedCodexTurn>,
 }
 
+struct ClaudeCodexShadowComparison {
+    registry_identity: String,
+    schema_hash: String,
+    loss_decisions_hash: String,
+    request_structure_matches: bool,
+}
+
+fn compare_shadow_turn(
+    prepared: &PreparedCodexTurn,
+    legacy_request: &Value,
+) -> ClaudeCodexShadowComparison {
+    let loss_decisions = serde_json::to_value(&prepared.negotiation_report.schema_losses)
+        .expect("schema loss decisions must serialize");
+    ClaudeCodexShadowComparison {
+        registry_identity: prepared.tool_registry.identity_fingerprint().to_string(),
+        schema_hash: prepared.tool_registry.schema_fingerprint().to_string(),
+        loss_decisions_hash: short_value_hash(Some(&loss_decisions)),
+        request_structure_matches: short_value_hash(Some(&prepared.request))
+            == short_value_hash(Some(legacy_request)),
+    }
+}
+
 fn dispatch_claude_codex_request_with<Legacy, Bridge>(
     app_type: &AppType,
     provider: &Provider,
@@ -82,13 +104,15 @@ where
             let legacy_request = legacy_compile(request)?;
             match shadow {
                 Ok(prepared) => {
-                    let matches = short_value_hash(Some(&prepared.request))
-                        == short_value_hash(Some(&legacy_request));
+                    let comparison = compare_shadow_turn(&prepared, &legacy_request);
                     log::debug!(
-                        "[ClaudeCodexBridge] mode=shadow provider={} profile={} request_match={}",
+                        "[ClaudeCodexBridge] mode=shadow provider={} profile={} registry_identity={} schema_hash={} loss_decisions={} request_match={}",
                         provider.id,
                         prepared.capability_snapshot.profile_version,
-                        matches
+                        comparison.registry_identity,
+                        comparison.schema_hash,
+                        comparison.loss_decisions_hash,
+                        comparison.request_structure_matches
                     );
                 }
                 Err(_) => log::warn!(
@@ -114,10 +138,13 @@ where
 fn synchronize_prepared_codex_request(
     prepared_turn: Option<&mut PreparedCodexTurn>,
     finalized_request: &Value,
-) {
+) -> Result<(), ProxyError> {
     if let Some(prepared_turn) = prepared_turn {
-        prepared_turn.finalize_request(finalized_request.clone());
+        prepared_turn
+            .finalize_request(finalized_request.clone())
+            .map_err(BridgeError::into_proxy_error)?;
     }
+    Ok(())
 }
 
 fn validate_codex_official_authorization(headers: &http::HeaderMap) -> Result<(), ProxyError> {
@@ -1738,7 +1765,7 @@ impl RequestForwarder {
                 }
             }
         }
-        synchronize_prepared_codex_request(prepared_codex_turn.as_mut(), &filtered_body);
+        synchronize_prepared_codex_request(prepared_codex_turn.as_mut(), &filtered_body)?;
         if let (Some(evidence), Some(prepared)) =
             (bridge_evidence.as_mut(), prepared_codex_turn.as_ref())
         {
@@ -4039,16 +4066,49 @@ mod tests {
                 Some("session-1"),
             )
             .unwrap();
-        let finalized = json!({
-            "model": "gpt-test",
-            "input": [{"role": "user", "content": "overridden"}],
-            "stream": true,
-            "store": false
-        });
+        let mut finalized = prepared.request.clone();
+        finalized["input"] = json!([{"role": "user", "content": "overridden"}]);
 
-        synchronize_prepared_codex_request(Some(&mut prepared), &finalized);
+        synchronize_prepared_codex_request(Some(&mut prepared), &finalized).unwrap();
 
         assert_eq!(prepared.request, finalized);
+    }
+
+    #[test]
+    fn shadow_comparison_covers_registry_schema_losses_and_request_structure() {
+        let provider = bridge_provider("codex_oauth", "openai_responses");
+        let claude_request = json!({
+            "model": "gpt-test",
+            "messages": [],
+            "tools": [{
+                "name": "Read",
+                "input_schema": {"properties": {"file_path": {"type": "string"}}}
+            }]
+        });
+        let legacy = crate::proxy::providers::transform_claude_request_for_api_format(
+            claude_request.clone(),
+            &provider,
+            "openai_responses",
+            None,
+            None,
+        )
+        .unwrap();
+        let prepared = ClaudeCodexBridge::builtin()
+            .prepare_turn(&AppType::Claude, claude_request, &provider, None)
+            .unwrap();
+
+        let comparison = compare_shadow_turn(&prepared, &legacy);
+
+        assert_eq!(
+            comparison.registry_identity,
+            prepared.tool_registry.identity_fingerprint()
+        );
+        assert_eq!(
+            comparison.schema_hash,
+            prepared.tool_registry.schema_fingerprint()
+        );
+        assert!(!comparison.loss_decisions_hash.is_empty());
+        assert!(!comparison.request_structure_matches);
     }
 
     #[test]

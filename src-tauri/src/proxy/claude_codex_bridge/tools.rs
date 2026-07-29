@@ -173,6 +173,16 @@ impl ToolRegistry {
         &self.schema_fingerprint
     }
 
+    pub fn codex_name_for_claude(&self, claude_name: &str) -> Result<&str, BridgeError> {
+        self.bindings
+            .iter()
+            .find(|binding| binding.claude_name == claude_name)
+            .map(|binding| binding.codex_name.as_str())
+            .ok_or_else(|| BridgeError::ToolRegistryViolation {
+                summary: format!("Claude tool is not registered for this turn: {claude_name}"),
+            })
+    }
+
     pub fn restore_call(
         &self,
         codex_name: &str,
