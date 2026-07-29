@@ -18,6 +18,7 @@ use super::transform_responses::{
     responses_to_anthropic_with_read_offset_protection_and_trace,
 };
 use crate::proxy::bridge_forensics::ForensicStreamObserver;
+use crate::proxy::claude_codex_bridge::ToolRegistry;
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
@@ -70,10 +71,22 @@ fn anthropic_error_sse(message: &str, error_type: &str) -> Bytes {
 /// Anthropic SSE lifecycle. This is used when the client requested streaming but
 /// the upstream ignored `stream:true` and returned `application/json`.
 fn responses_json_to_anthropic_sse(
-    body: Value,
+    mut body: Value,
     read_offset_protection: Option<&ReadOffsetProtection>,
     read_trace: Option<&ReadTrace>,
+    tool_registry: Option<&ToolRegistry>,
 ) -> Vec<Bytes> {
+    if let Some(registry) = tool_registry {
+        body = match registry.restore_response(&body) {
+            Ok(body) => body,
+            Err(error) => {
+                return vec![anthropic_error_sse(
+                    &error.to_string(),
+                    "tool_registry_violation",
+                )]
+            }
+        };
+    }
     let message = match responses_to_anthropic_with_read_offset_protection_and_trace(
         body,
         read_offset_protection,
@@ -332,7 +345,28 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_read_offset_protec
     read_offset_protection: Option<ReadOffsetProtection>,
     read_trace: Option<ReadTrace>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
-    create_anthropic_sse_stream_from_responses_core(stream, read_offset_protection, read_trace)
+    create_anthropic_sse_stream_from_responses_core(
+        stream,
+        read_offset_protection,
+        read_trace,
+        None,
+    )
+}
+
+pub(crate) fn create_anthropic_sse_stream_from_responses_with_registry<
+    E: std::error::Error + Send + 'static,
+>(
+    stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+    read_offset_protection: Option<ReadOffsetProtection>,
+    read_trace: Option<ReadTrace>,
+    tool_registry: Arc<ToolRegistry>,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    create_anthropic_sse_stream_from_responses_core(
+        stream,
+        read_offset_protection,
+        read_trace,
+        Some(tool_registry),
+    )
 }
 
 pub(crate) fn create_anthropic_sse_stream_from_responses_with_evidence<
@@ -349,6 +383,27 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_evidence<
         upstream,
         read_offset_protection,
         read_trace,
+        None,
+    );
+    observe_claude_stream(converted, observer)
+}
+
+pub(crate) fn create_anthropic_sse_stream_from_responses_with_registry_and_evidence<
+    E: std::error::Error + Send + 'static,
+>(
+    stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+    read_offset_protection: Option<ReadOffsetProtection>,
+    read_trace: Option<ReadTrace>,
+    tool_registry: Arc<ToolRegistry>,
+    evidence: Option<ForensicStreamObserver>,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    let observer = Arc::new(Mutex::new(evidence));
+    let upstream = observe_upstream_stream(stream, observer.clone());
+    let converted = create_anthropic_sse_stream_from_responses_core(
+        upstream,
+        read_offset_protection,
+        read_trace,
+        Some(tool_registry),
     );
     observe_claude_stream(converted, observer)
 }
@@ -357,6 +412,7 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
     stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
     read_offset_protection: Option<ReadOffsetProtection>,
     read_trace: Option<ReadTrace>,
+    tool_registry: Option<Arc<ToolRegistry>>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let mut buffer = String::new();
@@ -372,6 +428,7 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
         let mut current_text_index: Option<u32> = None;
         let mut tool_index_by_item_id: HashMap<String, u32> = HashMap::new();
         let mut tool_name_by_index: HashMap<u32, String> = HashMap::new();
+        let mut tool_codex_name_by_index: HashMap<u32, String> = HashMap::new();
         let mut tool_args_by_index: HashMap<u32, String> = HashMap::new();
         let mut tool_had_delta: HashSet<u32> = HashSet::new();
         let mut tool_trace_by_index: HashMap<u32, ReadCallTrace> = HashMap::new();
@@ -419,6 +476,7 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                     body,
                                     read_offset_protection.as_ref(),
                                     read_trace.as_ref(),
+                                    tool_registry.as_deref(),
                                 ) {
                                     yield Ok(event);
                                 }
@@ -755,7 +813,29 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                         }
 
                                         let call_id = item.get("call_id").and_then(|i| i.as_str()).unwrap_or("");
-                                        let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                                        let codex_name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                                        if tool_registry.is_some() && call_id.is_empty() {
+                                            yield Ok(anthropic_error_sse(
+                                                "registered tool call requires a non-empty call_id",
+                                                "tool_registry_violation",
+                                            ));
+                                            terminated = true;
+                                            continue;
+                                        }
+                                        let name = match tool_registry.as_deref() {
+                                            Some(registry) => match registry.claude_name_for_codex(codex_name) {
+                                                Ok(name) => name.to_string(),
+                                                Err(error) => {
+                                                    yield Ok(anthropic_error_sse(
+                                                        &error.to_string(),
+                                                        "tool_registry_violation",
+                                                    ));
+                                                    terminated = true;
+                                                    continue;
+                                                }
+                                            },
+                                            None => codex_name.to_string(),
+                                        };
                                         let index = if let Some(k) = tool_item_key_from_added(&data, item) {
                                             if let Some(existing) = index_by_key.get(&k).copied() {
                                                 existing
@@ -777,7 +857,8 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                         {
                                             tool_index_by_item_id.insert(item_id.to_string(), index);
                                         }
-                                        tool_name_by_index.insert(index, name.to_string());
+                                        tool_name_by_index.insert(index, name.clone());
+                                        tool_codex_name_by_index.insert(index, codex_name.to_string());
                                         if !call_id.is_empty() {
                                             tool_call_id_by_index.insert(index, call_id.to_string());
                                         }
@@ -874,14 +955,44 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                     if let Some(id) = item_id {
                                         tool_index_by_item_id.insert(id.to_string(), index);
                                     }
-                                    if let Some(name) = data.get("name").and_then(Value::as_str) {
-                                        tool_name_by_index.insert(index, name.to_string());
+                                    if let Some(codex_name) = data.get("name").and_then(Value::as_str) {
+                                        let name = match tool_registry.as_deref() {
+                                            Some(registry) => match registry.claude_name_for_codex(codex_name) {
+                                                Ok(name) => name.to_string(),
+                                                Err(error) => {
+                                                    yield Ok(anthropic_error_sse(
+                                                        &error.to_string(),
+                                                        "tool_registry_violation",
+                                                    ));
+                                                    terminated = true;
+                                                    continue;
+                                                }
+                                            },
+                                            None => codex_name.to_string(),
+                                        };
+                                        tool_name_by_index.insert(index, name);
+                                        tool_codex_name_by_index.insert(index, codex_name.to_string());
                                     } else {
                                         tool_name_by_index.entry(index).or_default();
+                                    }
+                                    if let Some(call_id) = data.get("call_id").and_then(Value::as_str) {
+                                        tool_call_id_by_index.insert(index, call_id.to_string());
                                     }
                                     last_tool_index = Some(index);
 
                                     if !open_indices.contains(&index) {
+                                        let name = tool_name_by_index
+                                            .get(&index)
+                                            .map(String::as_str)
+                                            .unwrap_or("");
+                                        if tool_registry.is_some() && name.is_empty() {
+                                            yield Ok(anthropic_error_sse(
+                                                "tool argument delta has no registered tool identity",
+                                                "tool_registry_violation",
+                                            ));
+                                            terminated = true;
+                                            continue;
+                                        }
                                         let start_event = json!({
                                             "type": "content_block_start",
                                             "index": index,
@@ -892,10 +1003,7 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                                     .and_then(|v| v.as_str())
                                                     .or(item_id)
                                                     .unwrap_or(""),
-                                                "name": data
-                                                    .get("name")
-                                                    .and_then(|v| v.as_str())
-                                                    .unwrap_or("")
+                                                "name": name
                                             }
                                         });
                                         let start_sse = format!("event: content_block_start\ndata: {}\n\n",
@@ -910,7 +1018,13 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                         .push_str(delta);
                                     tool_had_delta.insert(index);
 
-                                    if tool_name_by_index.get(&index).map(String::as_str) == Some("Read") {
+                                    if tool_registry.is_some() {
+                                        continue;
+                                    }
+
+                                    if tool_registry.is_none()
+                                        && tool_name_by_index.get(&index).map(String::as_str) == Some("Read")
+                                    {
                                         if let Some(trace) = read_trace.as_ref() {
                                             let call = tool_trace_by_index
                                                 .entry(index)
@@ -931,7 +1045,9 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                         }
                                     }
 
-                                    if tool_name_by_index.get(&index).map(String::as_str) == Some("Read") {
+                                    if tool_registry.is_none()
+                                        && tool_name_by_index.get(&index).map(String::as_str) == Some("Read")
+                                    {
                                         continue;
                                     }
 
@@ -969,7 +1085,50 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                     if !open_indices.remove(&index) {
                                         continue;
                                     }
-                                    if tool_name_by_index.get(&index).map(String::as_str) == Some("Read") {
+                                    if let Some(registry) = tool_registry.as_deref() {
+                                        let raw = data
+                                            .get("arguments")
+                                            .or_else(|| data.pointer("/item/arguments"))
+                                            .and_then(Value::as_str)
+                                            .map(str::to_string)
+                                            .unwrap_or_else(|| {
+                                                tool_args_by_index
+                                                    .get(&index)
+                                                    .cloned()
+                                                    .unwrap_or_default()
+                                            });
+                                        let codex_name = tool_codex_name_by_index
+                                            .get(&index)
+                                            .map(String::as_str)
+                                            .unwrap_or("");
+                                        let call_id = tool_call_id_by_index
+                                            .get(&index)
+                                            .map(String::as_str)
+                                            .or(item_id)
+                                            .unwrap_or("");
+                                        if let Err(error) = registry.restore_call(codex_name, call_id, &raw) {
+                                            yield Ok(anthropic_error_sse(
+                                                &error.to_string(),
+                                                "tool_registry_violation",
+                                            ));
+                                            terminated = true;
+                                            continue;
+                                        }
+                                        if !raw.is_empty() {
+                                            let event = json!({
+                                                "type": "content_block_delta",
+                                                "index": index,
+                                                "delta": {
+                                                    "type": "input_json_delta",
+                                                    "partial_json": raw
+                                                }
+                                            });
+                                            yield Ok(anthropic_sse("content_block_delta", &event));
+                                        }
+                                    }
+                                    if tool_registry.is_none()
+                                        && tool_name_by_index.get(&index).map(String::as_str) == Some("Read")
+                                    {
                                         let raw = data
                                             .get("arguments")
                                             .or_else(|| data.pointer("/item/arguments"))
@@ -1039,7 +1198,9 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                                 serde_json::to_string(&event).unwrap_or_default());
                                             yield Ok(Bytes::from(sse));
                                         }
-                                    } else if !tool_had_delta.contains(&index) {
+                                    } else if tool_registry.is_none()
+                                        && !tool_had_delta.contains(&index)
+                                    {
                                         // Some compatible gateways skip delta events and only
                                         // provide the complete arguments on the done event.
                                         if let Some(arguments) = data
@@ -1072,6 +1233,7 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                         tool_index_by_item_id.remove(item_id);
                                     }
                                     tool_name_by_index.remove(&index);
+                                    tool_codex_name_by_index.remove(&index);
                                     tool_args_by_index.remove(&index);
                                     tool_had_delta.remove(&index);
                                     tool_trace_by_index.remove(&index);
@@ -1452,6 +1614,48 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                                 .get(&index)
                                                 .map(String::as_str)
                                                 .unwrap_or("");
+                                            if let Some(registry) = tool_registry.as_deref() {
+                                                let raw = item
+                                                    .get("arguments")
+                                                    .and_then(Value::as_str)
+                                                    .filter(|value| !value.is_empty())
+                                                    .map(str::to_string)
+                                                    .unwrap_or_else(|| {
+                                                        tool_args_by_index
+                                                            .get(&index)
+                                                            .cloned()
+                                                            .unwrap_or_default()
+                                                    });
+                                                let codex_name = tool_codex_name_by_index
+                                                    .get(&index)
+                                                    .map(String::as_str)
+                                                    .unwrap_or("");
+                                                let call_id = tool_call_id_by_index
+                                                    .get(&index)
+                                                    .map(String::as_str)
+                                                    .or_else(|| item.get("call_id").and_then(Value::as_str))
+                                                    .unwrap_or("");
+                                                if let Err(error) = registry.restore_call(codex_name, call_id, &raw) {
+                                                    yield Ok(anthropic_error_sse(
+                                                        &error.to_string(),
+                                                        "tool_registry_violation",
+                                                    ));
+                                                    terminated = true;
+                                                    continue;
+                                                }
+                                                if !raw.is_empty() {
+                                                    let event = json!({
+                                                        "type": "content_block_delta",
+                                                        "index": index,
+                                                        "delta": {
+                                                            "type": "input_json_delta",
+                                                            "partial_json": raw
+                                                        }
+                                                    });
+                                                    yield Ok(anthropic_sse("content_block_delta", &event));
+                                                }
+                                                tool_had_delta.insert(index);
+                                            }
                                             if !tool_had_delta.contains(&index) || name == "Read" {
                                                 let raw = item
                                                     .get("arguments")
@@ -1534,6 +1738,7 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                                 tool_index_by_item_id.remove(id);
                                             }
                                             tool_name_by_index.remove(&index);
+                                            tool_codex_name_by_index.remove(&index);
                                             tool_args_by_index.remove(&index);
                                             tool_had_delta.remove(&index);
                                         }
@@ -1876,6 +2081,7 @@ fn mark_observer_stream_error(observer: &SharedForensicObserver) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::claude_codex_bridge::{CodexOAuthCapabilities, ToolRegistry};
     use futures::stream;
     use futures::StreamExt;
     use std::collections::HashMap;
@@ -1888,6 +2094,40 @@ mod tests {
             .into_iter()
             .map(|chunk| String::from_utf8_lossy(chunk.unwrap().as_ref()).to_string())
             .collect()
+    }
+
+    fn read_registry() -> Arc<ToolRegistry> {
+        let (registry, _) = ToolRegistry::compile(
+            &[json!({
+                "name": "Read",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"],
+                    "additionalProperties": false
+                }
+            })],
+            CodexOAuthCapabilities::builtin().as_ref(),
+        )
+        .unwrap();
+        Arc::new(registry)
+    }
+
+    async fn convert_stream_with_registry(input: &str) -> String {
+        let upstream = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
+            input.as_bytes(),
+        ))]);
+        create_anthropic_sse_stream_from_responses_with_registry(
+            upstream,
+            None,
+            None,
+            read_registry(),
+        )
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|chunk| String::from_utf8_lossy(chunk.unwrap().as_ref()).to_string())
+        .collect()
     }
 
     fn evidence_capture(
@@ -2272,6 +2512,89 @@ mod tests {
         assert!(merged.contains("\"input_tokens\":12"));
         assert!(merged.contains("\"output_tokens\":3"));
         assert!(merged.contains("\"type\":\"message_stop\""));
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_restores_registered_alias_and_validates_arguments() {
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-test\"}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"item_1\",\"delta\":\"{\\\"file_path\\\":\\\"src/main.rs\\\"}\"}\n\n",
+            "event: response.function_call_arguments.done\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"item_1\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        );
+
+        let converted = convert_stream_with_registry(input).await;
+
+        assert!(converted.contains("\"id\":\"call_1\""));
+        assert!(converted.contains("\"name\":\"Read\""));
+        assert!(converted.contains("src/main.rs"));
+        assert!(!converted.contains("\"name\":\"read_file\""));
+        assert!(!converted.contains("response_parse_error"));
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_rejects_unknown_tool_before_tool_use_visibility() {
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-test\"}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"unknown\"}}\n\n"
+        );
+
+        let converted = convert_stream_with_registry(input).await;
+
+        assert!(converted.contains("tool_registry_violation"));
+        assert!(!converted.contains("\"type\":\"tool_use\""));
+        assert!(!converted.contains("\"name\":\"unknown\""));
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_rejects_invalid_arguments_without_closing_tool_block() {
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-test\"}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"item_1\",\"delta\":\"{}\"}\n\n",
+            "event: response.function_call_arguments.done\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"item_1\"}\n\n"
+        );
+
+        let converted = convert_stream_with_registry(input).await;
+
+        assert!(converted.contains("tool_registry_violation"));
+        assert!(!converted.contains("\"type\":\"content_block_stop\""));
+        assert!(!converted.contains("\"partial_json\":\"{}\""));
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_json_fallback_restores_registry_identity() {
+        let input = json!({
+            "id": "resp_json",
+            "model": "gpt-test",
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_json",
+                "name": "read_file",
+                "arguments": "{\"file_path\":\"src/lib.rs\"}"
+            }]
+        })
+        .to_string();
+
+        let converted = convert_stream_with_registry(&input).await;
+
+        assert!(converted.contains("\"id\":\"call_json\""));
+        assert!(converted.contains("\"name\":\"Read\""));
+        assert!(converted.contains("src/lib.rs"));
+        assert!(!converted.contains("\"name\":\"read_file\""));
     }
 
     #[tokio::test]

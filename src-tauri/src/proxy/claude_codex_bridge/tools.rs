@@ -183,6 +183,15 @@ impl ToolRegistry {
             })
     }
 
+    pub fn claude_name_for_codex(&self, codex_name: &str) -> Result<&str, BridgeError> {
+        let index = self.codex_to_index.get(codex_name).ok_or_else(|| {
+            BridgeError::ToolRegistryViolation {
+                summary: format!("upstream tool is not registered for this turn: {codex_name}"),
+            }
+        })?;
+        Ok(self.bindings[*index].claude_name.as_str())
+    }
+
     pub fn restore_call(
         &self,
         codex_name: &str,
