@@ -1,9 +1,11 @@
 mod capabilities;
+mod conversation_ledger;
 mod error;
 mod schema;
 mod tools;
 
 pub use capabilities::*;
+pub use conversation_ledger::*;
 pub use error::*;
 pub use schema::*;
 pub use tools::*;
@@ -17,11 +19,15 @@ use crate::{
     },
 };
 use serde_json::Value;
-use std::sync::Arc;
+use sha2::{Digest, Sha256};
+use std::sync::{Arc, OnceLock};
+
+use crate::proxy::json_canonical::canonical_json_string;
 
 #[derive(Clone, Debug)]
 pub struct ClaudeCodexBridge {
     capabilities: Arc<CodexOAuthCapabilities>,
+    ledger: ConversationLedger,
 }
 
 #[derive(Clone, Debug)]
@@ -31,6 +37,32 @@ pub struct PreparedCodexTurn {
     pub tool_registry: Arc<ToolRegistry>,
     pub capability_snapshot: Arc<CodexOAuthCapabilities>,
     pub negotiation_report: NegotiationReport,
+    pub reused_turn: bool,
+    ledger: ConversationLedger,
+    ledger_binding: TurnBinding,
+}
+
+static BUILTIN_LEDGER: OnceLock<ConversationLedger> = OnceLock::new();
+
+pub fn canonical_request_fingerprint(request: &Value) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(canonical_json_string(request).as_bytes())
+    )
+}
+
+pub fn history_fingerprints(request: &Value) -> Vec<String> {
+    request
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(canonical_request_fingerprint)
+        .collect()
+}
+
+fn session_identity_hash(session_identity: &str) -> String {
+    format!("{:x}", Sha256::digest(session_identity.as_bytes()))
 }
 
 pub fn bridge_scope_matches(app_type: &AppType, provider: &Provider) -> bool {
@@ -47,7 +79,19 @@ impl ClaudeCodexBridge {
     pub fn builtin() -> Self {
         Self {
             capabilities: CodexOAuthCapabilities::builtin(),
+            ledger: BUILTIN_LEDGER.get_or_init(ConversationLedger::default).clone(),
         }
+    }
+
+    pub fn with_ledger(ledger: ConversationLedger) -> Self {
+        Self {
+            capabilities: CodexOAuthCapabilities::builtin(),
+            ledger,
+        }
+    }
+
+    pub fn ledger(&self) -> &ConversationLedger {
+        &self.ledger
     }
 
     pub fn prepare_turn(
@@ -57,9 +101,33 @@ impl ClaudeCodexBridge {
         provider: &Provider,
         session_id: Option<&str>,
     ) -> Result<PreparedCodexTurn, BridgeError> {
+        let fingerprint = canonical_request_fingerprint(&request);
+        let fallback_identity = format!("anonymous:{fingerprint}");
+        self.prepare_turn_with_session_identity(
+            app_type,
+            request,
+            provider,
+            session_id.unwrap_or(&fallback_identity),
+            session_id,
+        )
+    }
+
+    pub fn prepare_turn_with_session_identity(
+        &self,
+        app_type: &AppType,
+        request: Value,
+        provider: &Provider,
+        session_identity: &str,
+        client_session_id: Option<&str>,
+    ) -> Result<PreparedCodexTurn, BridgeError> {
         if !bridge_scope_matches(app_type, provider) {
             return Err(BridgeError::OutOfScope);
         }
+
+        let session_identity_hash = session_identity_hash(session_identity);
+        self.observe_tool_results(&session_identity_hash, &request)?;
+        let request_fingerprint = canonical_request_fingerprint(&request);
+        let history_fingerprints = history_fingerprints(&request);
 
         let claude_tools = request
             .get("tools")
@@ -70,15 +138,33 @@ impl ClaudeCodexBridge {
             .pointer("/tool_choice/name")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let capability_snapshot = self.capabilities.clone();
-        let (tool_registry, schema_losses) =
-            ToolRegistry::compile(&claude_tools, capability_snapshot.as_ref())?;
-        let tool_registry = Arc::new(tool_registry);
+        let existing = self
+            .ledger
+            .lookup_turn(&session_identity_hash, &request_fingerprint);
+        let (registration, schema_losses) = if let Some(existing) = existing {
+            let schema_losses = existing.schema_losses.clone();
+            (existing, schema_losses)
+        } else {
+            let capability_snapshot = self.capabilities.clone();
+            let (tool_registry, schema_losses) =
+                ToolRegistry::compile(&claude_tools, capability_snapshot.as_ref())?;
+            let registration = self.ledger.register_turn(
+                &session_identity_hash,
+                &request_fingerprint,
+                Arc::new(tool_registry),
+                capability_snapshot,
+                schema_losses.clone(),
+                &history_fingerprints,
+            )?;
+            (registration, schema_losses)
+        };
+        let tool_registry = registration.tool_registry.clone();
+        let capability_snapshot = registration.capability_snapshot.clone();
         let mut request = transform_claude_request_for_api_format(
             request,
             provider,
             "openai_responses",
-            session_id,
+            client_session_id,
             None,
         )?;
         request["tools"] = Value::Array(tool_registry.codex_tools().to_vec());
@@ -93,15 +179,55 @@ impl ClaudeCodexBridge {
 
         Ok(PreparedCodexTurn {
             request,
-            turn_id: uuid::Uuid::new_v4().to_string(),
+            turn_id: registration.binding.turn_id.clone(),
             tool_registry,
             capability_snapshot,
             negotiation_report,
+            reused_turn: registration.reused,
+            ledger: self.ledger.clone(),
+            ledger_binding: registration.binding,
         })
+    }
+
+    fn observe_tool_results(
+        &self,
+        session_identity_hash: &str,
+        request: &Value,
+    ) -> Result<(), BridgeError> {
+        for message in request
+            .get("messages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            for block in message
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+            {
+                let call_id = block
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let result_hash = canonical_request_fingerprint(block);
+                self.ledger.observe_result_for_session(
+                    session_identity_hash,
+                    call_id,
+                    &result_hash,
+                )?;
+            }
+        }
+        Ok(())
     }
 }
 
 impl PreparedCodexTurn {
+    pub fn ledger_binding(&self) -> &TurnBinding {
+        &self.ledger_binding
+    }
+
     pub(crate) fn finalize_request(&mut self, request: Value) -> Result<(), BridgeError> {
         if request.get("tools") != self.request.get("tools") {
             return Err(BridgeError::ToolRegistryViolation {
@@ -123,6 +249,35 @@ impl PreparedCodexTurn {
         read_offset_protection: Option<&ReadOffsetProtection>,
         read_trace: Option<&ReadTrace>,
     ) -> Result<Value, BridgeError> {
+        let tool_calls = response
+            .get("output")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+            .map(|item| {
+                let codex_name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
+                let arguments = item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let restored = self
+                    .tool_registry
+                    .restore_call(codex_name, call_id, arguments)?;
+                Ok((
+                    call_id.to_string(),
+                    codex_name.to_string(),
+                    canonical_request_fingerprint(&restored.input),
+                ))
+            })
+            .collect::<Result<Vec<_>, BridgeError>>()?;
+        for (call_id, codex_name, arguments_hash) in &tool_calls {
+            self.ledger
+                .declare_call(&self.ledger_binding, call_id, codex_name)?;
+            self.ledger
+                .mark_ready(&self.ledger_binding, call_id, arguments_hash)?;
+        }
         let upstream_response = response.clone();
         let response = self.tool_registry.restore_response(&response)?;
         let anthropic =
@@ -132,8 +287,14 @@ impl PreparedCodexTurn {
                 read_trace,
             )
             .map_err(BridgeError::from)?;
-        self.tool_registry
-            .restore_anthropic_message(&upstream_response, &anthropic)
+        let anthropic = self
+            .tool_registry
+            .restore_anthropic_message(&upstream_response, &anthropic)?;
+        for (call_id, _, _) in &tool_calls {
+            self.ledger
+                .mark_returned(&self.ledger_binding, call_id)?;
+        }
+        Ok(anthropic)
     }
 }
 
@@ -418,5 +579,179 @@ mod tests {
         ));
         assert_eq!(prepared.request, frozen_request);
         assert_eq!(prepared.tool_registry.bindings()[0].claude_name, "Read");
+    }
+
+    #[test]
+    fn canonical_request_fingerprint_is_stable_across_object_key_order() {
+        let left = json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}],
+            "metadata": {"b": 2, "a": 1}
+        });
+        let right = json!({
+            "metadata": {"a": 1, "b": 2},
+            "messages": [{"content": "hello", "role": "user"}],
+            "model": "gpt-test"
+        });
+
+        assert_eq!(
+            canonical_request_fingerprint(&left),
+            canonical_request_fingerprint(&right)
+        );
+    }
+
+    #[test]
+    fn same_session_and_fingerprint_reuse_turn_registry_and_capabilities() {
+        let bridge = ClaudeCodexBridge::with_ledger(ConversationLedger::default());
+        let provider = provider("codex_oauth", "openai_responses");
+        let request = json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "read"}],
+            "tools": [{"name": "Read", "input_schema": {"properties": {}}}]
+        });
+
+        let first = bridge
+            .prepare_turn_with_session_identity(
+                &AppType::Claude,
+                request.clone(),
+                &provider,
+                "session-1",
+                Some("session-1"),
+            )
+            .unwrap();
+        let retry = bridge
+            .prepare_turn_with_session_identity(
+                &AppType::Claude,
+                request,
+                &provider,
+                "session-1",
+                Some("session-1"),
+            )
+            .unwrap();
+
+        assert_eq!(first.turn_id, retry.turn_id);
+        assert!(Arc::ptr_eq(&first.tool_registry, &retry.tool_registry));
+        assert!(Arc::ptr_eq(
+            &first.capability_snapshot,
+            &retry.capability_snapshot
+        ));
+        assert!(!first.negotiation_report.schema_losses.is_empty());
+        assert_eq!(first.negotiation_report, retry.negotiation_report);
+        assert!(retry.reused_turn);
+    }
+
+    #[test]
+    fn matching_followup_tool_result_completes_returned_call() {
+        let bridge = ClaudeCodexBridge::with_ledger(ConversationLedger::default());
+        let provider = provider("codex_oauth", "openai_responses");
+        let first_request = json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "read"}],
+            "tools": [{
+                "name": "Read",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"]
+                }
+            }]
+        });
+        let first = bridge
+            .prepare_turn_with_session_identity(
+                &AppType::Claude,
+                first_request,
+                &provider,
+                "session-1",
+                Some("session-1"),
+            )
+            .unwrap();
+        first
+            .consume_response(
+                json!({
+                    "id": "resp-1",
+                    "model": "gpt-test",
+                    "status": "completed",
+                    "output": [{
+                        "type": "function_call",
+                        "call_id": "call-1",
+                        "name": "read_file",
+                        "arguments": "{\"file_path\":\"src/main.rs\"}"
+                    }],
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                }),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            bridge.ledger().call_state(first.ledger_binding(), "call-1"),
+            Some(ToolCallState::ReturnedToClaude)
+        );
+
+        bridge
+            .prepare_turn_with_session_identity(
+                &AppType::Claude,
+                json!({
+                    "model": "gpt-test",
+                    "messages": [
+                        {"role": "user", "content": "read"},
+                        {"role": "assistant", "content": [{
+                            "type": "tool_use",
+                            "id": "call-1",
+                            "name": "Read",
+                            "input": {"file_path": "src/main.rs"}
+                        }]},
+                        {"role": "user", "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "call-1",
+                            "content": "file contents"
+                        }]}
+                    ],
+                    "tools": [{
+                        "name": "Read",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"file_path": {"type": "string"}},
+                            "required": ["file_path"]
+                        }
+                    }]
+                }),
+                &provider,
+                "session-1",
+                Some("session-1"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            bridge.ledger().call_state(first.ledger_binding(), "call-1"),
+            Some(ToolCallState::Completed)
+        );
+    }
+
+    #[test]
+    fn orphan_tool_result_is_a_typed_conversation_conflict() {
+        let bridge = ClaudeCodexBridge::with_ledger(ConversationLedger::default());
+        let result = bridge.prepare_turn_with_session_identity(
+            &AppType::Claude,
+            json!({
+                "model": "gpt-test",
+                "messages": [{"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "missing",
+                    "content": "must not become text"
+                }]}]
+            }),
+            &provider("codex_oauth", "openai_responses"),
+            "session-1",
+            Some("session-1"),
+        );
+
+        assert_eq!(
+            result
+                .unwrap_err()
+                .conversation_conflict_kind()
+                .unwrap(),
+            ConversationConflictKind::OrphanToolResult
+        );
     }
 }
