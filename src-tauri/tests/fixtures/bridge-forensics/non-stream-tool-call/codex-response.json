@@ -1,0 +1,14 @@
+{
+  "id": "resp_1",
+  "model": "gpt-test",
+  "status": "completed",
+  "output": [
+    {
+      "type": "function_call",
+      "call_id": "call_1",
+      "name": "Read",
+      "arguments": "{\"file_path\":\"src/main.rs\"}"
+    }
+  ],
+  "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+}

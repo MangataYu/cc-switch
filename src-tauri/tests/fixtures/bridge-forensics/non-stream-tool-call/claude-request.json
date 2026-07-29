@@ -1,0 +1,18 @@
+{
+  "model": "gpt-test",
+  "max_tokens": 1024,
+  "messages": [
+    {"role": "user", "content": "Read src/main.rs"}
+  ],
+  "tools": [
+    {
+      "name": "Read",
+      "description": "Read a file",
+      "input_schema": {
+        "type": "object",
+        "properties": {"file_path": {"type": "string"}},
+        "required": ["file_path"]
+      }
+    }
+  ]
+}

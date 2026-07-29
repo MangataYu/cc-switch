@@ -1,0 +1,23 @@
+{
+  "format_version": 1,
+  "bundle_id": "fixture-non-stream-tool-call",
+  "created_at": "2026-07-29T00:00:00Z",
+  "provider_id": "fixture-codex-oauth",
+  "model": "gpt-test",
+  "session_id_hash": "fixture-session",
+  "stage": "response_transform",
+  "error": {
+    "kind": "schema_adaptation_loss",
+    "safe_summary": "Replay fixture",
+    "retryable": false,
+    "output_already_visible": false
+  },
+  "full_capture": true,
+  "suppression_reason": null,
+  "artifacts": [
+    {"kind": "claude_request", "file_name": "claude-request.json", "byte_len": 358, "sha256": "01d9f7de35436bc1ac51dbddfc704b7ffaad98633775736d9b00c589d7b1cab8"},
+    {"kind": "codex_request", "file_name": "codex-request.json", "byte_len": 545, "sha256": "3f9ab0d443ec105d812bb04872b0b02e251205e8541217561b0f63aedf894c7d"},
+    {"kind": "codex_response", "file_name": "codex-response.json", "byte_len": 304, "sha256": "8f34ba2e9d31f022cf51c313f871b70c6c870953d11b2fbb306ea9a5dc1ee4e5"},
+    {"kind": "claude_response", "file_name": "expected-claude-response.json", "byte_len": 340, "sha256": "c1d73cdacd5e62c29a3dab8a29785e1ca5df9e0963bec146b2cdb47210a79b68"}
+  ]
+}

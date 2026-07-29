@@ -1,0 +1,17 @@
+{
+  "id": "resp_1",
+  "type": "message",
+  "role": "assistant",
+  "content": [
+    {
+      "type": "tool_use",
+      "id": "call_1",
+      "name": "Read",
+      "input": {"file_path": "src/main.rs"}
+    }
+  ],
+  "model": "gpt-test",
+  "stop_reason": "tool_use",
+  "stop_sequence": null,
+  "usage": {"input_tokens": 3, "output_tokens": 2}
+}
