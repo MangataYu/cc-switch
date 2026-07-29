@@ -52,16 +52,10 @@ pub struct CapabilityDecision {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SchemaLoss {
-    pub path: String,
-    pub reason: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NegotiationReport {
     pub profile_version: String,
     pub decisions: Vec<CapabilityDecision>,
-    pub schema_losses: Vec<SchemaLoss>,
+    pub schema_losses: Vec<super::SchemaLoss>,
 }
 
 impl CodexOAuthCapabilities {

@@ -1,8 +1,10 @@
 mod capabilities;
 mod error;
+mod schema;
 
 pub use capabilities::*;
 pub use error::*;
+pub use schema::*;
 
 use crate::{
     app_config::AppType,
