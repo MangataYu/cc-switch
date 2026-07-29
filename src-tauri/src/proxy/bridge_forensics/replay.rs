@@ -22,8 +22,18 @@ pub struct ReplayReport {
     pub mode: ReplayMode,
     pub codex_request_matches: bool,
     pub claude_response_matches: bool,
+    pub tool_registry_matches: bool,
+    pub capability_report_matches: bool,
+    pub transform_decisions_match: bool,
     pub structural_differences: Vec<StructuralDifference>,
     pub network_requests: u32,
+}
+
+#[derive(Clone, Copy)]
+struct Stage2EvidenceMatches {
+    tool_registry: bool,
+    capability_report: bool,
+    transform_decisions: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -63,6 +73,7 @@ pub fn replay_bundle(path: &Path) -> Result<ReplayReport, AppError> {
     let actual_codex_request = prepared.request.clone();
 
     let mut differences = Vec::new();
+    let evidence_matches = compare_stage2_evidence(path, &manifest, &prepared, &mut differences)?;
     compare_values(
         "$/codex_request",
         &canonicalize_value(expected_codex_request.clone()),
@@ -85,6 +96,7 @@ pub fn replay_bundle(path: &Path) -> Result<ReplayReport, AppError> {
             codex_request_matches,
             differences,
             prepared,
+            evidence_matches,
         )
     } else {
         replay_non_streaming(
@@ -94,6 +106,7 @@ pub fn replay_bundle(path: &Path) -> Result<ReplayReport, AppError> {
             codex_request_matches,
             differences,
             prepared,
+            evidence_matches,
         )
     }
 }
@@ -105,6 +118,7 @@ fn replay_non_streaming(
     codex_request_matches: bool,
     mut differences: Vec<StructuralDifference>,
     prepared: PreparedCodexTurn,
+    evidence_matches: Stage2EvidenceMatches,
 ) -> Result<ReplayReport, AppError> {
     let codex_response = parse_json_artifact(root, response_artifact)?;
     let expected_claude_response =
@@ -125,6 +139,9 @@ fn replay_non_streaming(
         mode: ReplayMode::NonStreaming,
         codex_request_matches,
         claude_response_matches,
+        tool_registry_matches: evidence_matches.tool_registry,
+        capability_report_matches: evidence_matches.capability_report,
+        transform_decisions_match: evidence_matches.transform_decisions,
         structural_differences: differences,
         network_requests: 0,
     })
@@ -137,6 +154,7 @@ fn replay_streaming(
     codex_request_matches: bool,
     mut differences: Vec<StructuralDifference>,
     prepared: PreparedCodexTurn,
+    evidence_matches: Stage2EvidenceMatches,
 ) -> Result<ReplayReport, AppError> {
     let upstream_events = parse_ndjson_artifact(root, response_artifact)?;
     let expected_artifact =
@@ -181,9 +199,93 @@ fn replay_streaming(
         mode: ReplayMode::Streaming,
         codex_request_matches,
         claude_response_matches: expected == actual,
+        tool_registry_matches: evidence_matches.tool_registry,
+        capability_report_matches: evidence_matches.capability_report,
+        transform_decisions_match: evidence_matches.transform_decisions,
         structural_differences: differences,
         network_requests: 0,
     })
+}
+
+fn compare_stage2_evidence(
+    root: &Path,
+    manifest: &EvidenceManifest,
+    prepared: &PreparedCodexTurn,
+    differences: &mut Vec<StructuralDifference>,
+) -> Result<Stage2EvidenceMatches, AppError> {
+    let actual_registry = serde_json::json!({
+        "bindings": prepared.tool_registry.bindings(),
+        "identity_fingerprint": prepared.tool_registry.identity_fingerprint(),
+        "schema_fingerprint": prepared.tool_registry.schema_fingerprint()
+    });
+    let tool_registry = compare_optional_json_artifact(
+        root,
+        manifest,
+        EvidenceArtifactKind::ToolRegistry,
+        "$/tool_registry",
+        &actual_registry,
+        differences,
+    )?;
+
+    let actual_report = serde_json::to_value(&prepared.negotiation_report)
+        .map_err(|source| AppError::JsonSerialize { source })?;
+    let capability_report = compare_optional_json_artifact(
+        root,
+        manifest,
+        EvidenceArtifactKind::CapabilityReport,
+        "$/capability_report",
+        &actual_report,
+        differences,
+    )?;
+
+    let actual_decisions = Value::Array(
+        prepared
+            .tool_registry
+            .transform_decisions(&prepared.negotiation_report.schema_losses)
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| AppError::JsonSerialize { source })?,
+    );
+    let transform_decisions = match optional_artifact_for(
+        manifest,
+        EvidenceArtifactKind::TransformDecisions,
+        &["ndjson"],
+    )? {
+        Some(artifact) => {
+            let expected = Value::Array(parse_ndjson_artifact(root, artifact)?);
+            compare_values(
+                "$/transform_decisions",
+                &expected,
+                &actual_decisions,
+                differences,
+            );
+            expected == actual_decisions
+        }
+        None => true,
+    };
+
+    Ok(Stage2EvidenceMatches {
+        tool_registry,
+        capability_report,
+        transform_decisions,
+    })
+}
+
+fn compare_optional_json_artifact(
+    root: &Path,
+    manifest: &EvidenceManifest,
+    kind: EvidenceArtifactKind,
+    path: &str,
+    actual: &Value,
+    differences: &mut Vec<StructuralDifference>,
+) -> Result<bool, AppError> {
+    let Some(artifact) = optional_artifact_for(manifest, kind, &["json"])? else {
+        return Ok(true);
+    };
+    let expected = parse_json_artifact(root, artifact)?;
+    compare_values(path, &expected, actual, differences);
+    Ok(expected == *actual)
 }
 
 fn replay_provider() -> Provider {
@@ -267,6 +369,35 @@ fn artifact_for<'a>(
         [artifact] => Ok(*artifact),
         [] => Err(AppError::InvalidInput(format!(
             "missing replay artifact: {kind:?}"
+        ))),
+        _ => Err(AppError::InvalidInput(format!(
+            "duplicate replay artifact: {kind:?}"
+        ))),
+    }
+}
+
+fn optional_artifact_for<'a>(
+    manifest: &'a EvidenceManifest,
+    kind: EvidenceArtifactKind,
+    extensions: &[&str],
+) -> Result<Option<&'a EvidenceArtifact>, AppError> {
+    let matches: Vec<&EvidenceArtifact> = manifest
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.kind == kind)
+        .collect();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [artifact]
+            if extensions
+                .iter()
+                .any(|extension| artifact.file_name.ends_with(&format!(".{extension}"))) =>
+        {
+            Ok(Some(*artifact))
+        }
+        [artifact] => Err(AppError::InvalidInput(format!(
+            "invalid replay artifact extension for {kind:?}: {}",
+            artifact.file_name
         ))),
         _ => Err(AppError::InvalidInput(format!(
             "duplicate replay artifact: {kind:?}"
@@ -422,6 +553,27 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let store = BridgeForensicStore::new(temp.path().to_path_buf());
+        let claude_request = json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{
+                "name": "Read",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"],
+                    "additionalProperties": false
+                }
+            }]
+        });
+        let prepared = ClaudeCodexBridge::builtin()
+            .prepare_turn(
+                &AppType::Claude,
+                claude_request.clone(),
+                &replay_provider(),
+                None,
+            )
+            .unwrap();
         let mut capture = store
             .begin_turn(CaptureMetadata {
                 provider_id: "fixture-provider".to_string(),
@@ -430,32 +582,38 @@ mod tests {
             })
             .unwrap();
         capture
+            .record_json(EvidenceArtifactKind::ClaudeRequest, &claude_request)
+            .unwrap();
+        capture
+            .record_json(EvidenceArtifactKind::CodexRequest, &prepared.request)
+            .unwrap();
+        capture
             .record_json(
-                EvidenceArtifactKind::ClaudeRequest,
+                EvidenceArtifactKind::ToolRegistry,
                 &json!({
-                    "model": "gpt-test",
-                    "messages": [{"role": "user", "content": "hello"}]
+                    "bindings": prepared.tool_registry.bindings(),
+                    "identity_fingerprint": prepared.tool_registry.identity_fingerprint(),
+                    "schema_fingerprint": prepared.tool_registry.schema_fingerprint()
                 }),
             )
             .unwrap();
         capture
             .record_json(
-                EvidenceArtifactKind::CodexRequest,
-                &json!({
-                    "model": "gpt-test",
-                    "input": [{
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": "hello"}]
-                    }],
-                    "store": false,
-                    "include": ["reasoning.encrypted_content"],
-                    "instructions": "",
-                    "tools": [],
-                    "parallel_tool_calls": false,
-                    "stream": true
-                }),
+                EvidenceArtifactKind::CapabilityReport,
+                &serde_json::to_value(&prepared.negotiation_report).unwrap(),
             )
             .unwrap();
+        for decision in prepared
+            .tool_registry
+            .transform_decisions(&prepared.negotiation_report.schema_losses)
+        {
+            capture
+                .append_ndjson(
+                    EvidenceArtifactKind::TransformDecisions,
+                    &serde_json::to_value(decision).unwrap(),
+                )
+                .unwrap();
+        }
         capture
             .append_ndjson(
                 EvidenceArtifactKind::CodexResponse,
@@ -522,6 +680,9 @@ mod tests {
         assert_eq!(report.mode, ReplayMode::Streaming);
         assert!(report.codex_request_matches);
         assert!(report.claude_response_matches);
+        assert!(report.tool_registry_matches);
+        assert!(report.capability_report_matches);
+        assert!(report.transform_decisions_match);
         assert_eq!(report.network_requests, 0);
     }
 

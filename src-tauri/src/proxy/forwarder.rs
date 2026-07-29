@@ -100,6 +100,12 @@ fn record_prepared_turn_evidence(
     Ok(())
 }
 
+fn suppress_incomplete_prepared_evidence(capture: &mut ForensicTurnCapture) {
+    capture.suppress_full_capture(
+        "prepared-turn evidence was incomplete; protocol artifacts suppressed",
+    );
+}
+
 fn bridge_error_kind(error: &ProxyError) -> EvidenceErrorKind {
     match error {
         ProxyError::TransformError(message)
@@ -1861,6 +1867,7 @@ impl RequestForwarder {
             (bridge_evidence.as_mut(), prepared_codex_turn.as_ref())
         {
             if let Err(error) = record_prepared_turn_evidence(evidence, prepared) {
+                suppress_incomplete_prepared_evidence(evidence);
                 log::warn!("[BridgeEvidence] capture_failed stage=prepared_turn error={error}");
             }
         }
@@ -4446,6 +4453,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(captured["access_token"], "[REDACTED]");
+    }
+
+    #[test]
+    fn prepared_evidence_failure_suppresses_all_partially_written_artifacts() {
+        use crate::proxy::bridge_forensics::{
+            BridgeForensicStore, CaptureMetadata, EvidenceError, EvidenceErrorKind,
+            EvidenceManifest,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = BridgeForensicStore::new(temp.path().to_path_buf());
+        let mut capture = store
+            .begin_turn(CaptureMetadata {
+                provider_id: "provider-1".to_string(),
+                model: "gpt-test".to_string(),
+                session_id_hash: "session-hash".to_string(),
+            })
+            .unwrap();
+        capture
+            .record_json(
+                EvidenceArtifactKind::ToolRegistry,
+                &json!({"partial": true}),
+            )
+            .unwrap();
+
+        suppress_incomplete_prepared_evidence(&mut capture);
+        let bundle = capture
+            .commit_failure(EvidenceError {
+                kind: EvidenceErrorKind::LegacyTransformFailure,
+                safe_summary: "fixture".to_string(),
+                retryable: false,
+                output_already_visible: false,
+            })
+            .unwrap();
+        let manifest: EvidenceManifest =
+            serde_json::from_slice(&std::fs::read(bundle.path.join("manifest.json")).unwrap())
+                .unwrap();
+
+        assert!(!manifest.full_capture);
+        assert!(manifest.artifacts.is_empty());
+        assert!(manifest
+            .suppression_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("prepared-turn evidence")));
     }
 
     fn test_forwarder(
