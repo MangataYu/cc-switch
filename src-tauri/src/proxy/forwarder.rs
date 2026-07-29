@@ -7,7 +7,9 @@ use super::bridge_forensics::{
     EvidenceStage, ForensicTurnCapture,
 };
 use super::claude_codex_bridge::{
-    bridge_scope_matches, BridgeError, ClaudeCodexBridge, PreparedCodexTurn,
+    bridge_scope_matches, BridgeError, ClaudeCodexBridge, CodexOAuthCapabilities,
+    PreparedCodexTurn, SchemaAction, SchemaLoss, SchemaLossReason, TransformAction,
+    TransformDecision,
 };
 use super::hyper_client::ProxyResponse;
 use super::{
@@ -72,6 +74,92 @@ fn compare_shadow_turn(
         request_structure_matches: short_value_hash(Some(&prepared.request))
             == short_value_hash(Some(legacy_request)),
     }
+}
+
+fn record_prepared_turn_evidence(
+    capture: &mut ForensicTurnCapture,
+    prepared: &PreparedCodexTurn,
+) -> Result<(), crate::error::AppError> {
+    let registry = serde_json::to_value(prepared.tool_registry.as_ref())
+        .map_err(|source| crate::error::AppError::JsonSerialize { source })?;
+    capture.record_json(EvidenceArtifactKind::ToolRegistry, &registry)?;
+    let report = serde_json::to_value(&prepared.negotiation_report)
+        .map_err(|source| crate::error::AppError::JsonSerialize { source })?;
+    capture.record_json(EvidenceArtifactKind::CapabilityReport, &report)?;
+    for decision in prepared
+        .tool_registry
+        .transform_decisions(&prepared.negotiation_report.schema_losses)
+    {
+        let decision = serde_json::to_value(decision)
+            .map_err(|source| crate::error::AppError::JsonSerialize { source })?;
+        capture.append_ndjson(EvidenceArtifactKind::TransformDecisions, &decision)?;
+    }
+    Ok(())
+}
+
+fn bridge_error_kind(error: &ProxyError) -> EvidenceErrorKind {
+    match error {
+        ProxyError::TransformError(message)
+            if message.contains("Claude Codex tool registry violation") =>
+        {
+            EvidenceErrorKind::ToolRegistryViolation
+        }
+        ProxyError::InvalidRequest(message)
+            if message.contains("Claude tool schema cannot be represented safely") =>
+        {
+            EvidenceErrorKind::SchemaAdaptationLoss
+        }
+        _ => EvidenceErrorKind::LegacyTransformFailure,
+    }
+}
+
+fn record_rejected_turn_evidence(
+    capture: &mut ForensicTurnCapture,
+    kind: EvidenceErrorKind,
+) -> Result<(), crate::error::AppError> {
+    capture.record_json(
+        EvidenceArtifactKind::ToolRegistry,
+        &serde_json::json!({
+            "status": "rejected",
+            "bindings": [],
+            "identity_fingerprint": null,
+            "schema_fingerprint": null
+        }),
+    )?;
+    let mut report = CodexOAuthCapabilities::builtin().negotiation_report();
+    if kind == EvidenceErrorKind::SchemaAdaptationLoss {
+        report.schema_losses.push(SchemaLoss {
+            source_path: "$".to_string(),
+            action: SchemaAction::Reject,
+            reason: SchemaLossReason::InvalidSchema,
+            affects_correctness: true,
+        });
+    }
+    let report = serde_json::to_value(report)
+        .map_err(|source| crate::error::AppError::JsonSerialize { source })?;
+    capture.record_json(EvidenceArtifactKind::CapabilityReport, &report)?;
+    let decision = TransformDecision {
+        source_path: if kind == EvidenceErrorKind::SchemaAdaptationLoss {
+            "$/tools/*/input_schema"
+        } else {
+            "$/tools"
+        }
+        .to_string(),
+        source_value_type: "tool_directory".to_string(),
+        target_path: None,
+        action: TransformAction::Rejected,
+        reason_code: match kind {
+            EvidenceErrorKind::SchemaAdaptationLoss => "schema_adaptation_loss",
+            EvidenceErrorKind::ToolRegistryViolation => "tool_registry_violation",
+            _ => "request_transform_failure",
+        }
+        .to_string(),
+        capability_reference: Some("function_tools".to_string()),
+    };
+    let decision = serde_json::to_value(decision)
+        .map_err(|source| crate::error::AppError::JsonSerialize { source })?;
+    capture.append_ndjson(EvidenceArtifactKind::TransformDecisions, &decision)?;
+    Ok(())
 }
 
 fn dispatch_claude_codex_request_with<Legacy, Bridge>(
@@ -1769,12 +1857,8 @@ impl RequestForwarder {
         if let (Some(evidence), Some(prepared)) =
             (bridge_evidence.as_mut(), prepared_codex_turn.as_ref())
         {
-            let report = serde_json::to_value(&prepared.negotiation_report)
-                .expect("negotiation report must serialize");
-            if let Err(error) =
-                evidence.record_json(EvidenceArtifactKind::CapabilityReport, &report)
-            {
-                log::warn!("[BridgeEvidence] capture_failed stage=capability_report error={error}");
+            if let Err(error) = record_prepared_turn_evidence(evidence, prepared) {
+                log::warn!("[BridgeEvidence] capture_failed stage=prepared_turn error={error}");
             }
         }
         if let Some(mut evidence) = bridge_evidence.take() {
@@ -3742,8 +3826,20 @@ where
         Err(error) => {
             if let Some(mut capture) = evidence.take() {
                 capture.set_stage(EvidenceStage::RequestTransform);
+                let kind = bridge_error_kind(&error);
+                if matches!(
+                    kind,
+                    EvidenceErrorKind::ToolRegistryViolation
+                        | EvidenceErrorKind::SchemaAdaptationLoss
+                ) {
+                    if let Err(capture_error) = record_rejected_turn_evidence(&mut capture, kind) {
+                        log::warn!(
+                            "[BridgeEvidence] capture_failed stage=rejected_turn error={capture_error}"
+                        );
+                    }
+                }
                 let evidence_error = EvidenceError {
-                    kind: EvidenceErrorKind::LegacyTransformFailure,
+                    kind,
                     safe_summary: "Claude request could not be converted to Codex Responses"
                         .to_string(),
                     retryable: false,
@@ -4170,6 +4266,140 @@ mod tests {
             .artifacts
             .iter()
             .any(|artifact| artifact.kind == EvidenceArtifactKind::CodexRequest));
+    }
+
+    #[test]
+    fn prepared_turn_evidence_records_registry_capabilities_and_transform_decisions() {
+        use crate::proxy::bridge_forensics::{
+            BridgeForensicStore, CaptureMetadata, EvidenceArtifactKind, EvidenceError,
+            EvidenceErrorKind, EvidenceManifest,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = BridgeForensicStore::new(temp.path().to_path_buf());
+        let provider = bridge_provider("codex_oauth", "openai_responses");
+        let prepared = ClaudeCodexBridge::builtin()
+            .prepare_turn(
+                &AppType::Claude,
+                json!({
+                    "model": "gpt-test",
+                    "messages": [],
+                    "tools": [{
+                        "name": "Read",
+                        "input_schema": {
+                            "$schema": "https://json-schema.org/draft/2020-12/schema",
+                            "properties": {"file_path": {"type": "string"}}
+                        }
+                    }]
+                }),
+                &provider,
+                None,
+            )
+            .unwrap();
+        let mut capture = store
+            .begin_turn(CaptureMetadata {
+                provider_id: "provider-1".to_string(),
+                model: "gpt-test".to_string(),
+                session_id_hash: "session-hash".to_string(),
+            })
+            .unwrap();
+
+        record_prepared_turn_evidence(&mut capture, &prepared).unwrap();
+        let bundle = capture
+            .commit_failure(EvidenceError {
+                kind: EvidenceErrorKind::ToolRegistryViolation,
+                safe_summary: "registered tool response rejected".to_string(),
+                retryable: false,
+                output_already_visible: false,
+            })
+            .unwrap();
+        let manifest: EvidenceManifest =
+            serde_json::from_slice(&std::fs::read(bundle.path.join("manifest.json")).unwrap())
+                .unwrap();
+
+        for kind in [
+            EvidenceArtifactKind::ToolRegistry,
+            EvidenceArtifactKind::CapabilityReport,
+            EvidenceArtifactKind::TransformDecisions,
+        ] {
+            assert!(manifest
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.kind == kind));
+        }
+        let registry: Value =
+            serde_json::from_slice(&std::fs::read(bundle.path.join("tool-registry.json")).unwrap())
+                .unwrap();
+        assert_eq!(registry["bindings"][0]["claude_name"], "Read");
+        assert_eq!(registry["bindings"][0]["codex_name"], "read_file");
+        let decisions =
+            std::fs::read_to_string(bundle.path.join("transform-decisions.ndjson")).unwrap();
+        assert!(decisions.contains("renamed"));
+        assert!(decisions.contains("normalized"));
+        assert!(decisions.contains("dropped"));
+    }
+
+    #[test]
+    fn bridge_proxy_errors_map_to_typed_forensic_kinds() {
+        assert_eq!(
+            bridge_error_kind(&ProxyError::TransformError(
+                "Claude Codex tool registry violation: unknown tool".to_string()
+            )),
+            EvidenceErrorKind::ToolRegistryViolation
+        );
+        assert_eq!(
+            bridge_error_kind(&ProxyError::InvalidRequest(
+                "Claude tool schema cannot be represented safely: root".to_string()
+            )),
+            EvidenceErrorKind::SchemaAdaptationLoss
+        );
+    }
+
+    #[test]
+    fn rejected_schema_preparation_records_reject_decision_and_report() {
+        use crate::proxy::bridge_forensics::{
+            BridgeForensicStore, CaptureMetadata, EvidenceArtifactKind, EvidenceErrorKind,
+            EvidenceManifest,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = BridgeForensicStore::new(temp.path().to_path_buf());
+        let capture = store
+            .begin_turn(CaptureMetadata {
+                provider_id: "provider-1".to_string(),
+                model: "gpt-test".to_string(),
+                session_id_hash: "session-hash".to_string(),
+            })
+            .unwrap();
+
+        let _ = finish_bridge_request_transform(Some(capture), || -> Result<Value, ProxyError> {
+            Err(ProxyError::InvalidRequest(
+                "Claude tool schema cannot be represented safely: invalid required".to_string(),
+            ))
+        });
+
+        let summary = &store.list_bundles().unwrap()[0];
+        assert_eq!(summary.error_kind, EvidenceErrorKind::SchemaAdaptationLoss);
+        let bundle_path = temp.path().join("bundles").join(&summary.bundle_id.0);
+        let manifest: EvidenceManifest =
+            serde_json::from_slice(&std::fs::read(bundle_path.join("manifest.json")).unwrap())
+                .unwrap();
+        assert!(manifest
+            .artifacts
+            .iter()
+            .any(|artifact| { artifact.kind == EvidenceArtifactKind::CapabilityReport }));
+        assert!(manifest
+            .artifacts
+            .iter()
+            .any(|artifact| { artifact.kind == EvidenceArtifactKind::TransformDecisions }));
+        let report: Value = serde_json::from_slice(
+            &std::fs::read(bundle_path.join("capability-report.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["schema_losses"][0]["action"], "reject");
+        let decisions =
+            std::fs::read_to_string(bundle_path.join("transform-decisions.ndjson")).unwrap();
+        assert!(decisions.contains("rejected"));
     }
 
     #[test]

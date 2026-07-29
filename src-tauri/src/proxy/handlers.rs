@@ -822,7 +822,7 @@ where
             if let Some(mut capture) = evidence {
                 capture.set_stage(EvidenceStage::ResponseTransform);
                 let evidence_error = EvidenceError {
-                    kind: EvidenceErrorKind::SchemaAdaptationLoss,
+                    kind: response_transform_evidence_kind(&error),
                     safe_summary: "Codex response could not be converted to Claude protocol"
                         .to_string(),
                     retryable: false,
@@ -840,6 +840,17 @@ where
             }
             Err(error)
         }
+    }
+}
+
+fn response_transform_evidence_kind(error: &ProxyError) -> EvidenceErrorKind {
+    match error {
+        ProxyError::TransformError(message)
+            if message.contains("Claude Codex tool registry violation") =>
+        {
+            EvidenceErrorKind::ToolRegistryViolation
+        }
+        _ => EvidenceErrorKind::SchemaAdaptationLoss,
     }
 }
 
@@ -2861,8 +2872,8 @@ mod tests {
     use super::{
         body_looks_like_sse, chat_sse_to_response_value, classify_body_for_diagnostics,
         codex_proxy_error_json, dispatch_claude_codex_response, finish_bridge_response_transform,
-        responses_sse_to_response_value, should_use_claude_transform_streaming, transform,
-        upstream_body_parse_error,
+        response_transform_evidence_kind, responses_sse_to_response_value,
+        should_use_claude_transform_streaming, transform, upstream_body_parse_error,
     };
     use crate::proxy::ProxyError;
 
@@ -3013,6 +3024,16 @@ mod tests {
         assert!(!manifest.error.safe_summary.contains("sensitive_tool_name"));
         assert!(bundle_path.join("codex-response.json").is_file());
         assert!(!bundle_path.join("claude-response.json").exists());
+    }
+
+    #[test]
+    fn registry_response_failure_uses_tool_registry_evidence_kind() {
+        assert_eq!(
+            response_transform_evidence_kind(&ProxyError::TransformError(
+                "Claude Codex tool registry violation: upstream tool is not registered".to_string()
+            )),
+            crate::proxy::bridge_forensics::EvidenceErrorKind::ToolRegistryViolation
+        );
     }
 
     #[test]

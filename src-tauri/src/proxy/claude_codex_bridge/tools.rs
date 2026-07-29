@@ -39,6 +39,26 @@ pub struct RestoredToolCall {
     pub input: Value,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransformAction {
+    Preserved,
+    Renamed,
+    Normalized,
+    Dropped,
+    Rejected,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransformDecision {
+    pub source_path: String,
+    pub source_value_type: String,
+    pub target_path: Option<String>,
+    pub action: TransformAction,
+    pub reason_code: String,
+    pub capability_reference: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolRegistry {
     bindings: Vec<ToolBinding>,
@@ -171,6 +191,46 @@ impl ToolRegistry {
 
     pub fn schema_fingerprint(&self) -> &str {
         &self.schema_fingerprint
+    }
+
+    pub fn transform_decisions(&self, schema_losses: &[SchemaLoss]) -> Vec<TransformDecision> {
+        let mut decisions: Vec<TransformDecision> = self
+            .bindings
+            .iter()
+            .enumerate()
+            .map(|(index, binding)| TransformDecision {
+                source_path: format!("$/tools/{index}/name"),
+                source_value_type: "string".to_string(),
+                target_path: Some(format!("$/tools/{index}/name")),
+                action: if binding.claude_name == binding.codex_name {
+                    TransformAction::Preserved
+                } else {
+                    TransformAction::Renamed
+                },
+                reason_code: if binding.claude_name == binding.codex_name {
+                    "tool_identity_preserved"
+                } else {
+                    "codex_semantic_alias"
+                }
+                .to_string(),
+                capability_reference: Some("function_tools".to_string()),
+            })
+            .collect();
+        decisions.extend(schema_losses.iter().map(|loss| TransformDecision {
+            source_path: loss.source_path.clone(),
+            source_value_type: "schema".to_string(),
+            target_path:
+                (loss.action != super::SchemaAction::Drop).then(|| loss.source_path.clone()),
+            action: match loss.action {
+                super::SchemaAction::Preserve => TransformAction::Preserved,
+                super::SchemaAction::Normalize => TransformAction::Normalized,
+                super::SchemaAction::Drop => TransformAction::Dropped,
+                super::SchemaAction::Reject => TransformAction::Rejected,
+            },
+            reason_code: format!("{:?}", loss.reason).to_ascii_lowercase(),
+            capability_reference: Some("strict_json_schema".to_string()),
+        }));
+        decisions
     }
 
     pub fn codex_name_for_claude(&self, claude_name: &str) -> Result<&str, BridgeError> {
