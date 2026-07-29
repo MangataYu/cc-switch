@@ -1,7 +1,7 @@
 # Claude Code → Codex OAuth Agent Bridge Design
 
 **Date:** 2026-07-29
-**Status:** Stages 0–1 implemented; Stage 2 pending
+**Status:** Stages 0–2 implemented; Stage 3 pending
 **Scope:** Claude Code client to the built-in Codex OAuth backend only
 
 ## 1. Summary
@@ -588,6 +588,8 @@ Implemented on 2026-07-29. Providers without `bridgeMode` remain on `legacy`; `s
 ### Stage 2: Tool registry and semantic aliases
 
 Compile request-scoped tool bindings, adapt schemas with loss reports, restore calls by registry identity, and reject unknown tools. Cover the built-in Claude tool matrix before MCP and dynamic tools.
+
+Implemented on 2026-07-29. Each prepared turn freezes a request-scoped registry covering the current Claude Code built-ins plus deterministic MCP/dynamic bindings; schema adaptation is loss-reported and fail-closed, non-streaming and existing SSE codecs restore exact registered identities, IDs, and validated arguments, and forensic replay verifies registry, capability, and transform-decision evidence without network access. `BatchTool` remains explicitly unsupported. Conversation-ledger behavior remains Stage 3, and the strict typed streaming state machine remains Stage 4.
 
 ### Stage 3: Conversation ledger
 
