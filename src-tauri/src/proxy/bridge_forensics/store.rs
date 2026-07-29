@@ -49,6 +49,7 @@ pub struct ForensicTurnCapture {
     artifacts: Vec<PendingArtifact>,
     full_capture_allowed: bool,
     suppression_reasons: Vec<String>,
+    active: bool,
 }
 
 struct PendingArtifact {
@@ -90,6 +91,7 @@ impl BridgeForensicStore {
             artifacts: Vec::new(),
             full_capture_allowed: true,
             suppression_reasons: Vec::new(),
+            active: true,
         })
     }
 
@@ -378,17 +380,21 @@ impl ForensicTurnCapture {
         fs::rename(&self.staging_dir, &bundle_path)
             .map_err(|error| AppError::io(&self.staging_dir, error))?;
 
+        self.active = false;
+
         Ok(EvidenceBundleInfo {
-            bundle_id: self.bundle_id,
+            bundle_id: self.bundle_id.clone(),
             path: bundle_path,
             full_capture: self.full_capture_allowed,
         })
     }
 
-    pub fn discard_success(self) -> Result<(), AppError> {
+    pub fn discard_success(mut self) -> Result<(), AppError> {
         self.validate_staging_dir()?;
         fs::remove_dir_all(&self.staging_dir)
-            .map_err(|error| AppError::io(&self.staging_dir, error))
+            .map_err(|error| AppError::io(&self.staging_dir, error))?;
+        self.active = false;
+        Ok(())
     }
 
     fn write_artifact(
@@ -453,6 +459,14 @@ impl ForensicTurnCapture {
             ));
         }
         Ok(())
+    }
+}
+
+impl Drop for ForensicTurnCapture {
+    fn drop(&mut self) {
+        if self.active && self.validate_staging_dir().is_ok() && self.staging_dir.is_dir() {
+            let _ = fs::remove_dir_all(&self.staging_dir);
+        }
     }
 }
 
@@ -733,6 +747,26 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0]["access_token"], "[REDACTED]");
         assert_eq!(lines[1]["type"], "response.completed");
+    }
+
+    #[test]
+    fn dropped_capture_removes_staging_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BridgeForensicStore::new(temp.path().to_path_buf());
+        let mut capture = store.begin_turn(CaptureMetadata::test_fixture()).unwrap();
+        capture
+            .record_json(
+                EvidenceArtifactKind::ClaudeRequest,
+                &json!({"messages": [{"role": "user", "content": "temporary"}]}),
+            )
+            .unwrap();
+
+        drop(capture);
+
+        assert!(fs::read_dir(temp.path().join("staging"))
+            .unwrap()
+            .next()
+            .is_none());
     }
 
     #[test]

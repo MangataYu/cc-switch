@@ -2,13 +2,17 @@
 //!
 //! 负责将请求转发到上游Provider，支持故障转移
 
+use super::bridge_forensics::{
+    BridgeForensicStore, CaptureMetadata, EvidenceArtifactKind, EvidenceError, EvidenceErrorKind,
+    EvidenceStage, ForensicTurnCapture,
+};
 use super::hyper_client::ProxyResponse;
 use super::{
     body_filter::filter_private_params_with_whitelist,
     content_encoding::{decompress_body, get_content_encoding},
     error::*,
     failover_switch::FailoverSwitchManager,
-    json_canonical::{canonicalize_value, short_value_hash},
+    json_canonical::{canonicalize_value, short_sha256_hex, short_value_hash},
     log_codes::fwd as log_fwd,
     provider_router::ProviderRouter,
     providers::{
@@ -65,6 +69,7 @@ pub struct ForwardResult {
     /// usage 归因不能依赖 ctx.request_model（映射前的客户端别名）：上游响应
     /// 缺失 model 或回显别名时，接管流量会被记成 claude-* 并按其定价计费。
     pub outbound_model: Option<String>,
+    pub bridge_evidence: Option<ForensicTurnCapture>,
     /// 活跃连接 RAII guard：随响应一起流转到 response_processor / handle_claude_transform，
     /// 最终被 move 进流式 body future（或非流式响应作用域），覆盖整个响应生命周期。
     pub(crate) connection_guard: Option<ActiveConnectionGuard>,
@@ -490,7 +495,7 @@ impl RequestForwarder {
                 )
                 .await
             {
-                Ok((response, claude_api_format, outbound_model)) => {
+                Ok((response, claude_api_format, outbound_model, bridge_evidence)) => {
                     // 成功：普通闭合熔断状态异步记录，避免阻塞流式首包返回；
                     // HalfOpen 探测仍同步等待，保证 permit 与熔断状态及时释放。
                     self.record_success_result(&provider.id, app_type_str, used_half_open_permit)
@@ -539,6 +544,7 @@ impl RequestForwarder {
                         provider: provider.clone(),
                         claude_api_format,
                         outbound_model,
+                        bridge_evidence,
                         connection_guard: None,
                     });
                 }
@@ -589,7 +595,12 @@ impl RequestForwarder {
                                 )
                                 .await
                             {
-                                Ok((response, claude_api_format, outbound_model)) => {
+                                Ok((
+                                    response,
+                                    claude_api_format,
+                                    outbound_model,
+                                    bridge_evidence,
+                                )) => {
                                     log::info!(
                                         "[{app_type_str}] [Media] Unsupported-image retry succeeded"
                                     );
@@ -642,6 +653,7 @@ impl RequestForwarder {
                                         provider: provider.clone(),
                                         claude_api_format,
                                         outbound_model,
+                                        bridge_evidence,
                                         connection_guard: None,
                                     });
                                 }
@@ -735,7 +747,12 @@ impl RequestForwarder {
                                     )
                                     .await
                                 {
-                                    Ok((response, claude_api_format, outbound_model)) => {
+                                    Ok((
+                                        response,
+                                        claude_api_format,
+                                        outbound_model,
+                                        bridge_evidence,
+                                    )) => {
                                         log::info!("[{app_type_str}] [RECT-002] 整流重试成功");
                                         self.record_success_result(
                                             &provider.id,
@@ -791,6 +808,7 @@ impl RequestForwarder {
                                             provider: provider.clone(),
                                             claude_api_format,
                                             outbound_model,
+                                            bridge_evidence,
                                             connection_guard: None,
                                         });
                                     }
@@ -901,7 +919,12 @@ impl RequestForwarder {
                                 )
                                 .await
                             {
-                                Ok((response, claude_api_format, outbound_model)) => {
+                                Ok((
+                                    response,
+                                    claude_api_format,
+                                    outbound_model,
+                                    bridge_evidence,
+                                )) => {
                                     log::info!("[{app_type_str}] [RECT-011] budget 整流重试成功");
                                     self.record_success_result(
                                         &provider.id,
@@ -951,6 +974,7 @@ impl RequestForwarder {
                                         provider: provider.clone(),
                                         claude_api_format,
                                         outbound_model,
+                                        bridge_evidence,
                                         connection_guard: None,
                                     });
                                 }
@@ -1122,7 +1146,15 @@ impl RequestForwarder {
         headers: &axum::http::HeaderMap,
         extensions: &Extensions,
         adapter: &dyn ProviderAdapter,
-    ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
+    ) -> Result<
+        (
+            ProxyResponse,
+            Option<String>,
+            Option<String>,
+            Option<ForensicTurnCapture>,
+        ),
+        ProxyError,
+    > {
         // 使用适配器提取 base_url
         let mut base_url = adapter.extract_base_url(provider)?;
 
@@ -1414,6 +1446,15 @@ impl RequestForwarder {
         // suffix and add the context-1m beta header.
         let mut codex_anthropic_one_m = false;
 
+        let mut bridge_evidence = if should_capture_bridge_evidence(app_type, provider) {
+            let store = BridgeForensicStore::new(
+                crate::config::get_app_config_dir().join("bridge-evidence"),
+            );
+            begin_bridge_evidence_capture(&store, provider, &mapped_body, self.session_id.as_str())
+        } else {
+            None
+        };
+
         // 转换请求体（如果需要）
         let mut request_body = if codex_responses_to_chat {
             let mut mapped_body = mapped_body;
@@ -1506,14 +1547,19 @@ impl RequestForwarder {
                 let api_format = resolved_claude_api_format
                     .as_deref()
                     .unwrap_or_else(|| super::providers::get_claude_api_format(provider));
-                super::providers::transform_claude_request_for_api_format(
-                    mapped_body,
-                    provider,
-                    api_format,
-                    self.session_client_provided
-                        .then_some(self.session_id.as_str()),
-                    Some(self.gemini_shadow.as_ref()),
-                )?
+                let (transformed, evidence) =
+                    finish_bridge_request_transform(bridge_evidence.take(), || {
+                        super::providers::transform_claude_request_for_api_format(
+                            mapped_body,
+                            provider,
+                            api_format,
+                            self.session_client_provided
+                                .then_some(self.session_id.as_str()),
+                            Some(self.gemini_shadow.as_ref()),
+                        )
+                    })?;
+                bridge_evidence = evidence;
+                transformed
             } else {
                 adapter.transform_request(mapped_body, provider)?
             }
@@ -1578,6 +1624,15 @@ impl RequestForwarder {
             {
                 if apply_local_proxy_body_overrides(&mut filtered_body, overrides) {
                     filtered_body = prepare_upstream_request_body(filtered_body);
+                }
+            }
+        }
+        if let Some(mut evidence) = bridge_evidence.take() {
+            match evidence.record_json(EvidenceArtifactKind::CodexRequest, &filtered_body) {
+                Ok(()) => bridge_evidence = Some(evidence),
+                Err(error) => {
+                    log::warn!("[BridgeEvidence] capture_failed stage=codex_request error={error}");
+                    let _ = evidence.discard_success();
                 }
             }
         }
@@ -2301,7 +2356,12 @@ impl RequestForwarder {
                     response = self.validate_responses_stream_start(response).await?;
                 }
             }
-            Ok((response, resolved_claude_api_format, outbound_model))
+            Ok((
+                response,
+                resolved_claude_api_format,
+                outbound_model,
+                bridge_evidence,
+            ))
         } else {
             let status_code = status.as_u16();
             // 错误响应同样可能被上游压缩（content-encoding）。reqwest 未启用任何
@@ -3467,6 +3527,80 @@ fn prepare_upstream_request_body(request_body: Value) -> Value {
     canonicalize_value(filter_private_params_with_whitelist(request_body, &[]))
 }
 
+fn should_capture_bridge_evidence(app_type: &AppType, provider: &Provider) -> bool {
+    matches!(app_type, AppType::Claude)
+        && provider.is_codex_oauth()
+        && provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.api_format.as_deref())
+            == Some("openai_responses")
+}
+
+fn begin_bridge_evidence_capture(
+    store: &BridgeForensicStore,
+    provider: &Provider,
+    claude_request: &Value,
+    session_id: &str,
+) -> Option<ForensicTurnCapture> {
+    let metadata = CaptureMetadata {
+        provider_id: provider.id.clone(),
+        model: claude_request
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        session_id_hash: short_sha256_hex(session_id.as_bytes()),
+    };
+    let mut capture = match store.begin_turn(metadata) {
+        Ok(capture) => capture,
+        Err(error) => {
+            log::warn!("[BridgeEvidence] capture_failed stage=begin_turn error={error}");
+            return None;
+        }
+    };
+    if let Err(error) = capture.record_json(EvidenceArtifactKind::ClaudeRequest, claude_request) {
+        log::warn!("[BridgeEvidence] capture_failed stage=claude_request error={error}");
+        let _ = capture.discard_success();
+        return None;
+    }
+    Some(capture)
+}
+
+fn finish_bridge_request_transform<F>(
+    mut evidence: Option<ForensicTurnCapture>,
+    transform: F,
+) -> Result<(Value, Option<ForensicTurnCapture>), ProxyError>
+where
+    F: FnOnce() -> Result<Value, ProxyError>,
+{
+    match transform() {
+        Ok(value) => Ok((value, evidence)),
+        Err(error) => {
+            if let Some(mut capture) = evidence.take() {
+                capture.set_stage(EvidenceStage::RequestTransform);
+                let evidence_error = EvidenceError {
+                    kind: EvidenceErrorKind::LegacyTransformFailure,
+                    safe_summary: "Claude request could not be converted to Codex Responses"
+                        .to_string(),
+                    retryable: false,
+                    output_already_visible: false,
+                };
+                match capture.commit_failure(evidence_error) {
+                    Ok(bundle) => log::error!(
+                        "[BridgeEvidence] bundle_id={} stage=request_transform summary=claude_request_conversion_failed",
+                        bundle.bundle_id.0
+                    ),
+                    Err(capture_error) => log::warn!(
+                        "[BridgeEvidence] capture_failed stage=request_transform error={capture_error}"
+                    ),
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
 fn log_prompt_cache_trace(
     app_type: &AppType,
     provider: &Provider,
@@ -3596,6 +3730,88 @@ mod tests {
             icon_color: None,
             in_failover_queue: false,
         }
+    }
+
+    fn bridge_provider(provider_type: &str, api_format: &str) -> Provider {
+        let mut provider = test_provider_with_type(Some(provider_type));
+        provider.meta.as_mut().unwrap().api_format = Some(api_format.to_string());
+        provider
+    }
+
+    #[test]
+    fn evidence_capture_is_scoped_to_claude_codex_oauth_responses() {
+        assert!(should_capture_bridge_evidence(
+            &AppType::Claude,
+            &bridge_provider("codex_oauth", "openai_responses")
+        ));
+        assert!(!should_capture_bridge_evidence(
+            &AppType::Codex,
+            &bridge_provider("codex_oauth", "openai_responses")
+        ));
+        assert!(!should_capture_bridge_evidence(
+            &AppType::Claude,
+            &bridge_provider("github_copilot", "openai_chat")
+        ));
+    }
+
+    #[test]
+    fn captures_codex_oauth_request_transform_failure() {
+        use crate::proxy::bridge_forensics::{
+            BridgeForensicStore, CaptureMetadata, EvidenceArtifactKind, EvidenceErrorKind,
+            EvidenceManifest, EvidenceStage,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = BridgeForensicStore::new(temp.path().to_path_buf());
+        let claude_request = json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "inspect src/main.rs"}],
+            "tools": [{"name": "Read", "input_schema": {"type": "object"}}]
+        });
+        let mut capture = store
+            .begin_turn(CaptureMetadata {
+                provider_id: "provider-1".to_string(),
+                model: "gpt-test".to_string(),
+                session_id_hash: "session-hash".to_string(),
+            })
+            .unwrap();
+        capture
+            .record_json(EvidenceArtifactKind::ClaudeRequest, &claude_request)
+            .unwrap();
+
+        let error = match finish_bridge_request_transform(Some(capture), || {
+            Err(ProxyError::TransformError(
+                "original converter detail".to_string(),
+            ))
+        }) {
+            Ok(_) => panic!("transform should fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("original converter detail"));
+        let bundles = store.list_bundles().unwrap();
+        assert_eq!(bundles.len(), 1);
+        let bundle_path = temp.path().join("bundles").join(&bundles[0].bundle_id.0);
+        let manifest: EvidenceManifest =
+            serde_json::from_slice(&std::fs::read(bundle_path.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest.stage, EvidenceStage::RequestTransform);
+        assert_eq!(
+            manifest.error.kind,
+            EvidenceErrorKind::LegacyTransformFailure
+        );
+        assert!(!manifest
+            .error
+            .safe_summary
+            .contains("original converter detail"));
+        assert!(manifest
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.kind == EvidenceArtifactKind::ClaudeRequest));
+        assert!(!manifest
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.kind == EvidenceArtifactKind::CodexRequest));
     }
 
     fn test_forwarder(
