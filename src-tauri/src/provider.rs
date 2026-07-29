@@ -1004,8 +1004,8 @@ pub struct OpenCodeModelLimit {
 mod tests {
     use super::{
         ClaudeCodexBridgeMode, ClaudeModelConfig, CodexModelConfig, GeminiModelConfig,
-        LocalProxyRequestOverrides, OpenCodeProviderConfig, Provider, ProviderManager, ProviderMeta,
-        UniversalProvider,
+        LocalProxyRequestOverrides, OpenCodeProviderConfig, Provider, ProviderManager,
+        ProviderMeta, UniversalProvider,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -1044,8 +1044,7 @@ mod tests {
             ("shadow", ClaudeCodexBridgeMode::Shadow),
             ("enabled", ClaudeCodexBridgeMode::Enabled),
         ] {
-            let meta: ProviderMeta =
-                serde_json::from_value(json!({"bridgeMode": raw})).unwrap();
+            let meta: ProviderMeta = serde_json::from_value(json!({"bridgeMode": raw})).unwrap();
             assert_eq!(meta.bridge_mode, Some(expected));
 
             let serialized = serde_json::to_value(meta).unwrap();
