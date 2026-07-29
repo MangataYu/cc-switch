@@ -623,16 +623,14 @@ The legacy path may be removed only when:
 - Claude→Codex OAuth semantic logic in the old transformers is covered by the new modules.
 - Removing old entry points does not remove codecs used by other traffic directions.
 
-## 18. Existing Worktree Changes
+## 18. Worktree Baseline
 
-The current worktree already contains uncommitted Read tracing, previous-response and shell probes, Read offset handling, and related proxy changes. They are user-owned work and must not be overwritten or discarded.
-
-The implementation plan must classify each existing change as one of:
-
-- Absorb into Stage 0 tracing/replay.
-- Use as capability-profile evidence.
-- Preserve as an independent bug fix.
-- Supersede only after an equivalent bridge regression test exists.
+Before implementation planning, the earlier Read tracing, capability probes,
+generated probe targets, and related uncommitted proxy experiments were discarded
+at the user's request because they did not establish the required Agent semantics.
+Implementation therefore starts from commit `5ad2fafc` with a clean worktree and
+must build its own failing tests and replay fixtures rather than depending on those
+experiments.
 
 ## 19. Success Criteria
 
