@@ -77,6 +77,11 @@ fn redact_value(
                 );
             }
         }
+        Value::String(text) if looks_like_embedded_credential(text) => {
+            *value = Value::String(REDACTED.to_string());
+            redacted_paths.push(path.to_string());
+            uncertain_paths.push(path.to_string());
+        }
         _ => {}
     }
 }
@@ -87,6 +92,26 @@ fn normalize_key(key: &str) -> String {
 
 fn looks_like_unknown_credential(key: &str) -> bool {
     key.contains("secret") || key.contains("credential") || key.ends_with("_token")
+}
+
+fn looks_like_embedded_credential(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("bearer ")
+        || lower.contains("sk-")
+        || lower.contains("ghp_")
+        || lower.contains("github_pat_")
+        || lower.contains("xoxb-")
+        || lower.contains("xoxp-")
+    {
+        return true;
+    }
+
+    value.split_ascii_whitespace().any(|word| {
+        let candidate = word.trim_matches(|character: char| {
+            matches!(character, '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']')
+        });
+        candidate.starts_with("eyJ") && candidate.split('.').count() == 3 && candidate.len() >= 32
+    })
 }
 
 #[cfg(test)]
@@ -120,5 +145,20 @@ mod tests {
         assert!(outcome
             .uncertain_paths
             .contains(&"$.custom_super_secret_credential".to_string()));
+    }
+
+    #[test]
+    fn embedded_credential_value_suppresses_full_capture() {
+        let input = serde_json::json!({
+            "input": [{"role": "user", "content": "debug Bearer oauth-secret"}]
+        });
+
+        let outcome = redact_protocol_value(&input);
+
+        assert!(!outcome.safe_for_full_capture);
+        assert_eq!(outcome.value["input"][0]["content"], "[REDACTED]");
+        assert!(outcome
+            .uncertain_paths
+            .contains(&"$.input[0].content".to_string()));
     }
 }
