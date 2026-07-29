@@ -2,6 +2,7 @@ mod capabilities;
 mod conversation_ledger;
 mod error;
 mod schema;
+pub mod streaming;
 mod tools;
 
 pub use capabilities::*;

@@ -15,6 +15,10 @@ pub enum BridgeError {
         kind: ConversationConflictKind,
         summary: String,
     },
+    #[error("invalid upstream Responses event ({event_kind}): {summary}")]
+    InvalidUpstreamEvent { event_kind: String, summary: String },
+    #[error("incomplete upstream Responses stream: {summary}")]
+    IncompleteStream { summary: String },
     #[error(transparent)]
     Codec(#[from] ProxyError),
 }
@@ -34,6 +38,15 @@ impl BridgeError {
             Self::ConversationStateConflict { kind, summary } => ProxyError::InvalidRequest(
                 format!("Claude Codex conversation state conflict ({kind:?}): {summary}"),
             ),
+            Self::InvalidUpstreamEvent {
+                event_kind,
+                summary,
+            } => ProxyError::TransformError(format!(
+                "Claude Codex invalid upstream event ({event_kind}): {summary}"
+            )),
+            Self::IncompleteStream { summary } => ProxyError::TransformError(format!(
+                "Claude Codex incomplete upstream stream: {summary}"
+            )),
             Self::Codec(error) => error,
         }
     }
