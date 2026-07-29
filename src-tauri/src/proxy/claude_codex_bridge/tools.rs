@@ -5,7 +5,7 @@ use crate::proxy::json_canonical::canonical_json_string;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -56,6 +56,7 @@ impl ToolRegistry {
         if capabilities.function_tools == SupportLevel::Unsupported && !tools.is_empty() {
             return registry_error("function tools are unsupported by this capability profile");
         }
+        let dynamic_names = plan_dynamic_names(tools)?;
         let mut bindings = Vec::with_capacity(tools.len());
         let mut codex_tools = Vec::with_capacity(tools.len());
         let mut claude_to_index = BTreeMap::new();
@@ -84,7 +85,15 @@ impl ToolRegistry {
             }
             let (codex_name, semantics) = builtin_alias(&claude_name)
                 .map(|alias| (alias.to_string(), builtin_semantics(&claude_name)))
-                .unwrap_or_else(|| (sanitize_dynamic_name(&claude_name), ToolSemantics::Dynamic));
+                .unwrap_or_else(|| {
+                    (
+                        dynamic_names
+                            .get(&claude_name)
+                            .expect("dynamic name was precomputed")
+                            .clone(),
+                        ToolSemantics::Dynamic,
+                    )
+                });
             if codex_to_index.contains_key(&codex_name) {
                 return registry_error(&format!("conflicting Codex tool alias: {codex_name}"));
             }
@@ -254,6 +263,12 @@ fn builtin_semantics(name: &str) -> ToolSemantics {
 }
 
 fn sanitize_dynamic_name(name: &str) -> String {
+    if name
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+    {
+        return name.to_string();
+    }
     let mut sanitized = String::with_capacity(name.len());
     for character in name.chars() {
         if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
@@ -261,9 +276,6 @@ fn sanitize_dynamic_name(name: &str) -> String {
         } else {
             sanitized.push('_');
         }
-    }
-    while sanitized.contains("__") {
-        sanitized = sanitized.replace("__", "_");
     }
     let sanitized = sanitized.trim_matches('_');
     let mut result = if sanitized.is_empty() {
@@ -275,6 +287,70 @@ fn sanitize_dynamic_name(name: &str) -> String {
         result.insert_str(0, "tool_");
     }
     result
+}
+
+fn plan_dynamic_names(tools: &[Value]) -> Result<BTreeMap<String, String>, BridgeError> {
+    let reserved: BTreeSet<&'static str> = [
+        "read_file",
+        "find_files",
+        "search_text",
+        "edit_file",
+        "write_file",
+        "shell_command",
+        "fetch_url",
+        "search_web",
+        "edit_notebook",
+        "spawn_agent",
+        "search_tools",
+    ]
+    .into_iter()
+    .collect();
+    let mut seen = BTreeSet::new();
+    let mut candidates = BTreeMap::new();
+    let mut counts = BTreeMap::<String, usize>::new();
+    for tool in tools {
+        let object = tool
+            .as_object()
+            .ok_or_else(|| BridgeError::ToolRegistryViolation {
+                summary: "tool definition must be an object".to_string(),
+            })?;
+        if object.get("type").and_then(Value::as_str) == Some("BatchTool") {
+            return registry_error("BatchTool is unsupported by the Stage 2 bridge");
+        }
+        let name = object
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| BridgeError::ToolRegistryViolation {
+                summary: "tool definition requires a non-empty name".to_string(),
+            })?;
+        if !seen.insert(name.to_string()) {
+            return registry_error(&format!("duplicate Claude tool name: {name}"));
+        }
+        if builtin_alias(name).is_some() {
+            continue;
+        }
+        let candidate = sanitize_dynamic_name(name);
+        if reserved.contains(candidate.as_str()) {
+            return registry_error(&format!(
+                "dynamic tool conflicts with built-in alias namespace: {candidate}"
+            ));
+        }
+        *counts.entry(candidate.clone()).or_default() += 1;
+        candidates.insert(name.to_string(), candidate);
+    }
+    Ok(candidates
+        .into_iter()
+        .map(|(name, candidate)| {
+            let planned = if counts.get(&candidate).copied().unwrap_or_default() > 1 {
+                let hash = format!("{:x}", Sha256::digest(name.as_bytes()));
+                format!("{candidate}__{}", &hash[..8])
+            } else {
+                candidate
+            };
+            (name, planned)
+        })
+        .collect())
 }
 
 fn model_description(name: &str, semantics: ToolSemantics, supplied: Option<&str>) -> String {
@@ -536,5 +612,65 @@ mod tests {
             response["output"][1]["arguments"]
         );
         assert_eq!(response["output"][1]["name"], "read_file");
+    }
+
+    #[test]
+    fn dynamic_mcp_names_are_stable_and_restore_exactly() {
+        let tools = [
+            definition("mcp__filesystem__stat"),
+            definition("插件 search/文件"),
+        ];
+        let (left, _) =
+            ToolRegistry::compile(&tools, CodexOAuthCapabilities::builtin().as_ref()).unwrap();
+        let (right, _) =
+            ToolRegistry::compile(&tools, CodexOAuthCapabilities::builtin().as_ref()).unwrap();
+
+        assert_eq!(left.bindings()[0].codex_name, "mcp__filesystem__stat");
+        assert_eq!(left.bindings()[0].semantics, ToolSemantics::Dynamic);
+        assert_eq!(
+            left.bindings()[1].codex_name,
+            right.bindings()[1].codex_name
+        );
+        assert!(left.bindings()[1]
+            .codex_name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')));
+        let restored = left
+            .restore_call(
+                &left.bindings()[1].codex_name,
+                "call_plugin",
+                r#"{"value":"x"}"#,
+            )
+            .unwrap();
+        assert_eq!(restored.claude_name, "插件 search/文件");
+    }
+
+    #[test]
+    fn sanitized_dynamic_collisions_receive_distinct_stable_hash_suffixes() {
+        let tools = [definition("plugin/a"), definition("plugin a")];
+        let (registry, _) =
+            ToolRegistry::compile(&tools, CodexOAuthCapabilities::builtin().as_ref()).unwrap();
+
+        let names: Vec<&str> = registry
+            .bindings()
+            .iter()
+            .map(|binding| binding.codex_name.as_str())
+            .collect();
+        assert_ne!(names[0], names[1]);
+        assert!(names.iter().all(|name| name.starts_with("plugin_a__")));
+        assert!(names
+            .iter()
+            .all(|name| name.len() == "plugin_a__".len() + 8));
+    }
+
+    #[test]
+    fn dynamic_tools_cannot_claim_exact_builtin_alias_namespace() {
+        assert!(matches!(
+            ToolRegistry::compile(
+                &[definition("read_file")],
+                CodexOAuthCapabilities::builtin().as_ref()
+            ),
+            Err(BridgeError::ToolRegistryViolation { .. })
+        ));
     }
 }
