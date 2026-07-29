@@ -446,6 +446,7 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
         let mut tool_trace_by_index: HashMap<u32, ReadCallTrace> = HashMap::new();
         let mut tool_call_id_by_index: HashMap<u32, String> = HashMap::new();
         let mut pending_registry_tools: HashSet<u32> = HashSet::new();
+        let mut completed_registry_tools: HashMap<u32, (String, String, String)> = HashMap::new();
         let mut last_tool_index: Option<u32> = None;
         let mut reasoning_index_by_item_id: HashMap<String, u32> = HashMap::new();
         let mut reasoning_item_by_index: HashMap<u32, Value> = HashMap::new();
@@ -870,6 +871,21 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                         {
                                             tool_index_by_item_id.insert(item_id.to_string(), index);
                                         }
+                                        if tool_registry.is_some()
+                                            && (tool_codex_name_by_index
+                                                .get(&index)
+                                                .is_some_and(|existing| existing != codex_name)
+                                                || tool_call_id_by_index
+                                                    .get(&index)
+                                                    .is_some_and(|existing| existing != call_id))
+                                        {
+                                            yield Ok(anthropic_error_sse(
+                                                "registered tool identity changed between stream events",
+                                                "tool_registry_violation",
+                                            ));
+                                            terminated = true;
+                                            continue;
+                                        }
                                         tool_name_by_index.insert(index, name.clone());
                                         tool_codex_name_by_index.insert(index, codex_name.to_string());
                                         if !call_id.is_empty() {
@@ -976,6 +992,18 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                         tool_index_by_item_id.insert(id.to_string(), index);
                                     }
                                     if let Some(codex_name) = data.get("name").and_then(Value::as_str) {
+                                        if tool_registry.is_some()
+                                            && tool_codex_name_by_index
+                                                .get(&index)
+                                                .is_some_and(|existing| existing != codex_name)
+                                        {
+                                            yield Ok(anthropic_error_sse(
+                                                "registered tool identity changed between stream events",
+                                                "tool_registry_violation",
+                                            ));
+                                            terminated = true;
+                                            continue;
+                                        }
                                         let name = match tool_registry.as_deref() {
                                             Some(registry) => match registry.claude_name_for_codex(codex_name) {
                                                 Ok(name) => name.to_string(),
@@ -996,6 +1024,18 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                         tool_name_by_index.entry(index).or_default();
                                     }
                                     if let Some(call_id) = data.get("call_id").and_then(Value::as_str) {
+                                        if tool_registry.is_some()
+                                            && tool_call_id_by_index
+                                                .get(&index)
+                                                .is_some_and(|existing| existing != call_id)
+                                        {
+                                            yield Ok(anthropic_error_sse(
+                                                "registered tool identity changed between stream events",
+                                                "tool_registry_violation",
+                                            ));
+                                            terminated = true;
+                                            continue;
+                                        }
                                         tool_call_id_by_index.insert(index, call_id.to_string());
                                     }
                                     last_tool_index = Some(index);
@@ -1118,6 +1158,36 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                 .or(last_tool_index);
                                 if let Some(index) = index {
                                     if let Some(registry) = tool_registry.as_deref() {
+                                        if let Some((completed_name, completed_id, completed_raw)) =
+                                            completed_registry_tools.get(&index)
+                                        {
+                                            let duplicate_raw = data
+                                                .get("arguments")
+                                                .or_else(|| data.pointer("/item/arguments"))
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("");
+                                            let duplicate_name = data
+                                                .get("name")
+                                                .or_else(|| data.pointer("/item/name"))
+                                                .and_then(Value::as_str);
+                                            let duplicate_id = data
+                                                .get("call_id")
+                                                .or_else(|| data.pointer("/item/call_id"))
+                                                .and_then(Value::as_str);
+                                            if duplicate_raw != completed_raw
+                                                || duplicate_name
+                                                    .is_some_and(|name| name != completed_name)
+                                                || duplicate_id
+                                                    .is_some_and(|id| id != completed_id)
+                                            {
+                                                yield Ok(anthropic_error_sse(
+                                                    "duplicate registered tool completion conflicts with the validated call",
+                                                    "tool_registry_violation",
+                                                ));
+                                                terminated = true;
+                                            }
+                                            continue;
+                                        }
                                         if !pending_registry_tools.remove(&index) {
                                             yield Ok(anthropic_error_sse(
                                                 "registered tool completion has no pending tool call",
@@ -1145,6 +1215,24 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                             .get(&index)
                                             .map(String::as_str)
                                             .unwrap_or("");
+                                        let completion_name = data
+                                            .get("name")
+                                            .or_else(|| data.pointer("/item/name"))
+                                            .and_then(Value::as_str);
+                                        let completion_call_id = data
+                                            .get("call_id")
+                                            .or_else(|| data.pointer("/item/call_id"))
+                                            .and_then(Value::as_str);
+                                        if completion_name.is_some_and(|name| name != codex_name)
+                                            || completion_call_id.is_some_and(|id| id != call_id)
+                                        {
+                                            yield Ok(anthropic_error_sse(
+                                                "registered tool identity changed between stream events",
+                                                "tool_registry_violation",
+                                            ));
+                                            terminated = true;
+                                            continue;
+                                        }
                                         let call = match registry.restore_call(codex_name, call_id, &raw) {
                                             Ok(call) => call,
                                             Err(error) => {
@@ -1183,6 +1271,10 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                             "content_block_stop",
                                             &json!({"type": "content_block_stop", "index": index}),
                                         ));
+                                        completed_registry_tools.insert(
+                                            index,
+                                            (codex_name.to_string(), call_id.to_string(), raw.clone()),
+                                        );
                                         if let Some(item_id) = item_id {
                                             tool_index_by_item_id.remove(item_id);
                                         }
@@ -1689,6 +1781,36 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                             .or(last_tool_index);
                                         if let Some(index) = index {
                                             if let Some(registry) = tool_registry.as_deref() {
+                                                if let Some((completed_name, completed_id, completed_raw)) =
+                                                    completed_registry_tools.get(&index)
+                                                {
+                                                    let duplicate_raw = item
+                                                        .get("arguments")
+                                                        .and_then(Value::as_str)
+                                                        .unwrap_or("");
+                                                    let duplicate_name = item
+                                                        .get("name")
+                                                        .and_then(Value::as_str);
+                                                    let duplicate_id = item
+                                                        .get("call_id")
+                                                        .and_then(Value::as_str);
+                                                    if duplicate_raw != completed_raw
+                                                        || duplicate_name
+                                                            .is_some_and(|name| name != completed_name)
+                                                        || duplicate_id
+                                                            .is_some_and(|id| id != completed_id)
+                                                    {
+                                                        yield Ok(anthropic_error_sse(
+                                                            "duplicate registered tool completion conflicts with the validated call",
+                                                            "tool_registry_violation",
+                                                        ));
+                                                        terminated = true;
+                                                    }
+                                                    if let Some(id) = item_id {
+                                                        tool_index_by_item_id.remove(id);
+                                                    }
+                                                    continue;
+                                                }
                                                 if !pending_registry_tools.remove(&index) {
                                                     yield Ok(anthropic_error_sse(
                                                         "registered output item has no pending tool call",
@@ -1716,6 +1838,22 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                                     .get(&index)
                                                     .map(String::as_str)
                                                     .unwrap_or("");
+                                                if item
+                                                    .get("name")
+                                                    .and_then(Value::as_str)
+                                                    .is_some_and(|name| name != codex_name)
+                                                    || item
+                                                        .get("call_id")
+                                                        .and_then(Value::as_str)
+                                                        .is_some_and(|id| id != call_id)
+                                                {
+                                                    yield Ok(anthropic_error_sse(
+                                                        "registered tool identity changed between stream events",
+                                                        "tool_registry_violation",
+                                                    ));
+                                                    terminated = true;
+                                                    continue;
+                                                }
                                                 let call = match registry.restore_call(codex_name, call_id, &raw) {
                                                     Ok(call) => call,
                                                     Err(error) => {
@@ -1754,6 +1892,14 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                                     "content_block_stop",
                                                     &json!({"type": "content_block_stop", "index": index}),
                                                 ));
+                                                completed_registry_tools.insert(
+                                                    index,
+                                                    (
+                                                        codex_name.to_string(),
+                                                        call_id.to_string(),
+                                                        raw.clone(),
+                                                    ),
+                                                );
                                                 if let Some(id) = item_id {
                                                     tool_index_by_item_id.remove(id);
                                                 }
@@ -2732,6 +2878,47 @@ mod tests {
         assert_eq!(converted.matches("partial_json").count(), 1);
         assert!(converted.contains("\\\"pages\\\":\\\"\\\""));
         assert!(converted.contains("2.300310976710655e22"));
+        assert!(!converted.contains("tool_registry_violation"));
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_rejects_conflicting_tool_identity_events() {
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-test\"}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\"}}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"call_id\":\"call_2\",\"name\":\"different_tool\",\"arguments\":\"{\\\"file_path\\\":\\\"src/main.rs\\\"}\"}}\n\n"
+        );
+
+        let converted = convert_stream_with_registry(input).await;
+
+        assert!(converted.contains("tool_registry_violation"));
+        assert!(!converted.contains("\"type\":\"tool_use\""));
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_accepts_consistent_arguments_done_then_output_item_done() {
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-test\"}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"item_1\",\"output_index\":0,\"delta\":\"{\\\"file_path\\\":\\\"src/main.rs\\\"}\"}\n\n",
+            "event: response.function_call_arguments.done\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"item_1\",\"output_index\":0,\"arguments\":\"{\\\"file_path\\\":\\\"src/main.rs\\\"}\"}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":\"{\\\"file_path\\\":\\\"src/main.rs\\\"}\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        );
+
+        let converted = convert_stream_with_registry(input).await;
+
+        assert_eq!(converted.matches("\"type\":\"tool_use\"").count(), 1);
+        assert_eq!(converted.matches("partial_json").count(), 1);
         assert!(!converted.contains("tool_registry_violation"));
     }
 

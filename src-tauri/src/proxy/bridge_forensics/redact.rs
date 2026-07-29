@@ -33,7 +33,14 @@ pub fn redact_protocol_value(value: &Value) -> RedactionOutcome {
     let mut redacted_paths = Vec::new();
     let mut uncertain_paths = Vec::new();
 
-    redact_value(&mut value, "$", &mut redacted_paths, &mut uncertain_paths);
+    redact_value(
+        &mut value,
+        "$",
+        &mut redacted_paths,
+        &mut uncertain_paths,
+        false,
+        false,
+    );
 
     RedactionOutcome {
         value,
@@ -48,6 +55,8 @@ fn redact_value(
     path: &str,
     redacted_paths: &mut Vec<String>,
     uncertain_paths: &mut Vec<String>,
+    in_schema: bool,
+    schema_property_map: bool,
 ) {
     match value {
         Value::Object(object) => {
@@ -55,7 +64,16 @@ fn redact_value(
                 let child_path = format!("{path}.{key}");
                 let normalized_key = normalize_key(key);
 
-                if EXPLICIT_CREDENTIAL_KEYS.contains(&normalized_key.as_str()) {
+                if schema_property_map {
+                    redact_value(
+                        child,
+                        &child_path,
+                        redacted_paths,
+                        uncertain_paths,
+                        true,
+                        false,
+                    );
+                } else if EXPLICIT_CREDENTIAL_KEYS.contains(&normalized_key.as_str()) {
                     *child = Value::String(REDACTED.to_string());
                     redacted_paths.push(child_path);
                 } else if looks_like_unknown_credential(&normalized_key) {
@@ -63,7 +81,18 @@ fn redact_value(
                     redacted_paths.push(child_path.clone());
                     uncertain_paths.push(child_path);
                 } else {
-                    redact_value(child, &child_path, redacted_paths, uncertain_paths);
+                    let starts_schema = matches!(
+                        normalized_key.as_str(),
+                        "input_schema" | "claude_schema" | "codex_schema" | "parameters"
+                    );
+                    redact_value(
+                        child,
+                        &child_path,
+                        redacted_paths,
+                        uncertain_paths,
+                        in_schema || starts_schema,
+                        in_schema && normalized_key == "properties",
+                    );
                 }
             }
         }
@@ -74,6 +103,8 @@ fn redact_value(
                     &format!("{path}[{index}]"),
                     redacted_paths,
                     uncertain_paths,
+                    in_schema,
+                    false,
                 );
             }
         }
@@ -160,5 +191,36 @@ mod tests {
         assert!(outcome
             .uncertain_paths
             .contains(&"$.input[0].content".to_string()));
+    }
+
+    #[test]
+    fn preserves_credential_named_schema_properties_but_redacts_runtime_values() {
+        let input = serde_json::json!({
+            "tools": [{
+                "name": "configure",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "api_key": {"type": "string"},
+                        "password": {"type": "string"}
+                    },
+                    "required": ["api_key"]
+                }
+            }],
+            "runtime_input": {"api_key": "secret", "password": "secret"}
+        });
+
+        let outcome = redact_protocol_value(&input);
+
+        assert_eq!(
+            outcome.value["tools"][0]["input_schema"]["properties"]["api_key"],
+            serde_json::json!({"type": "string"})
+        );
+        assert_eq!(
+            outcome.value["tools"][0]["input_schema"]["properties"]["password"],
+            serde_json::json!({"type": "string"})
+        );
+        assert_eq!(outcome.value["runtime_input"]["api_key"], REDACTED);
+        assert_eq!(outcome.value["runtime_input"]["password"], REDACTED);
     }
 }

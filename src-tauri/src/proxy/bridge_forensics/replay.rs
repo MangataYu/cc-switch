@@ -560,7 +560,10 @@ mod tests {
                 "name": "Read",
                 "input_schema": {
                     "type": "object",
-                    "properties": {"file_path": {"type": "string"}},
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "api_key": {"type": "string"}
+                    },
                     "required": ["file_path"],
                     "additionalProperties": false
                 }

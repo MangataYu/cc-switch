@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::str::FromStr;
+
+use rust_decimal::Decimal;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -180,14 +183,18 @@ fn validate_schema_shape(schema: &Value, path: &str) -> Result<(), BridgeError> 
         "exclusiveMaximum",
         "multipleOf",
     ] {
-        if object.get(keyword).is_some_and(|value| !value.is_number()) {
-            return schema_error(&format!("{path}/{keyword} must be a number"));
+        if let Some(value) = object.get(keyword) {
+            if exact_decimal(value).is_none() {
+                return schema_error(&format!(
+                    "{path}/{keyword} must be an exactly representable decimal number"
+                ));
+            }
         }
     }
     if object
         .get("multipleOf")
-        .and_then(Value::as_f64)
-        .is_some_and(|value| value <= 0.0)
+        .and_then(exact_decimal)
+        .is_some_and(|value| value <= Decimal::ZERO)
     {
         return schema_error(&format!("{path}/multipleOf must be positive"));
     }
@@ -320,7 +327,7 @@ fn validate_value(schema: &Value, value: &Value, path: &str) -> Result<(), Strin
             "object" => value.is_object(),
             "array" => value.is_array(),
             "string" => value.is_string(),
-            "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+            "integer" => exact_decimal(value).is_some_and(|value| value.fract().is_zero()),
             "number" => value.is_number(),
             "boolean" => value.is_boolean(),
             "null" => value.is_null(),
@@ -365,39 +372,38 @@ fn validate_value(schema: &Value, value: &Value, path: &str) -> Result<(), Strin
             }
         }
     }
-    if let Some(number) = value.as_f64() {
+    if value.is_number() {
+        let number = exact_decimal(value)
+            .ok_or_else(|| format!("argument number at {path} cannot be represented exactly"))?;
         if object
             .get("minimum")
-            .and_then(Value::as_f64)
+            .and_then(exact_decimal)
             .is_some_and(|minimum| number < minimum)
         {
             return Err(format!("argument at {path} is below minimum"));
         }
         if object
             .get("maximum")
-            .and_then(Value::as_f64)
+            .and_then(exact_decimal)
             .is_some_and(|maximum| number > maximum)
         {
             return Err(format!("argument at {path} is above maximum"));
         }
         if object
             .get("exclusiveMinimum")
-            .and_then(Value::as_f64)
+            .and_then(exact_decimal)
             .is_some_and(|min| number <= min)
             || object
                 .get("exclusiveMaximum")
-                .and_then(Value::as_f64)
+                .and_then(exact_decimal)
                 .is_some_and(|max| number >= max)
         {
             return Err(format!("argument at {path} is outside exclusive bounds"));
         }
         if object
             .get("multipleOf")
-            .and_then(Value::as_f64)
-            .is_some_and(|multiple| {
-                let quotient = number / multiple;
-                (quotient - quotient.round()).abs() > 1e-9
-            })
+            .and_then(exact_decimal)
+            .is_some_and(|multiple| number % multiple != Decimal::ZERO)
         {
             return Err(format!("argument at {path} is not a required multiple"));
         }
@@ -427,6 +433,13 @@ fn validate_value(schema: &Value, value: &Value, path: &str) -> Result<(), Strin
         }
     }
     Ok(())
+}
+
+fn exact_decimal(value: &Value) -> Option<Decimal> {
+    let text = value.as_number()?.to_string();
+    Decimal::from_str(&text)
+        .or_else(|_| Decimal::from_scientific(&text))
+        .ok()
 }
 
 fn validate_object(
@@ -604,6 +617,31 @@ mod tests {
                 "keyword {keyword} must fail closed"
             );
         }
+    }
+
+    #[test]
+    fn argument_validation_enforces_numeric_constraints_without_f64_rounding() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "large": {"type": "integer", "minimum": 9007199254740993_u64},
+                "whole": {"type": "number", "multipleOf": 1}
+            },
+            "required": ["large", "whole"],
+            "additionalProperties": false
+        });
+
+        adapt_schema(&schema).unwrap();
+        validate_arguments(&schema, &json!({"large": 9007199254740993_u64, "whole": 2})).unwrap();
+        assert!(
+            validate_arguments(&schema, &json!({"large": 9007199254740992_u64, "whole": 2}))
+                .is_err()
+        );
+        assert!(validate_arguments(
+            &schema,
+            &json!({"large": 9007199254740993_u64, "whole": 1e-10})
+        )
+        .is_err());
     }
 
     #[test]
