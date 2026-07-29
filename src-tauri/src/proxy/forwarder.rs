@@ -6,6 +6,9 @@ use super::bridge_forensics::{
     BridgeForensicStore, CaptureMetadata, EvidenceArtifactKind, EvidenceError, EvidenceErrorKind,
     EvidenceStage, ForensicTurnCapture,
 };
+use super::claude_codex_bridge::{
+    bridge_scope_matches, BridgeError, ClaudeCodexBridge, PreparedCodexTurn,
+};
 use super::hyper_client::ProxyResponse;
 use super::{
     body_filter::filter_private_params_with_whitelist,
@@ -32,7 +35,7 @@ use crate::proxy::providers::copilot_auth::CopilotAuthManager;
 use crate::proxy::providers::xai_oauth_auth::XaiOAuthManager;
 use crate::{
     app_config::AppType,
-    provider::{LocalProxyRequestOverrides, Provider},
+    provider::{ClaudeCodexBridgeMode, LocalProxyRequestOverrides, Provider},
 };
 use bytes::Bytes;
 use futures::StreamExt;
@@ -43,6 +46,70 @@ use tauri::Manager;
 use tokio::sync::RwLock;
 
 const PROXY_AUTH_PLACEHOLDER: &str = "PROXY_MANAGED";
+
+struct ClaudeCodexRequestDispatch {
+    request: Value,
+    prepared_turn: Option<PreparedCodexTurn>,
+}
+
+fn dispatch_claude_codex_request_with<Legacy, Bridge>(
+    app_type: &AppType,
+    provider: &Provider,
+    request: Value,
+    legacy_compile: Legacy,
+    bridge_compile: Bridge,
+) -> Result<ClaudeCodexRequestDispatch, ProxyError>
+where
+    Legacy: FnOnce(Value) -> Result<Value, ProxyError>,
+    Bridge: FnOnce(Value) -> Result<PreparedCodexTurn, BridgeError>,
+{
+    if !bridge_scope_matches(app_type, provider) {
+        return legacy_compile(request).map(|request| ClaudeCodexRequestDispatch {
+            request,
+            prepared_turn: None,
+        });
+    }
+
+    match provider.claude_codex_bridge_mode() {
+        ClaudeCodexBridgeMode::Legacy => {
+            legacy_compile(request).map(|request| ClaudeCodexRequestDispatch {
+                request,
+                prepared_turn: None,
+            })
+        }
+        ClaudeCodexBridgeMode::Shadow => {
+            let shadow = bridge_compile(request.clone());
+            let legacy_request = legacy_compile(request)?;
+            match shadow {
+                Ok(prepared) => {
+                    let matches = short_value_hash(Some(&prepared.request))
+                        == short_value_hash(Some(&legacy_request));
+                    log::debug!(
+                        "[ClaudeCodexBridge] mode=shadow provider={} profile={} request_match={}",
+                        provider.id,
+                        prepared.capability_snapshot.profile_version,
+                        matches
+                    );
+                }
+                Err(_) => log::warn!(
+                    "[ClaudeCodexBridge] mode=shadow provider={} compile_failed",
+                    provider.id
+                ),
+            }
+            Ok(ClaudeCodexRequestDispatch {
+                request: legacy_request,
+                prepared_turn: None,
+            })
+        }
+        ClaudeCodexBridgeMode::Enabled => {
+            let prepared_turn = bridge_compile(request).map_err(BridgeError::into_proxy_error)?;
+            Ok(ClaudeCodexRequestDispatch {
+                request: prepared_turn.request.clone(),
+                prepared_turn: Some(prepared_turn),
+            })
+        }
+    }
+}
 
 fn validate_codex_official_authorization(headers: &http::HeaderMap) -> Result<(), ProxyError> {
     let authorization = headers
@@ -70,6 +137,7 @@ pub struct ForwardResult {
     /// 缺失 model 或回显别名时，接管流量会被记成 claude-* 并按其定价计费。
     pub outbound_model: Option<String>,
     pub bridge_evidence: Option<ForensicTurnCapture>,
+    pub prepared_codex_turn: Option<PreparedCodexTurn>,
     /// 活跃连接 RAII guard：随响应一起流转到 response_processor / handle_claude_transform，
     /// 最终被 move 进流式 body future（或非流式响应作用域），覆盖整个响应生命周期。
     pub(crate) connection_guard: Option<ActiveConnectionGuard>,
@@ -495,7 +563,13 @@ impl RequestForwarder {
                 )
                 .await
             {
-                Ok((response, claude_api_format, outbound_model, bridge_evidence)) => {
+                Ok((
+                    response,
+                    claude_api_format,
+                    outbound_model,
+                    bridge_evidence,
+                    prepared_codex_turn,
+                )) => {
                     // 成功：普通闭合熔断状态异步记录，避免阻塞流式首包返回；
                     // HalfOpen 探测仍同步等待，保证 permit 与熔断状态及时释放。
                     self.record_success_result(&provider.id, app_type_str, used_half_open_permit)
@@ -545,6 +619,7 @@ impl RequestForwarder {
                         claude_api_format,
                         outbound_model,
                         bridge_evidence,
+                        prepared_codex_turn,
                         connection_guard: None,
                     });
                 }
@@ -600,6 +675,7 @@ impl RequestForwarder {
                                     claude_api_format,
                                     outbound_model,
                                     bridge_evidence,
+                                    prepared_codex_turn,
                                 )) => {
                                     log::info!(
                                         "[{app_type_str}] [Media] Unsupported-image retry succeeded"
@@ -654,6 +730,7 @@ impl RequestForwarder {
                                         claude_api_format,
                                         outbound_model,
                                         bridge_evidence,
+                                        prepared_codex_turn,
                                         connection_guard: None,
                                     });
                                 }
@@ -752,6 +829,7 @@ impl RequestForwarder {
                                         claude_api_format,
                                         outbound_model,
                                         bridge_evidence,
+                                        prepared_codex_turn,
                                     )) => {
                                         log::info!("[{app_type_str}] [RECT-002] 整流重试成功");
                                         self.record_success_result(
@@ -809,6 +887,7 @@ impl RequestForwarder {
                                             claude_api_format,
                                             outbound_model,
                                             bridge_evidence,
+                                            prepared_codex_turn,
                                             connection_guard: None,
                                         });
                                     }
@@ -924,6 +1003,7 @@ impl RequestForwarder {
                                     claude_api_format,
                                     outbound_model,
                                     bridge_evidence,
+                                    prepared_codex_turn,
                                 )) => {
                                     log::info!("[{app_type_str}] [RECT-011] budget 整流重试成功");
                                     self.record_success_result(
@@ -975,6 +1055,7 @@ impl RequestForwarder {
                                         claude_api_format,
                                         outbound_model,
                                         bridge_evidence,
+                                        prepared_codex_turn,
                                         connection_guard: None,
                                     });
                                 }
@@ -1152,6 +1233,7 @@ impl RequestForwarder {
             Option<String>,
             Option<String>,
             Option<ForensicTurnCapture>,
+            Option<PreparedCodexTurn>,
         ),
         ProxyError,
     > {
@@ -1455,6 +1537,8 @@ impl RequestForwarder {
             None
         };
 
+        let mut prepared_codex_turn = None;
+
         // 转换请求体（如果需要）
         let mut request_body = if codex_responses_to_chat {
             let mut mapped_body = mapped_body;
@@ -1547,19 +1631,37 @@ impl RequestForwarder {
                 let api_format = resolved_claude_api_format
                     .as_deref()
                     .unwrap_or_else(|| super::providers::get_claude_api_format(provider));
-                let (transformed, evidence) =
+                let (dispatch, evidence) =
                     finish_bridge_request_transform(bridge_evidence.take(), || {
-                        super::providers::transform_claude_request_for_api_format(
-                            mapped_body,
+                        let bridge = ClaudeCodexBridge::builtin();
+                        dispatch_claude_codex_request_with(
+                            app_type,
                             provider,
-                            api_format,
-                            self.session_client_provided
-                                .then_some(self.session_id.as_str()),
-                            Some(self.gemini_shadow.as_ref()),
+                            mapped_body,
+                            |body| {
+                                super::providers::transform_claude_request_for_api_format(
+                                    body,
+                                    provider,
+                                    api_format,
+                                    self.session_client_provided
+                                        .then_some(self.session_id.as_str()),
+                                    Some(self.gemini_shadow.as_ref()),
+                                )
+                            },
+                            |body| {
+                                bridge.prepare_turn(
+                                    app_type,
+                                    body,
+                                    provider,
+                                    self.session_client_provided
+                                        .then_some(self.session_id.as_str()),
+                                )
+                            },
                         )
                     })?;
                 bridge_evidence = evidence;
-                transformed
+                prepared_codex_turn = dispatch.prepared_turn;
+                dispatch.request
             } else {
                 adapter.transform_request(mapped_body, provider)?
             }
@@ -1625,6 +1727,17 @@ impl RequestForwarder {
                 if apply_local_proxy_body_overrides(&mut filtered_body, overrides) {
                     filtered_body = prepare_upstream_request_body(filtered_body);
                 }
+            }
+        }
+        if let (Some(evidence), Some(prepared)) =
+            (bridge_evidence.as_mut(), prepared_codex_turn.as_ref())
+        {
+            let report = serde_json::to_value(&prepared.negotiation_report)
+                .expect("negotiation report must serialize");
+            if let Err(error) =
+                evidence.record_json(EvidenceArtifactKind::CapabilityReport, &report)
+            {
+                log::warn!("[BridgeEvidence] capture_failed stage=capability_report error={error}");
             }
         }
         if let Some(mut evidence) = bridge_evidence.take() {
@@ -2363,6 +2476,7 @@ impl RequestForwarder {
                 resolved_claude_api_format,
                 outbound_model,
                 bridge_evidence,
+                prepared_codex_turn,
             ))
         } else {
             let status_code = status.as_u16();
@@ -3585,12 +3699,12 @@ fn begin_bridge_evidence_capture(
     Some(capture)
 }
 
-fn finish_bridge_request_transform<F>(
+fn finish_bridge_request_transform<F, T>(
     mut evidence: Option<ForensicTurnCapture>,
     transform: F,
-) -> Result<(Value, Option<ForensicTurnCapture>), ProxyError>
+) -> Result<(T, Option<ForensicTurnCapture>), ProxyError>
 where
-    F: FnOnce() -> Result<Value, ProxyError>,
+    F: FnOnce() -> Result<T, ProxyError>,
 {
     match transform() {
         Ok(value) => Ok((value, evidence)),
@@ -3812,6 +3926,101 @@ mod tests {
     }
 
     #[test]
+    fn claude_codex_bridge_dispatch_preserves_legacy_and_shadow_serving_paths() {
+        use std::cell::Cell;
+
+        let mut provider = bridge_provider("codex_oauth", "openai_responses");
+        let request = json!({"model": "gpt-test", "messages": []});
+
+        let bridge_calls = Cell::new(0);
+        let legacy = dispatch_claude_codex_request_with(
+            &AppType::Claude,
+            &provider,
+            request.clone(),
+            |_| Ok(json!({"served": "legacy"})),
+            |_| {
+                bridge_calls.set(bridge_calls.get() + 1);
+                Err(crate::proxy::claude_codex_bridge::BridgeError::OutOfScope)
+            },
+        )
+        .unwrap();
+        assert_eq!(legacy.request, json!({"served": "legacy"}));
+        assert!(legacy.prepared_turn.is_none());
+        assert_eq!(bridge_calls.get(), 0);
+
+        provider.meta.as_mut().unwrap().bridge_mode =
+            Some(crate::provider::ClaudeCodexBridgeMode::Shadow);
+        let shadow = dispatch_claude_codex_request_with(
+            &AppType::Claude,
+            &provider,
+            request,
+            |_| Ok(json!({"served": "legacy"})),
+            |_| {
+                bridge_calls.set(bridge_calls.get() + 1);
+                Err(crate::proxy::claude_codex_bridge::BridgeError::OutOfScope)
+            },
+        )
+        .unwrap();
+        assert_eq!(shadow.request, json!({"served": "legacy"}));
+        assert!(shadow.prepared_turn.is_none());
+        assert_eq!(bridge_calls.get(), 1);
+    }
+
+    #[test]
+    fn claude_codex_bridge_dispatch_enabled_returns_prepared_turn() {
+        let mut provider = bridge_provider("codex_oauth", "openai_responses");
+        provider.meta.as_mut().unwrap().bridge_mode =
+            Some(crate::provider::ClaudeCodexBridgeMode::Enabled);
+        let request = json!({
+            "model": "gpt-test",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+
+        let dispatch = dispatch_claude_codex_request_with(
+            &AppType::Claude,
+            &provider,
+            request.clone(),
+            |_| panic!("enabled mode must not invoke the legacy compiler"),
+            |body| {
+                crate::proxy::claude_codex_bridge::ClaudeCodexBridge::builtin().prepare_turn(
+                    &AppType::Claude,
+                    body,
+                    &provider,
+                    Some("session-1"),
+                )
+            },
+        )
+        .unwrap();
+
+        let prepared = dispatch.prepared_turn.unwrap();
+        assert_eq!(dispatch.request, prepared.request);
+        assert_eq!(
+            prepared.capability_snapshot.profile_version,
+            crate::proxy::claude_codex_bridge::BUILTIN_CODEX_OAUTH_PROFILE_VERSION
+        );
+    }
+
+    #[test]
+    fn claude_codex_bridge_dispatch_ignores_enabled_mode_outside_scope() {
+        let mut provider = bridge_provider("codex_oauth", "openai_responses");
+        provider.meta.as_mut().unwrap().bridge_mode =
+            Some(crate::provider::ClaudeCodexBridgeMode::Enabled);
+
+        let dispatch = dispatch_claude_codex_request_with(
+            &AppType::ClaudeDesktop,
+            &provider,
+            json!({"model": "gpt-test"}),
+            |_| Ok(json!({"served": "legacy"})),
+            |_| panic!("out-of-scope traffic must not invoke the bridge compiler"),
+        )
+        .unwrap();
+
+        assert_eq!(dispatch.request, json!({"served": "legacy"}));
+        assert!(dispatch.prepared_turn.is_none());
+    }
+
+    #[test]
     fn captures_codex_oauth_request_transform_failure() {
         use crate::proxy::bridge_forensics::{
             BridgeForensicStore, CaptureMetadata, EvidenceArtifactKind, EvidenceErrorKind,
@@ -3836,14 +4045,15 @@ mod tests {
             .record_json(EvidenceArtifactKind::ClaudeRequest, &claude_request)
             .unwrap();
 
-        let error = match finish_bridge_request_transform(Some(capture), || {
-            Err(ProxyError::TransformError(
-                "original converter detail".to_string(),
-            ))
-        }) {
-            Ok(_) => panic!("transform should fail"),
-            Err(error) => error,
-        };
+        let error =
+            match finish_bridge_request_transform(Some(capture), || -> Result<Value, ProxyError> {
+                Err(ProxyError::TransformError(
+                    "original converter detail".to_string(),
+                ))
+            }) {
+                Ok(_) => panic!("transform should fail"),
+                Err(error) => error,
+            };
 
         assert!(error.to_string().contains("original converter detail"));
         let bundles = store.list_bundles().unwrap();
