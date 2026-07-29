@@ -76,6 +76,7 @@ fn responses_json_to_anthropic_sse(
     read_trace: Option<&ReadTrace>,
     tool_registry: Option<&ToolRegistry>,
 ) -> Vec<Bytes> {
+    let upstream_body = body.clone();
     if let Some(registry) = tool_registry {
         body = match registry.restore_response(&body) {
             Ok(body) => body,
@@ -87,7 +88,7 @@ fn responses_json_to_anthropic_sse(
             }
         };
     }
-    let message = match responses_to_anthropic_with_read_offset_protection_and_trace(
+    let mut message = match responses_to_anthropic_with_read_offset_protection_and_trace(
         body,
         read_offset_protection,
         read_trace,
@@ -100,6 +101,17 @@ fn responses_json_to_anthropic_sse(
             )]
         }
     };
+    if let Some(registry) = tool_registry {
+        message = match registry.restore_anthropic_message(&upstream_body, &message) {
+            Ok(message) => message,
+            Err(error) => {
+                return vec![anthropic_error_sse(
+                    &error.to_string(),
+                    "tool_registry_violation",
+                )]
+            }
+        };
+    }
 
     let usage = message.get("usage").cloned().unwrap_or_else(|| json!({}));
     let mut start_usage = usage.clone();

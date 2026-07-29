@@ -123,13 +123,17 @@ impl PreparedCodexTurn {
         read_offset_protection: Option<&ReadOffsetProtection>,
         read_trace: Option<&ReadTrace>,
     ) -> Result<Value, BridgeError> {
+        let upstream_response = response.clone();
         let response = self.tool_registry.restore_response(&response)?;
-        transform_responses::responses_to_anthropic_with_read_offset_protection_and_trace(
-            response,
-            read_offset_protection,
-            read_trace,
-        )
-        .map_err(BridgeError::from)
+        let anthropic =
+            transform_responses::responses_to_anthropic_with_read_offset_protection_and_trace(
+                response,
+                read_offset_protection,
+                read_trace,
+            )
+            .map_err(BridgeError::from)?;
+        self.tool_registry
+            .restore_anthropic_message(&upstream_response, &anthropic)
     }
 }
 
@@ -296,6 +300,58 @@ mod tests {
         assert_eq!(restored["content"][0]["name"], "Read");
         assert_eq!(restored["content"][0]["id"], "call_1");
         assert_eq!(restored["content"][0]["input"]["file_path"], "src/main.rs");
+    }
+
+    #[test]
+    fn prepared_turn_returns_registry_validated_arguments_without_legacy_read_mutation() {
+        let provider = provider("codex_oauth", "openai_responses");
+        let prepared = ClaudeCodexBridge::builtin()
+            .prepare_turn(
+                &AppType::Claude,
+                json!({
+                    "model": "gpt-test",
+                    "messages": [],
+                    "tools": [{
+                        "name": "Read",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {
+                                "file_path": {"type": "string"},
+                                "pages": {"type": "string"},
+                                "offset": {"type": "number"}
+                            },
+                            "required": ["file_path", "pages", "offset"],
+                            "additionalProperties": false
+                        }
+                    }]
+                }),
+                &provider,
+                None,
+            )
+            .unwrap();
+        let exact_input = json!({
+            "file_path": "src/main.rs",
+            "pages": "",
+            "offset": 2.300310976710655e22
+        });
+        let response = json!({
+            "id": "resp_exact",
+            "model": "gpt-test",
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_exact",
+                "name": "read_file",
+                "arguments": serde_json::to_string(&exact_input).unwrap()
+            }],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+
+        let restored = prepared.consume_response(response, None, None).unwrap();
+
+        assert_eq!(restored["content"][0]["name"], "Read");
+        assert_eq!(restored["content"][0]["id"], "call_exact");
+        assert_eq!(restored["content"][0]["input"], exact_input);
     }
 
     #[test]

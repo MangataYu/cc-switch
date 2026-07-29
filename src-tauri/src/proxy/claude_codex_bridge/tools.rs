@@ -315,6 +315,69 @@ impl ToolRegistry {
         }
         Ok(restored)
     }
+
+    pub fn restore_anthropic_message(
+        &self,
+        upstream_response: &Value,
+        anthropic_message: &Value,
+    ) -> Result<Value, BridgeError> {
+        let output = upstream_response
+            .get("output")
+            .and_then(Value::as_array)
+            .ok_or_else(|| BridgeError::ToolRegistryViolation {
+                summary: "Responses payload requires an output array".to_string(),
+            })?;
+        let mut calls = BTreeMap::new();
+        for item in output {
+            if item.get("type").and_then(Value::as_str) != Some("function_call") {
+                continue;
+            }
+            let call = self.restore_call(
+                item.get("name").and_then(Value::as_str).unwrap_or(""),
+                item.get("call_id").and_then(Value::as_str).unwrap_or(""),
+                item.get("arguments").and_then(Value::as_str).unwrap_or(""),
+            )?;
+            if calls.insert(call.tool_use_id.clone(), call).is_some() {
+                return registry_error("upstream response contains duplicate tool call IDs");
+            }
+        }
+
+        let mut restored = anthropic_message.clone();
+        let content = restored
+            .get_mut("content")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| BridgeError::ToolRegistryViolation {
+                summary: "Anthropic response requires a content array".to_string(),
+            })?;
+        let mut seen = BTreeSet::new();
+        for block in content {
+            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                continue;
+            }
+            let id = block
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let call = calls
+                .get(&id)
+                .ok_or_else(|| BridgeError::ToolRegistryViolation {
+                    summary: format!(
+                        "Anthropic response contains an unregistered tool_use ID: {id}"
+                    ),
+                })?;
+            block["id"] = Value::String(call.tool_use_id.clone());
+            block["name"] = Value::String(call.claude_name.clone());
+            block["input"] = call.input.clone();
+            seen.insert(id);
+        }
+        if seen.len() != calls.len() {
+            return registry_error(
+                "not every upstream tool call was restored to Anthropic content",
+            );
+        }
+        Ok(restored)
+    }
 }
 
 fn builtin_alias(name: &str) -> Option<&'static str> {
