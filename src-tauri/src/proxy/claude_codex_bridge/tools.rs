@@ -117,10 +117,11 @@ impl ToolRegistry {
             if codex_to_index.contains_key(&codex_name) {
                 return registry_error(&format!("conflicting Codex tool alias: {codex_name}"));
             }
-            let claude_schema = object
-                .get("input_schema")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
+            let claude_schema = object.get("input_schema").cloned().ok_or_else(|| {
+                BridgeError::ToolRegistryViolation {
+                    summary: format!("tool {claude_name} requires an explicit input_schema"),
+                }
+            })?;
             if !claude_schema.is_object() {
                 return registry_error(&format!(
                     "input_schema for {claude_name} must be an object"
@@ -572,6 +573,7 @@ mod tests {
         for tool in [
             json!({"name": "", "input_schema": {"type": "object"}}),
             json!({"input_schema": {"type": "object"}}),
+            json!({"name": "Read"}),
             json!({"name": "Read", "input_schema": []}),
         ] {
             assert!(

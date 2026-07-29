@@ -3,6 +3,7 @@ use crate::proxy::json_canonical::canonical_json_string;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -84,6 +85,53 @@ fn validate_schema_shape(schema: &Value, path: &str) -> Result<(), BridgeError> 
     let Value::Object(object) = schema else {
         return schema_error(&format!("{path} must be a schema object"));
     };
+    const ALLOWED: &[&str] = &[
+        "$schema",
+        "type",
+        "enum",
+        "const",
+        "required",
+        "properties",
+        "additionalProperties",
+        "items",
+        "oneOf",
+        "anyOf",
+        "allOf",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minLength",
+        "maxLength",
+        "pattern",
+        "minItems",
+        "maxItems",
+        "uniqueItems",
+        "minProperties",
+        "maxProperties",
+        "title",
+        "description",
+        "default",
+        "examples",
+        "$comment",
+        "deprecated",
+        "readOnly",
+        "writeOnly",
+    ];
+    if let Some(keyword) = object.keys().find(|key| !ALLOWED.contains(&key.as_str())) {
+        return schema_error(&format!(
+            "unsupported correctness-affecting schema keyword {path}/{keyword}"
+        ));
+    }
+    if let Some(kind) = object.get("type") {
+        validate_type_keyword(kind, path)?;
+    }
+    if let Some(values) = object.get("enum") {
+        if !values.as_array().is_some_and(|values| !values.is_empty()) {
+            return schema_error(&format!("{path}/enum must be a non-empty array"));
+        }
+    }
     if let Some(required) = object.get("required") {
         let Some(required) = required.as_array() else {
             return schema_error(&format!("{path}/required must be an array"));
@@ -103,6 +151,15 @@ fn validate_schema_shape(schema: &Value, path: &str) -> Result<(), BridgeError> 
     if let Some(items) = object.get("items") {
         validate_schema_shape(items, &format!("{path}/items"))?;
     }
+    if let Some(additional) = object.get("additionalProperties") {
+        if additional.is_object() {
+            validate_schema_shape(additional, &format!("{path}/additionalProperties"))?;
+        } else if !additional.is_boolean() {
+            return schema_error(&format!(
+                "{path}/additionalProperties must be a boolean or schema object"
+            ));
+        }
+    }
     for keyword in ["oneOf", "anyOf", "allOf"] {
         if let Some(branches) = object.get(keyword) {
             let Some(branches) = branches.as_array() else {
@@ -115,6 +172,89 @@ fn validate_schema_shape(schema: &Value, path: &str) -> Result<(), BridgeError> 
                 validate_schema_shape(branch, &format!("{path}/{keyword}/{index}"))?;
             }
         }
+    }
+    for keyword in [
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+    ] {
+        if object.get(keyword).is_some_and(|value| !value.is_number()) {
+            return schema_error(&format!("{path}/{keyword} must be a number"));
+        }
+    }
+    if object
+        .get("multipleOf")
+        .and_then(Value::as_f64)
+        .is_some_and(|value| value <= 0.0)
+    {
+        return schema_error(&format!("{path}/multipleOf must be positive"));
+    }
+    for keyword in [
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+        "minProperties",
+        "maxProperties",
+    ] {
+        if object
+            .get(keyword)
+            .is_some_and(|value| value.as_u64().is_none())
+        {
+            return schema_error(&format!("{path}/{keyword} must be a non-negative integer"));
+        }
+    }
+    if let Some(pattern) = object.get("pattern") {
+        let Some(pattern) = pattern.as_str() else {
+            return schema_error(&format!("{path}/pattern must be a string"));
+        };
+        regex::Regex::new(pattern).map_err(|_| BridgeError::SchemaAdaptationLoss {
+            summary: format!("{path}/pattern must be a valid regular expression"),
+        })?;
+    }
+    for keyword in ["uniqueItems", "deprecated", "readOnly", "writeOnly"] {
+        if object.get(keyword).is_some_and(|value| !value.is_boolean()) {
+            return schema_error(&format!("{path}/{keyword} must be a boolean"));
+        }
+    }
+    for keyword in ["title", "description", "$comment", "$schema"] {
+        if object.get(keyword).is_some_and(|value| !value.is_string()) {
+            return schema_error(&format!("{path}/{keyword} must be a string"));
+        }
+    }
+    if object
+        .get("examples")
+        .is_some_and(|value| !value.is_array())
+    {
+        return schema_error(&format!("{path}/examples must be an array"));
+    }
+    Ok(())
+}
+
+fn validate_type_keyword(kind: &Value, path: &str) -> Result<(), BridgeError> {
+    const TYPES: &[&str] = &[
+        "object", "array", "string", "integer", "number", "boolean", "null",
+    ];
+    let kinds: Vec<&str> = match kind {
+        Value::String(kind) => vec![kind],
+        Value::Array(kinds) if !kinds.is_empty() => kinds
+            .iter()
+            .map(|kind| {
+                kind.as_str()
+                    .ok_or_else(|| BridgeError::SchemaAdaptationLoss {
+                        summary: format!("{path}/type must contain only strings"),
+                    })
+            })
+            .collect::<Result<_, _>>()?,
+        _ => return schema_error(&format!("{path}/type must be a string or non-empty array")),
+    };
+    let unique: BTreeSet<_> = kinds.iter().copied().collect();
+    if unique.len() != kinds.len() || kinds.iter().any(|kind| !TYPES.contains(kind)) {
+        return schema_error(&format!(
+            "{path}/type contains duplicate or unsupported types"
+        ));
     }
     Ok(())
 }
@@ -170,8 +310,13 @@ fn validate_value(schema: &Value, value: &Value, path: &str) -> Result<(), Strin
         }
     }
 
-    if let Some(kind) = object.get("type").and_then(Value::as_str) {
-        let type_matches = match kind {
+    if let Some(kinds) = object.get("type") {
+        let kinds: Vec<&str> = match kinds {
+            Value::String(kind) => vec![kind],
+            Value::Array(kinds) => kinds.iter().filter_map(Value::as_str).collect(),
+            _ => return Err(format!("malformed schema type at {path}")),
+        };
+        let type_matches = kinds.iter().any(|kind| match *kind {
             "object" => value.is_object(),
             "array" => value.is_array(),
             "string" => value.is_string(),
@@ -179,10 +324,10 @@ fn validate_value(schema: &Value, value: &Value, path: &str) -> Result<(), Strin
             "number" => value.is_number(),
             "boolean" => value.is_boolean(),
             "null" => value.is_null(),
-            _ => return Err(format!("unsupported schema type {kind} at {path}")),
-        };
+            _ => false,
+        });
         if !type_matches {
-            return Err(format!("argument at {path} must be {kind}"));
+            return Err(format!("argument at {path} has an invalid type"));
         }
     }
 
@@ -190,6 +335,30 @@ fn validate_value(schema: &Value, value: &Value, path: &str) -> Result<(), Strin
         validate_object(object, value, path)?;
     }
     if let Some(values) = value.as_array() {
+        let length = values.len() as u64;
+        if object
+            .get("minItems")
+            .and_then(Value::as_u64)
+            .is_some_and(|min| length < min)
+            || object
+                .get("maxItems")
+                .and_then(Value::as_u64)
+                .is_some_and(|max| length > max)
+        {
+            return Err(format!(
+                "argument array length at {path} is outside allowed bounds"
+            ));
+        }
+        if object.get("uniqueItems") == Some(&Value::Bool(true))
+            && values
+                .iter()
+                .enumerate()
+                .any(|(index, item)| values[..index].contains(item))
+        {
+            return Err(format!(
+                "argument array at {path} must contain unique items"
+            ));
+        }
         if let Some(items) = object.get("items") {
             for (index, value) in values.iter().enumerate() {
                 validate_value(items, value, &format!("{path}/{index}"))?;
@@ -211,6 +380,51 @@ fn validate_value(schema: &Value, value: &Value, path: &str) -> Result<(), Strin
         {
             return Err(format!("argument at {path} is above maximum"));
         }
+        if object
+            .get("exclusiveMinimum")
+            .and_then(Value::as_f64)
+            .is_some_and(|min| number <= min)
+            || object
+                .get("exclusiveMaximum")
+                .and_then(Value::as_f64)
+                .is_some_and(|max| number >= max)
+        {
+            return Err(format!("argument at {path} is outside exclusive bounds"));
+        }
+        if object
+            .get("multipleOf")
+            .and_then(Value::as_f64)
+            .is_some_and(|multiple| {
+                let quotient = number / multiple;
+                (quotient - quotient.round()).abs() > 1e-9
+            })
+        {
+            return Err(format!("argument at {path} is not a required multiple"));
+        }
+    }
+    if let Some(text) = value.as_str() {
+        let length = text.chars().count() as u64;
+        if object
+            .get("minLength")
+            .and_then(Value::as_u64)
+            .is_some_and(|min| length < min)
+            || object
+                .get("maxLength")
+                .and_then(Value::as_u64)
+                .is_some_and(|max| length > max)
+        {
+            return Err(format!(
+                "argument string length at {path} is outside allowed bounds"
+            ));
+        }
+        if let Some(pattern) = object.get("pattern").and_then(Value::as_str) {
+            if !regex::Regex::new(pattern)
+                .map_err(|_| format!("invalid pattern at {path}"))?
+                .is_match(text)
+            {
+                return Err(format!("argument string at {path} does not match pattern"));
+            }
+        }
     }
     Ok(())
 }
@@ -220,6 +434,20 @@ fn validate_object(
     value: &Map<String, Value>,
     path: &str,
 ) -> Result<(), String> {
+    let length = value.len() as u64;
+    if schema
+        .get("minProperties")
+        .and_then(Value::as_u64)
+        .is_some_and(|min| length < min)
+        || schema
+            .get("maxProperties")
+            .and_then(Value::as_u64)
+            .is_some_and(|max| length > max)
+    {
+        return Err(format!(
+            "argument object size at {path} is outside allowed bounds"
+        ));
+    }
     if let Some(required) = schema.get("required").and_then(Value::as_array) {
         for name in required.iter().filter_map(Value::as_str) {
             if !value.contains_key(name) {
@@ -308,11 +536,73 @@ mod tests {
             json!({"type": "object", "required": "path"}),
             json!({"type": "object", "properties": []}),
             json!({"type": "object", "required": [1]}),
+            json!({"type": "object", "properties": {"path": {"type": 42}}}),
+            json!({"type": "object", "properties": {"path": {"enum": "x"}}}),
+            json!({"type": "object", "additionalProperties": []}),
+            json!({"type": "object", "properties": {"path": {"minimum": "zero"}}}),
         ] {
             assert!(matches!(
                 adapt_schema(&schema),
                 Err(BridgeError::SchemaAdaptationLoss { .. })
             ));
+        }
+    }
+
+    #[test]
+    fn adaptation_accepts_and_enforces_supported_nested_constraints() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "label": {
+                    "type": ["string", "null"],
+                    "minLength": 2,
+                    "maxLength": 4,
+                    "pattern": "^[a-z]+$"
+                },
+                "values": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 2,
+                    "uniqueItems": true,
+                    "items": {"type": "integer", "multipleOf": 2}
+                }
+            },
+            "additionalProperties": false
+        });
+
+        adapt_schema(&schema).unwrap();
+        validate_arguments(&schema, &json!({"label": "abc", "values": [2, 4]})).unwrap();
+        for invalid in [
+            json!({"label": "A", "values": [2]}),
+            json!({"label": "abc", "values": []}),
+            json!({"label": "abc", "values": [2, 2]}),
+            json!({"label": "abc", "values": [3]}),
+        ] {
+            assert!(validate_arguments(&schema, &invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn adaptation_rejects_unsupported_correctness_affecting_keywords() {
+        for keyword in [
+            "$ref",
+            "not",
+            "if",
+            "dependentRequired",
+            "propertyNames",
+            "format",
+        ] {
+            let schema = json!({
+                "type": "object",
+                "properties": {"value": {(keyword): {}}}
+            });
+            assert!(
+                matches!(
+                    adapt_schema(&schema),
+                    Err(BridgeError::SchemaAdaptationLoss { .. })
+                ),
+                "keyword {keyword} must fail closed"
+            );
         }
     }
 
