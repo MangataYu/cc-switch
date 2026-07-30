@@ -266,6 +266,20 @@ pub struct ShadowComparisonReport {
     pub readiness: ShadowReadinessSummary,
 }
 
+impl ShadowComparisonReport {
+    pub fn unexplained_reason_codes(&self) -> Vec<ShadowReasonCode> {
+        let mut codes = Vec::new();
+        for difference in &self.differences {
+            if difference.disposition == ShadowDifferenceDisposition::Unexplained
+                && !codes.contains(&difference.reason_code)
+            {
+                codes.push(difference.reason_code);
+            }
+        }
+        codes
+    }
+}
+
 #[derive(Debug)]
 pub struct ShadowComparisonSession {
     prepared: Option<PreparedCodexTurn>,
@@ -1178,6 +1192,78 @@ mod tests {
         assert!(!encoded.contains(secret));
         assert!(!encoded.contains("Authorization"));
         assert!(!encoded.contains("tool-arguments"));
+    }
+
+    #[test]
+    fn shadow_report_exposes_only_ordered_unique_unexplained_reason_codes() {
+        let bridge = ClaudeCodexBridge::with_ledger(ConversationLedger::default());
+        let prepared = bridge
+            .prepare_turn(
+                &AppType::Claude,
+                request("private prompt"),
+                &provider(),
+                Some("private-session"),
+            )
+            .unwrap();
+        let mut report = ShadowComparisonSession::compare_request(prepared, &json!({})).report();
+        report.differences = vec![
+            ShadowDifference {
+                kind: ShadowDifferenceKind::ResponseEventMismatch,
+                disposition: ShadowDifferenceDisposition::Unexplained,
+                reason_code: ShadowReasonCode::ResponseEventMismatch,
+                path: "$/private-path".to_string(),
+                legacy_hash: Some("private-legacy-hash".to_string()),
+                bridge_hash: Some("private-bridge-hash".to_string()),
+            },
+            ShadowDifference {
+                kind: ShadowDifferenceKind::SafeNormalization,
+                disposition: ShadowDifferenceDisposition::Accepted,
+                reason_code: ShadowReasonCode::SafeRequestNormalization,
+                path: "$/private-accepted-path".to_string(),
+                legacy_hash: None,
+                bridge_hash: None,
+            },
+            ShadowDifference {
+                kind: ShadowDifferenceKind::ResponseEventMismatch,
+                disposition: ShadowDifferenceDisposition::Unexplained,
+                reason_code: ShadowReasonCode::ResponseEventMismatch,
+                path: "$/private-duplicate-path".to_string(),
+                legacy_hash: None,
+                bridge_hash: None,
+            },
+            ShadowDifference {
+                kind: ShadowDifferenceKind::TerminalMismatch,
+                disposition: ShadowDifferenceDisposition::Unexplained,
+                reason_code: ShadowReasonCode::TerminalMismatch,
+                path: "$/private-terminal-path".to_string(),
+                legacy_hash: Some("call-private".to_string()),
+                bridge_hash: Some("Glob-find_files-private".to_string()),
+            },
+        ];
+
+        let codes = report.unexplained_reason_codes();
+
+        assert_eq!(
+            codes,
+            vec![
+                ShadowReasonCode::ResponseEventMismatch,
+                ShadowReasonCode::TerminalMismatch,
+            ]
+        );
+        let encoded = format!("{codes:?}");
+        for private in [
+            "private-path",
+            "private-legacy-hash",
+            "private-bridge-hash",
+            "private-accepted-path",
+            "private-duplicate-path",
+            "private-terminal-path",
+            "call-private",
+            "Glob",
+            "find_files",
+        ] {
+            assert!(!encoded.contains(private));
+        }
     }
 
     #[test]

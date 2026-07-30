@@ -476,12 +476,14 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_shadow<
         if let Ok(mut comparison) = comparison.lock() {
             comparison.finish_stream();
             let report = comparison.report();
+            let unexplained_reason_codes = report.unexplained_reason_codes();
             log::debug!(
-                "[ClaudeCodexBridge] mode=shadow stream_differences={} unexplained={} comparison_failures={} bounded={}",
+                "[ClaudeCodexBridge] mode=shadow stream_differences={} unexplained={} comparison_failures={} bounded={} unexplained_reason_codes={:?}",
                 report.differences.len(),
                 report.readiness.unexplained_differences,
                 report.readiness.comparison_failures,
-                report.stream.as_ref().is_some_and(|stream| stream.bounded)
+                report.stream.as_ref().is_some_and(|stream| stream.bounded),
+                unexplained_reason_codes
             );
         }
     }
