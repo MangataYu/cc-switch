@@ -7,10 +7,14 @@ use super::bridge_forensics::{
     EvidenceStage, ForensicTurnCapture,
 };
 use super::claude_codex_bridge::{
-    bridge_scope_matches, BridgeError, ClaudeCodexBridge, CodexOAuthCapabilities,
-    PreparedCodexTurn, SchemaAction, SchemaLoss, SchemaLossReason, TransformAction,
-    TransformDecision,
+    bridge_scope_matches, streaming::StreamVisibility, BridgeError, ClaudeCodexBridge,
+    CodexOAuthCapabilities, PreparedCodexTurn, SchemaAction, SchemaLoss, SchemaLossReason,
+    TransformAction, TransformDecision,
 };
+
+fn bridge_stream_retry_allowed(visibility: StreamVisibility) -> bool {
+    !visibility.output_emitted && !visibility.tool_visible
+}
 use super::hyper_client::ProxyResponse;
 use super::{
     body_filter::filter_private_params_with_whitelist,
@@ -2768,6 +2772,7 @@ impl RequestForwarder {
         &self,
         response: ProxyResponse,
     ) -> Result<ProxyResponse, ProxyError> {
+        debug_assert!(bridge_stream_retry_allowed(StreamVisibility::default()));
         const MAX_PRIME_BYTES: usize = 256 * 1024;
 
         let status = response.status();
@@ -3884,6 +3889,7 @@ where
                         .to_string(),
                     retryable: false,
                     output_already_visible: false,
+                    streaming: None,
                 };
                 match capture.commit_failure(evidence_error) {
                     Ok(bundle) => log::error!(
@@ -3927,6 +3933,7 @@ fn commit_bridge_upstream_rejection(
         safe_summary: format!("{safe_summary} (status {status})"),
         retryable: status == 429 || status >= 500,
         output_already_visible: false,
+        streaming: None,
     };
     match capture.commit_failure(evidence_error) {
         Ok(bundle) => log::error!(
@@ -4049,6 +4056,19 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::time::Duration;
+
+    #[test]
+    fn bridge_stream_retry_boundary_requires_zero_output_visibility() {
+        assert!(bridge_stream_retry_allowed(StreamVisibility::default()));
+        assert!(!bridge_stream_retry_allowed(StreamVisibility {
+            output_emitted: true,
+            tool_visible: false,
+        }));
+        assert!(!bridge_stream_retry_allowed(StreamVisibility {
+            output_emitted: false,
+            tool_visible: true,
+        }));
+    }
 
     fn test_provider_with_type(provider_type: Option<&str>) -> Provider {
         Provider {
@@ -4412,6 +4432,7 @@ mod tests {
                 safe_summary: "registered tool response rejected".to_string(),
                 retryable: false,
                 output_already_visible: false,
+                streaming: None,
             })
             .unwrap();
         let manifest: EvidenceManifest =
@@ -4582,6 +4603,7 @@ mod tests {
                 safe_summary: "fixture".to_string(),
                 retryable: false,
                 output_already_visible: false,
+                streaming: None,
             })
             .unwrap();
         let manifest: EvidenceManifest =

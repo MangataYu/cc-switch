@@ -791,6 +791,7 @@ mod tests {
                 safe_summary: "fixture".to_string(),
                 retryable: false,
                 output_already_visible: false,
+                streaming: None,
             })
             .unwrap();
 

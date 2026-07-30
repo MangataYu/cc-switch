@@ -18,10 +18,13 @@ use super::transform_responses::{
     responses_to_anthropic_with_read_offset_protection_and_trace,
 };
 use crate::proxy::bridge_forensics::ForensicStreamObserver;
+use crate::proxy::bridge_forensics::StreamingFailureContext;
 use crate::proxy::claude_codex_bridge::{
+    canonical_request_fingerprint,
     streaming::{
         claude_stream_event_kind, decode_codex_response_event, encode_claude_stream_event,
-        ClaudeStreamEvent, CodexResponseEventKind,
+        event_identity_hashes, ClaudeStreamEvent, CodexResponseEventKind, PreparedCodexStream,
+        StreamTerminalState,
     },
     BridgeError, PreparedCodexTurn, ToolRegistry,
 };
@@ -456,6 +459,16 @@ fn create_strict_anthropic_sse_stream_from_responses<E: std::error::Error + Send
     observer: SharedForensicObserver,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
+        let turn_id = prepared_turn.turn_id.clone();
+        let registry_fingerprint = format!(
+            "{}:{}",
+            prepared_turn.tool_registry.identity_fingerprint(),
+            prepared_turn.tool_registry.schema_fingerprint()
+        );
+        let capability_fingerprint = canonical_request_fingerprint(
+            &serde_json::to_value(prepared_turn.capability_snapshot.as_ref())
+                .unwrap_or(Value::Null),
+        );
         let mut machine = prepared_turn.start_stream();
         let mut buffer = String::new();
         let mut utf8_remainder = Vec::new();
@@ -474,6 +487,16 @@ fn create_strict_anthropic_sse_stream_from_responses<E: std::error::Error + Send
                     let error = BridgeError::IncompleteStream {
                         summary: "upstream byte stream failed before terminal response".to_string(),
                     };
+                    set_strict_failure_context(
+                        &observer,
+                        "byte_stream_error",
+                        None,
+                        None,
+                        &machine,
+                        &turn_id,
+                        &registry_fingerprint,
+                        &capability_fingerprint,
+                    );
                     mark_observer_stream_error(&observer);
                     yield Ok(strict_error_sse(&error));
                     failed = true;
@@ -485,6 +508,16 @@ fn create_strict_anthropic_sse_stream_from_responses<E: std::error::Error + Send
                 let error = BridgeError::IncompleteStream {
                     summary: "stream ended inside a UTF-8 scalar".to_string(),
                 };
+                set_strict_failure_context(
+                    &observer,
+                    "utf8_truncation",
+                    None,
+                    None,
+                    &machine,
+                    &turn_id,
+                    &registry_fingerprint,
+                    &capability_fingerprint,
+                );
                 mark_observer_stream_error(&observer);
                 yield Ok(strict_error_sse(&error));
                 failed = true;
@@ -502,6 +535,16 @@ fn create_strict_anthropic_sse_stream_from_responses<E: std::error::Error + Send
                     Ok(Some(value)) => value,
                     Ok(None) => continue,
                     Err(error) => {
+                        set_strict_failure_context(
+                            &observer,
+                            "sse_decode_error",
+                            None,
+                            None,
+                            &machine,
+                            &turn_id,
+                            &registry_fingerprint,
+                            &capability_fingerprint,
+                        );
                         mark_observer_stream_error(&observer);
                         yield Ok(strict_error_sse(&error));
                         failed = true;
@@ -511,6 +554,16 @@ fn create_strict_anthropic_sse_stream_from_responses<E: std::error::Error + Send
                 let decoded = match decode_codex_response_event(named_event.as_deref(), data) {
                     Ok(decoded) => decoded,
                     Err(error) => {
+                        set_strict_failure_context(
+                            &observer,
+                            "typed_decode_error",
+                            None,
+                            None,
+                            &machine,
+                            &turn_id,
+                            &registry_fingerprint,
+                            &capability_fingerprint,
+                        );
                         mark_observer_stream_error(&observer);
                         yield Ok(strict_error_sse(&error));
                         failed = true;
@@ -518,10 +571,31 @@ fn create_strict_anthropic_sse_stream_from_responses<E: std::error::Error + Send
                     }
                 };
                 for event in decoded {
-                    observe_strict_upstream_event(&observer, event.kind());
+                    let event_kind = event.kind();
+                    let (item_hash, call_hash) = event_identity_hashes(&event);
+                    observe_strict_upstream_event(&observer, event_kind);
                     let claude_events = match machine.apply(event) {
-                        Ok(events) => events,
+                        Ok(events) => {
+                            observe_strict_decision(
+                                &observer,
+                                &machine,
+                                &turn_id,
+                                &registry_fingerprint,
+                                &capability_fingerprint,
+                            );
+                            events
+                        }
                         Err(error) => {
+                            set_strict_failure_context(
+                                &observer,
+                                &format!("{event_kind:?}").to_ascii_lowercase(),
+                                item_hash,
+                                call_hash,
+                                &machine,
+                                &turn_id,
+                                &registry_fingerprint,
+                                &capability_fingerprint,
+                            );
                             mark_observer_stream_error(&observer);
                             yield Ok(strict_error_sse(&error));
                             failed = true;
@@ -537,6 +611,7 @@ fn create_strict_anthropic_sse_stream_from_responses<E: std::error::Error + Send
                             failed = true;
                             break 'upstream;
                         }
+                        update_strict_visibility(&observer, machine.visibility());
                     }
                 }
             }
@@ -547,6 +622,16 @@ fn create_strict_anthropic_sse_stream_from_responses<E: std::error::Error + Send
 
         if !failed {
             if let Err(error) = machine.finish() {
+                set_strict_failure_context(
+                    &observer,
+                    "eof",
+                    None,
+                    None,
+                    &machine,
+                    &turn_id,
+                    &registry_fingerprint,
+                    &capability_fingerprint,
+                );
                 mark_observer_stream_error(&observer);
                 yield Ok(strict_error_sse(&error));
                 failed = true;
@@ -554,6 +639,87 @@ fn create_strict_anthropic_sse_stream_from_responses<E: std::error::Error + Send
         }
         finish_strict_observer(&observer, failed);
     }
+}
+
+fn observe_strict_decision(
+    observer: &SharedForensicObserver,
+    machine: &PreparedCodexStream,
+    turn_id: &str,
+    registry_fingerprint: &str,
+    capability_fingerprint: &str,
+) {
+    let Some(decision) = machine.decisions().last() else {
+        return;
+    };
+    if let Ok(mut guard) = observer.lock() {
+        if let Some(evidence) = guard.as_mut() {
+            if let Err(error) = evidence.typed_decision(
+                turn_id,
+                decision,
+                machine.terminal_state(),
+                registry_fingerprint,
+                capability_fingerprint,
+            ) {
+                log::warn!("[BridgeEvidence] capture_failed stage=stream_decision error={error}");
+                *guard = None;
+            }
+        }
+    }
+}
+
+fn update_strict_visibility(
+    observer: &SharedForensicObserver,
+    visibility: crate::proxy::claude_codex_bridge::streaming::StreamVisibility,
+) {
+    if let Ok(mut guard) = observer.lock() {
+        if let Some(evidence) = guard.as_mut() {
+            evidence.update_stream_visibility(visibility);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn set_strict_failure_context(
+    observer: &SharedForensicObserver,
+    event_kind: &str,
+    item_identity_hash: Option<String>,
+    call_identity_hash: Option<String>,
+    machine: &PreparedCodexStream,
+    turn_id: &str,
+    registry_fingerprint: &str,
+    capability_fingerprint: &str,
+) {
+    let visibility = machine.visibility();
+    let state = serde_enum_name(machine.terminal_state());
+    let context = StreamingFailureContext {
+        event_kind: event_kind.to_string(),
+        event_sequence: machine
+            .decisions()
+            .last()
+            .map_or(1, |decision| decision.sequence.saturating_add(1)),
+        turn_id: turn_id.to_string(),
+        item_identity_hash,
+        call_identity_hash,
+        state_before: state.clone(),
+        state_after: state,
+        output_already_emitted: visibility.output_emitted,
+        tool_visible: visibility.tool_visible,
+        terminal_state: serde_enum_name(machine.terminal_state()),
+        registry_fingerprint: registry_fingerprint.to_string(),
+        capability_fingerprint: capability_fingerprint.to_string(),
+    };
+    if let Ok(mut guard) = observer.lock() {
+        if let Some(evidence) = guard.as_mut() {
+            evidence.set_stream_failure_context(context);
+        }
+    }
+}
+
+fn serde_enum_name(state: StreamTerminalState) -> String {
+    serde_json::to_value(state)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn strict_sse_payload(block: &str) -> Result<Option<(Option<String>, Value)>, BridgeError> {
@@ -2983,6 +3149,106 @@ mod tests {
             assert!(merged.contains("event: error"));
             assert!(!merged.contains("secret-sentinel"));
             assert!(!merged.contains("event: message_stop"));
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_stream_forensics_redacts_visible_tool_failure_and_disables_retry() {
+        use crate::proxy::bridge_forensics::{BridgeForensicStore, EvidenceManifest};
+
+        let secret = "sentinel-tool-arguments-plaintext";
+        let provider = Provider {
+            id: "strict-forensics".to_string(),
+            name: "Strict Forensics".to_string(),
+            settings_config: json!({}),
+            website_url: None,
+            category: Some("claude".to_string()),
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: Some(ProviderMeta {
+                provider_type: Some("codex_oauth".to_string()),
+                api_format: Some("openai_responses".to_string()),
+                ..ProviderMeta::default()
+            }),
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        };
+        let prepared = ClaudeCodexBridge::with_ledger(ConversationLedger::default())
+            .prepare_turn(
+                &AppType::Claude,
+                json!({
+                    "model":"gpt-5.6",
+                    "max_tokens":64,
+                    "messages":[{"role":"user","content":"fixture"}],
+                    "tools":[{
+                        "name":"lookup",
+                        "input_schema":{
+                            "type":"object",
+                            "properties":{"q":{"type":"string"}},
+                            "required":["q"],
+                            "additionalProperties":false
+                        }
+                    }]
+                }),
+                &provider,
+                Some("strict-forensics-session"),
+            )
+            .unwrap();
+        let codex_name = prepared
+            .tool_registry
+            .codex_name_for_claude("lookup")
+            .unwrap()
+            .to_string();
+        let input = format!(
+            concat!(
+                "event: response.created\n",
+                "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_1\",\"model\":\"gpt-5.6\"}}}}\n\n",
+                "event: response.output_item.added\n",
+                "data: {{\"type\":\"response.output_item.added\",\"item\":{{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":{codex_name:?}}}}}\n\n",
+                "event: response.function_call_arguments.done\n",
+                "data: {{\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_1\",\"arguments\":\"{{\\\"q\\\":\\\"{secret}\\\"}}\"}}\n\n",
+                "event: response.future_semantic.delta\n",
+                "data: {{\"type\":\"response.future_semantic.delta\",\"delta\":\"{secret}\"}}\n\n"
+            ),
+            codex_name = codex_name,
+            secret = secret,
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let store = BridgeForensicStore::new(temp.path().join("evidence"));
+        let observer = evidence_capture(&store);
+        let _ = create_anthropic_sse_stream_from_responses_with_prepared_turn_and_evidence(
+            stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(input))]),
+            None,
+            None,
+            prepared,
+            Some(observer),
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        let bundles = store.list_bundles().unwrap();
+        assert_eq!(bundles.len(), 1);
+        let bundle_path = temp
+            .path()
+            .join("evidence")
+            .join("bundles")
+            .join(&bundles[0].bundle_id.0);
+        let manifest: EvidenceManifest =
+            serde_json::from_slice(&std::fs::read(bundle_path.join("manifest.json")).unwrap())
+                .unwrap();
+        assert!(!manifest.error.retryable);
+        let context = manifest.error.streaming.as_ref().unwrap();
+        assert!(context.output_already_emitted);
+        assert!(context.tool_visible);
+
+        for entry in std::fs::read_dir(bundle_path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                let bytes = std::fs::read(path).unwrap();
+                assert!(!String::from_utf8_lossy(&bytes).contains(secret));
+            }
         }
     }
 

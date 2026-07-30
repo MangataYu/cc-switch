@@ -841,6 +841,7 @@ where
                         .to_string(),
                     retryable: false,
                     output_already_visible: false,
+                    streaming: None,
                 };
                 match capture.commit_failure(evidence_error) {
                     Ok(bundle) => log::error!(

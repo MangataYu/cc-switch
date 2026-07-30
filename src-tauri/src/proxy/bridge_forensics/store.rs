@@ -16,10 +16,13 @@ use sha2::{Digest, Sha256};
 use super::{
     redact_protocol_value, EvidenceArtifact, EvidenceArtifactKind, EvidenceBundleId,
     EvidenceBundleSummary, EvidenceError, EvidenceErrorKind, EvidenceManifest, EvidenceStage,
-    RetentionReport,
+    RetentionReport, StreamingFailureContext,
 };
 use crate::config::atomic_write;
 use crate::error::AppError;
+use crate::proxy::claude_codex_bridge::streaming::{
+    StreamDecision, StreamTerminalState, StreamVisibility,
+};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
@@ -68,7 +71,9 @@ pub struct ForensicStreamObserver {
     capture: Option<ForensicTurnCapture>,
     saw_terminal_event: bool,
     output_visible: bool,
+    tool_visible: bool,
     invalid_event: bool,
+    streaming_context: Option<StreamingFailureContext>,
 }
 
 impl ForensicStreamObserver {
@@ -77,7 +82,9 @@ impl ForensicStreamObserver {
             capture: Some(capture),
             saw_terminal_event: false,
             output_visible: false,
+            tool_visible: false,
             invalid_event: false,
+            streaming_context: None,
         }
     }
 
@@ -131,6 +138,54 @@ impl ForensicStreamObserver {
         self.invalid_event = true;
     }
 
+    pub fn typed_decision(
+        &mut self,
+        turn_id: &str,
+        decision: &StreamDecision,
+        terminal_state: StreamTerminalState,
+        registry_fingerprint: &str,
+        capability_fingerprint: &str,
+    ) -> Result<(), AppError> {
+        if let Some(capture) = self.capture.as_mut() {
+            let value = serde_json::to_value(decision)
+                .map_err(|source| AppError::JsonSerialize { source })?;
+            capture.append_ndjson(EvidenceArtifactKind::TransformDecisions, &value)?;
+        }
+        self.output_visible |= decision.output_visible;
+        self.tool_visible |= decision.tool_visible;
+        self.streaming_context = Some(StreamingFailureContext {
+            event_kind: serde_name(&decision.event_kind),
+            event_sequence: decision.sequence,
+            turn_id: turn_id.to_string(),
+            item_identity_hash: decision.item_identity_hash.clone(),
+            call_identity_hash: decision.call_identity_hash.clone(),
+            state_before: serde_name(&decision.state_before),
+            state_after: serde_name(&decision.state_after),
+            output_already_emitted: self.output_visible,
+            tool_visible: self.tool_visible,
+            terminal_state: serde_name(&terminal_state),
+            registry_fingerprint: registry_fingerprint.to_string(),
+            capability_fingerprint: capability_fingerprint.to_string(),
+        });
+        Ok(())
+    }
+
+    pub fn update_stream_visibility(&mut self, visibility: StreamVisibility) {
+        self.output_visible |= visibility.output_emitted;
+        self.tool_visible |= visibility.tool_visible;
+        if let Some(context) = self.streaming_context.as_mut() {
+            context.output_already_emitted = self.output_visible;
+            context.tool_visible = self.tool_visible;
+        }
+    }
+
+    pub fn set_stream_failure_context(&mut self, context: StreamingFailureContext) {
+        self.output_visible |= context.output_already_emitted;
+        self.tool_visible |= context.tool_visible;
+        self.streaming_context = Some(context);
+        self.invalid_event = true;
+    }
+
     pub fn finish(
         mut self,
         stream_error: Option<&str>,
@@ -158,11 +213,19 @@ impl ForensicStreamObserver {
         let info = capture.commit_failure(EvidenceError {
             kind,
             safe_summary: safe_summary.to_string(),
-            retryable: true,
+            retryable: !self.output_visible && !self.tool_visible,
             output_already_visible: self.output_visible,
+            streaming: self.streaming_context,
         })?;
         Ok(Some(info))
     }
+}
+
+fn serde_name<T: Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 impl BridgeForensicStore {
@@ -752,6 +815,7 @@ impl EvidenceError {
             safe_summary: "test transform failure".to_string(),
             retryable: false,
             output_already_visible: false,
+            streaming: None,
         }
     }
 }

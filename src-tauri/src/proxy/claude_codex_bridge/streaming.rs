@@ -827,6 +827,7 @@ impl PreparedCodexStream {
         self.state
     }
 
+    #[cfg(test)]
     pub fn open_item_count(&self) -> usize {
         self.items.values().filter(|item| !item.is_done()).count()
     }
@@ -888,6 +889,13 @@ fn event_call_id(event: &CodexResponseEvent) -> Option<&CallId> {
         | CodexResponseEvent::ToolCallDone { call_id, .. } => call_id.as_ref(),
         _ => None,
     }
+}
+
+pub fn event_identity_hashes(event: &CodexResponseEvent) -> (Option<String>, Option<String>) {
+    (
+        event_item_id(event).map(|value| safe_hash(value.0.as_bytes())),
+        event_call_id(event).map(|value| safe_hash(value.0.as_bytes())),
+    )
 }
 
 fn event_fingerprint(event: &CodexResponseEvent) -> String {
