@@ -5,15 +5,21 @@ use std::path::{Component, Path};
 use bytes::Bytes;
 use futures::{stream, StreamExt};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::{EvidenceArtifact, EvidenceArtifactKind, EvidenceManifest, FORENSIC_FORMAT_VERSION};
+use super::{
+    EvidenceArtifact, EvidenceArtifactKind, EvidenceErrorKind, EvidenceManifest,
+    FORENSIC_FORMAT_VERSION,
+};
 use crate::app_config::AppType;
 use crate::error::AppError;
 use crate::provider::{Provider, ProviderMeta};
 use crate::proxy::claude_codex_bridge::{
-    ClaudeCodexBridge, ConversationLedger, PreparedCodexTurn, ToolCallState,
+    streaming::{
+        claude_stream_event_kind, decode_codex_response_event, StreamDecision, StreamTerminalState,
+    },
+    BridgeError, ClaudeCodexBridge, ConversationLedger, PreparedCodexTurn, ToolCallState,
 };
 use crate::proxy::json_canonical::canonicalize_value;
 use crate::proxy::providers::streaming_responses::create_anthropic_sse_stream_from_responses_with_prepared_turn;
@@ -59,6 +65,32 @@ pub struct ConversationLedgerReplayReport {
     pub network_requests: u32,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StrictStreamReplayFixture {
+    TextOnly,
+    ReasoningAndText,
+    SingleTool,
+    ParallelTools,
+    ToolArgumentsChunks,
+    ToolLifecycle,
+    Incomplete,
+    InvalidSequence,
+    UnknownTool,
+    ConflictingDuplicate,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct StreamingEventReplayReport {
+    pub fixture: StrictStreamReplayFixture,
+    pub typed_event_decisions: Vec<StreamDecision>,
+    pub claude_sse_shape: Vec<String>,
+    pub ledger_transitions: Vec<String>,
+    pub terminal_state: String,
+    pub error_kind: Option<EvidenceErrorKind>,
+    pub network_requests: u32,
+}
+
 pub fn replay_conversation_lifecycle(
     request: Value,
     response: Value,
@@ -98,6 +130,319 @@ pub fn replay_conversation_lifecycle(
         final_state,
         network_requests: 0,
     })
+}
+
+pub fn replay_strict_stream_fixture(
+    fixture: StrictStreamReplayFixture,
+) -> Result<StreamingEventReplayReport, AppError> {
+    let bridge = ClaudeCodexBridge::with_ledger(ConversationLedger::default());
+    let provider = replay_provider();
+    let prepared = bridge
+        .prepare_turn_with_session_identity(
+            &AppType::Claude,
+            strict_replay_request(),
+            &provider,
+            "strict-offline-replay-session",
+            None,
+        )
+        .map_err(|error| AppError::Message(format!("strict replay preparation failed: {error}")))?;
+    let binding = prepared.ledger_binding().clone();
+    let lookup = prepared
+        .tool_registry
+        .codex_name_for_claude("lookup")
+        .map_err(|error| AppError::Message(error.to_string()))?
+        .to_string();
+    let fetch = prepared
+        .tool_registry
+        .codex_name_for_claude("fetch")
+        .map_err(|error| AppError::Message(error.to_string()))?
+        .to_string();
+    let mut machine = prepared.start_stream();
+    let mut claude_sse_shape = Vec::new();
+    let mut ledger_transitions = Vec::new();
+    let mut error_kind = None;
+
+    'events: for (event_name, payload) in strict_fixture_events(fixture, &lookup, &fetch) {
+        let decoded = match decode_codex_response_event(Some(event_name), payload) {
+            Ok(events) => events,
+            Err(error) => {
+                error_kind = Some(bridge_error_kind(&error));
+                break;
+            }
+        };
+        for event in decoded {
+            let outputs = match machine.apply(event) {
+                Ok(outputs) => outputs,
+                Err(error) => {
+                    error_kind = Some(bridge_error_kind(&error));
+                    break 'events;
+                }
+            };
+            for output in outputs {
+                claude_sse_shape.push(claude_stream_event_kind(&output).to_string());
+                if let Err(error) = machine.acknowledge_emitted(&output) {
+                    error_kind = Some(bridge_error_kind(&error));
+                    break 'events;
+                }
+                record_call_state(&bridge, &binding, "call-1", &mut ledger_transitions);
+                record_call_state(&bridge, &binding, "call-2", &mut ledger_transitions);
+            }
+        }
+    }
+
+    if error_kind.is_none() {
+        if let Err(error) = machine.finish() {
+            error_kind = Some(bridge_error_kind(&error));
+        }
+    }
+    let typed_event_decisions = machine.decisions().to_vec();
+    let terminal_state = stream_state_name(machine.terminal_state());
+
+    if fixture == StrictStreamReplayFixture::ToolLifecycle && error_kind.is_none() {
+        bridge
+            .prepare_turn_with_session_identity(
+                &AppType::Claude,
+                strict_replay_followup_request(),
+                &provider,
+                "strict-offline-replay-session",
+                None,
+            )
+            .map_err(|error| {
+                AppError::Message(format!("strict replay followup failed: {error}"))
+            })?;
+        record_call_state(&bridge, &binding, "call-1", &mut ledger_transitions);
+    }
+
+    Ok(StreamingEventReplayReport {
+        fixture,
+        typed_event_decisions,
+        claude_sse_shape,
+        ledger_transitions,
+        terminal_state,
+        error_kind,
+        network_requests: 0,
+    })
+}
+
+fn strict_replay_request() -> Value {
+    json!({
+        "model":"gpt-5.6",
+        "max_tokens":128,
+        "messages":[{"role":"user","content":"offline fixture"}],
+        "tools":[
+            {"name":"lookup","input_schema":strict_tool_schema()},
+            {"name":"fetch","input_schema":strict_tool_schema()}
+        ]
+    })
+}
+
+fn strict_replay_followup_request() -> Value {
+    json!({
+        "model":"gpt-5.6",
+        "max_tokens":128,
+        "messages":[
+            {"role":"user","content":"offline fixture"},
+            {"role":"assistant","content":[{
+                "type":"tool_use","id":"call-1","name":"lookup","input":{"q":"one"}
+            }]},
+            {"role":"user","content":[{
+                "type":"tool_result","tool_use_id":"call-1","content":"fixture result"
+            }]}
+        ],
+        "tools":[
+            {"name":"lookup","input_schema":strict_tool_schema()},
+            {"name":"fetch","input_schema":strict_tool_schema()}
+        ]
+    })
+}
+
+fn strict_tool_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{"q":{"type":"string"}},
+        "required":["q"],
+        "additionalProperties":false
+    })
+}
+
+fn strict_fixture_events(
+    fixture: StrictStreamReplayFixture,
+    lookup: &str,
+    fetch: &str,
+) -> Vec<(&'static str, Value)> {
+    let created = || {
+        (
+            "response.created",
+            json!({"type":"response.created","response":{"id":"resp-replay","model":"gpt-5.6","usage":{"input_tokens":2,"output_tokens":0}}}),
+        )
+    };
+    let completed = || {
+        (
+            "response.completed",
+            json!({"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":2,"output_tokens":2}}}),
+        )
+    };
+    let text = || {
+        vec![
+            (
+                "response.content_part.added",
+                json!({"type":"response.content_part.added","item_id":"msg-1","part":{"type":"output_text","text":""}}),
+            ),
+            (
+                "response.output_text.delta",
+                json!({"type":"response.output_text.delta","item_id":"msg-1","sequence_number":20,"delta":"hello"}),
+            ),
+            (
+                "response.output_text.done",
+                json!({"type":"response.output_text.done","item_id":"msg-1","text":"hello"}),
+            ),
+        ]
+    };
+    let tool_start = |item: &str, call: &str, name: &str| {
+        (
+            "response.output_item.added",
+            json!({"type":"response.output_item.added","item":{"id":item,"type":"function_call","call_id":call,"name":name}}),
+        )
+    };
+
+    match fixture {
+        StrictStreamReplayFixture::TextOnly => {
+            let mut events = vec![created()];
+            events.extend(text());
+            events.push(completed());
+            events
+        }
+        StrictStreamReplayFixture::ReasoningAndText => {
+            let mut events = vec![
+                created(),
+                (
+                    "response.output_item.added",
+                    json!({"type":"response.output_item.added","item":{"id":"rs-1","type":"reasoning"}}),
+                ),
+                (
+                    "response.reasoning_summary_text.delta",
+                    json!({"type":"response.reasoning_summary_text.delta","item_id":"rs-1","sequence_number":3,"delta":"think"}),
+                ),
+                (
+                    "response.output_item.done",
+                    json!({"type":"response.output_item.done","item":{"id":"rs-1","type":"reasoning","encrypted_content":"opaque"}}),
+                ),
+            ];
+            events.extend(text());
+            events.push(completed());
+            events
+        }
+        StrictStreamReplayFixture::SingleTool | StrictStreamReplayFixture::ToolLifecycle => vec![
+            created(),
+            tool_start("fc-1", "call-1", lookup),
+            (
+                "response.function_call_arguments.done",
+                json!({"type":"response.function_call_arguments.done","item_id":"fc-1","call_id":"call-1","arguments":"{\"q\":\"one\"}"}),
+            ),
+            completed(),
+        ],
+        StrictStreamReplayFixture::ParallelTools => vec![
+            created(),
+            tool_start("fc-1", "call-1", lookup),
+            tool_start("fc-2", "call-2", fetch),
+            (
+                "response.function_call_arguments.delta",
+                json!({"type":"response.function_call_arguments.delta","item_id":"fc-2","sequence_number":7,"delta":"{\"q\":\"two\"}"}),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                json!({"type":"response.function_call_arguments.delta","item_id":"fc-1","sequence_number":8,"delta":"{\"q\":\"one\"}"}),
+            ),
+            (
+                "response.function_call_arguments.done",
+                json!({"type":"response.function_call_arguments.done","item_id":"fc-1"}),
+            ),
+            (
+                "response.function_call_arguments.done",
+                json!({"type":"response.function_call_arguments.done","item_id":"fc-2"}),
+            ),
+            completed(),
+        ],
+        StrictStreamReplayFixture::ToolArgumentsChunks => vec![
+            created(),
+            tool_start("fc-1", "call-1", lookup),
+            (
+                "response.function_call_arguments.delta",
+                json!({"type":"response.function_call_arguments.delta","item_id":"fc-1","sequence_number":4,"delta":"{\"q\":\""}),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                json!({"type":"response.function_call_arguments.delta","item_id":"fc-1","sequence_number":5,"delta":"chunked\"}"}),
+            ),
+            (
+                "response.function_call_arguments.done",
+                json!({"type":"response.function_call_arguments.done","item_id":"fc-1"}),
+            ),
+            completed(),
+        ],
+        StrictStreamReplayFixture::Incomplete => vec![created()],
+        StrictStreamReplayFixture::InvalidSequence => vec![
+            created(),
+            (
+                "response.output_text.delta",
+                json!({"type":"response.output_text.delta","item_id":"msg-1","delta":"orphan"}),
+            ),
+        ],
+        StrictStreamReplayFixture::UnknownTool => {
+            vec![created(), tool_start("fc-1", "call-1", "unknown-tool")]
+        }
+        StrictStreamReplayFixture::ConflictingDuplicate => vec![
+            created(),
+            (
+                "response.content_part.added",
+                json!({"type":"response.content_part.added","item_id":"msg-1","part":{"type":"output_text"}}),
+            ),
+            (
+                "response.output_text.delta",
+                json!({"type":"response.output_text.delta","item_id":"msg-1","sequence_number":9,"delta":"one"}),
+            ),
+            (
+                "response.output_text.delta",
+                json!({"type":"response.output_text.delta","item_id":"msg-1","sequence_number":9,"delta":"two"}),
+            ),
+        ],
+    }
+}
+
+fn bridge_error_kind(error: &BridgeError) -> EvidenceErrorKind {
+    match error {
+        BridgeError::ToolRegistryViolation { .. } => EvidenceErrorKind::ToolRegistryViolation,
+        BridgeError::ConversationStateConflict { .. } => {
+            EvidenceErrorKind::ConversationStateConflict
+        }
+        BridgeError::IncompleteStream { .. } => EvidenceErrorKind::IncompleteStream,
+        _ => EvidenceErrorKind::InvalidUpstreamEvent,
+    }
+}
+
+fn record_call_state(
+    bridge: &ClaudeCodexBridge,
+    binding: &crate::proxy::claude_codex_bridge::TurnBinding,
+    call_id: &str,
+    transitions: &mut Vec<String>,
+) {
+    let Some(state) = bridge.ledger().call_state(binding, call_id) else {
+        return;
+    };
+    let state = serde_json::to_value(state)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{state:?}").to_ascii_lowercase());
+    if transitions.last() != Some(&state) {
+        transitions.push(state);
+    }
+}
+
+fn stream_state_name(state: StreamTerminalState) -> String {
+    serde_json::to_value(state)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 pub fn replay_bundle(path: &Path) -> Result<ReplayReport, AppError> {
@@ -804,6 +1149,56 @@ mod tests {
         assert!(report.capability_report_matches);
         assert!(report.transform_decisions_match);
         assert_eq!(report.network_requests, 0);
+    }
+
+    #[test]
+    fn streaming_event_replay_covers_required_fixtures_without_network() {
+        let success = [
+            StrictStreamReplayFixture::TextOnly,
+            StrictStreamReplayFixture::ReasoningAndText,
+            StrictStreamReplayFixture::SingleTool,
+            StrictStreamReplayFixture::ParallelTools,
+            StrictStreamReplayFixture::ToolArgumentsChunks,
+            StrictStreamReplayFixture::ToolLifecycle,
+        ];
+        for fixture in success {
+            let report = replay_strict_stream_fixture(fixture).unwrap();
+            assert_eq!(report.network_requests, 0, "{fixture:?}");
+            assert!(report.error_kind.is_none(), "{fixture:?}: {report:?}");
+            assert_eq!(report.terminal_state, "completed", "{fixture:?}");
+            assert!(!report.typed_event_decisions.is_empty());
+            assert!(report
+                .claude_sse_shape
+                .contains(&"message_start".to_string()));
+            assert!(report
+                .claude_sse_shape
+                .contains(&"message_stop".to_string()));
+            assert_eq!(report, replay_strict_stream_fixture(fixture).unwrap());
+        }
+
+        let lifecycle =
+            replay_strict_stream_fixture(StrictStreamReplayFixture::ToolLifecycle).unwrap();
+        assert!(lifecycle
+            .ledger_transitions
+            .iter()
+            .any(|state| state == "returned_to_claude"));
+        assert!(lifecycle
+            .ledger_transitions
+            .iter()
+            .any(|state| state == "completed"));
+
+        for fixture in [
+            StrictStreamReplayFixture::Incomplete,
+            StrictStreamReplayFixture::InvalidSequence,
+            StrictStreamReplayFixture::UnknownTool,
+            StrictStreamReplayFixture::ConflictingDuplicate,
+        ] {
+            let report = replay_strict_stream_fixture(fixture).unwrap();
+            assert_eq!(report.network_requests, 0, "{fixture:?}");
+            assert!(report.error_kind.is_some(), "{fixture:?}");
+            assert_ne!(report.terminal_state, "completed", "{fixture:?}");
+            assert_eq!(report, replay_strict_stream_fixture(fixture).unwrap());
+        }
     }
 
     fn fixture_path(name: &str) -> PathBuf {

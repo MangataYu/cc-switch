@@ -31,8 +31,9 @@ mod provider;
 mod provider_defaults;
 mod proxy;
 pub use proxy::bridge_forensics::{
-    replay_bundle, replay_conversation_lifecycle, ConversationLedgerReplayReport, ReplayMode,
-    ReplayReport, StructuralDifference,
+    replay_bundle, replay_conversation_lifecycle, replay_strict_stream_fixture,
+    ConversationLedgerReplayReport, ReplayMode, ReplayReport, StreamingEventReplayReport,
+    StrictStreamReplayFixture, StructuralDifference,
 };
 mod services;
 mod session_manager;

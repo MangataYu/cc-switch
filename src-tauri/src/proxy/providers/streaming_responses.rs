@@ -2900,7 +2900,7 @@ mod tests {
         provider::{Provider, ProviderMeta},
         proxy::claude_codex_bridge::{
             ClaudeCodexBridge, CodexOAuthCapabilities, ConversationLedger, ToolCallState,
-            ToolRegistry,
+            ToolRegistry, TurnBinding,
         },
     };
     use futures::stream;
@@ -3054,6 +3054,56 @@ mod tests {
                 Some("strict-adapter-session"),
             )
             .unwrap()
+    }
+
+    fn strict_prepared_tool_turn() -> (ClaudeCodexBridge, PreparedCodexTurn, TurnBinding, String) {
+        let provider = Provider {
+            id: "strict-tool-adapter".to_string(),
+            name: "Strict Tool Adapter".to_string(),
+            settings_config: json!({}),
+            website_url: None,
+            category: Some("claude".to_string()),
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: Some(ProviderMeta {
+                provider_type: Some("codex_oauth".to_string()),
+                api_format: Some("openai_responses".to_string()),
+                ..ProviderMeta::default()
+            }),
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        };
+        let bridge = ClaudeCodexBridge::with_ledger(ConversationLedger::default());
+        let prepared = bridge
+            .prepare_turn(
+                &AppType::Claude,
+                json!({
+                    "model":"gpt-5.6",
+                    "max_tokens":64,
+                    "messages":[{"role":"user","content":"read a file"}],
+                    "tools":[{
+                        "name":"Read",
+                        "input_schema":{
+                            "type":"object",
+                            "properties":{"file_path":{"type":"string"}},
+                            "required":["file_path"],
+                            "additionalProperties":false
+                        }
+                    }]
+                }),
+                &provider,
+                Some("strict-tool-adapter-session"),
+            )
+            .unwrap();
+        let codex_name = prepared
+            .tool_registry
+            .codex_name_for_claude("Read")
+            .unwrap()
+            .to_string();
+        let binding = prepared.ledger_binding().clone();
+        (bridge, prepared, binding, codex_name)
     }
 
     #[tokio::test]
@@ -3248,6 +3298,134 @@ mod tests {
             if path.is_file() {
                 let bytes = std::fs::read(path).unwrap();
                 assert!(!String::from_utf8_lossy(&bytes).contains(secret));
+            }
+        }
+    }
+
+    async fn convert_strict_chunks(chunks: Vec<Bytes>, prepared: PreparedCodexTurn) -> String {
+        create_anthropic_sse_stream_from_responses_with_prepared_turn(
+            stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>)),
+            None,
+            None,
+            prepared,
+        )
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|chunk| String::from_utf8_lossy(chunk.unwrap().as_ref()).to_string())
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn strict_stream_fragmentation_is_invariant_at_every_utf8_sse_byte_boundary() {
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_utf8\",\"model\":\"gpt-5.6\"}}\n\n",
+            "event: response.content_part.added\n",
+            "data: {\"type\":\"response.content_part.added\",\"item_id\":\"msg_1\",\"part\":{\"type\":\"output_text\"}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"sequence_number\":1,\"delta\":\"你好🌏\"}\n\n",
+            "event: response.output_text.done\n",
+            "data: {\"type\":\"response.output_text.done\",\"item_id\":\"msg_1\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        );
+        let bytes = input.as_bytes();
+        let baseline =
+            convert_strict_chunks(vec![Bytes::copy_from_slice(bytes)], strict_prepared_turn())
+                .await;
+        for split in 0..=bytes.len() {
+            let actual = convert_strict_chunks(
+                vec![
+                    Bytes::copy_from_slice(&bytes[..split]),
+                    Bytes::copy_from_slice(&bytes[split..]),
+                ],
+                strict_prepared_turn(),
+            )
+            .await;
+            assert_eq!(actual, baseline, "split={split}");
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_stream_fragmentation_rejects_illegal_sequence_independent_of_chunks() {
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_bad\",\"model\":\"gpt-5.6\"}}\n\n",
+            "event: response.future_semantic.delta\n",
+            "data: {\"type\":\"response.future_semantic.delta\",\"delta\":\"sentinel-private\"}\n\n"
+        );
+        let bytes = input.as_bytes();
+        let baseline =
+            convert_strict_chunks(vec![Bytes::copy_from_slice(bytes)], strict_prepared_turn())
+                .await;
+        assert!(baseline.contains("event: error"));
+        assert!(!baseline.contains("sentinel-private"));
+        for split in 0..=bytes.len() {
+            let actual = convert_strict_chunks(
+                vec![
+                    Bytes::copy_from_slice(&bytes[..split]),
+                    Bytes::copy_from_slice(&bytes[split..]),
+                ],
+                strict_prepared_turn(),
+            )
+            .await;
+            assert_eq!(actual, baseline, "split={split}");
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_stream_tool_arguments_are_invariant_at_every_logical_delta_boundary() {
+        fn event(name: &str, payload: Value) -> String {
+            format!("event: {name}\ndata: {payload}\n\n")
+        }
+
+        let arguments = r#"{"file_path":"src/main.rs"}"#;
+        let mut baseline = None;
+        for split in 1..arguments.len() {
+            let (bridge, prepared, binding, codex_name) = strict_prepared_tool_turn();
+            let input = [
+                event(
+                    "response.created",
+                    json!({"type":"response.created","response":{"id":"resp_tool","model":"gpt-5.6"}}),
+                ),
+                event(
+                    "response.output_item.added",
+                    json!({"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":codex_name}}),
+                ),
+                event(
+                    "response.function_call_arguments.delta",
+                    json!({"type":"response.function_call_arguments.delta","item_id":"fc_1","sequence_number":1,"delta":&arguments[..split]}),
+                ),
+                event(
+                    "response.function_call_arguments.delta",
+                    json!({"type":"response.function_call_arguments.delta","item_id":"fc_1","sequence_number":2,"delta":&arguments[split..]}),
+                ),
+                event(
+                    "response.function_call_arguments.done",
+                    json!({"type":"response.function_call_arguments.done","item_id":"fc_1"}),
+                ),
+                event(
+                    "response.completed",
+                    json!({"type":"response.completed","response":{"status":"completed"}}),
+                ),
+            ]
+            .concat();
+            let actual =
+                convert_strict_chunks(vec![Bytes::copy_from_slice(input.as_bytes())], prepared)
+                    .await;
+            assert!(actual.contains("content_block_start"), "split={split}");
+            assert!(actual.contains("tool_use"), "split={split}");
+            assert!(!actual.contains("event: error"), "split={split}");
+            assert_eq!(
+                bridge.ledger().call_state(&binding, "call_1"),
+                Some(ToolCallState::ReturnedToClaude),
+                "split={split}"
+            );
+            if let Some(expected) = &baseline {
+                assert_eq!(&actual, expected, "split={split}");
+            } else {
+                baseline = Some(actual);
             }
         }
     }
