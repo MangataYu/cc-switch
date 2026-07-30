@@ -95,6 +95,7 @@ fn validate_schema_shape(schema: &Value, path: &str) -> Result<(), BridgeError> 
         "const",
         "required",
         "properties",
+        "propertyNames",
         "additionalProperties",
         "items",
         "oneOf",
@@ -108,6 +109,7 @@ fn validate_schema_shape(schema: &Value, path: &str) -> Result<(), BridgeError> 
         "minLength",
         "maxLength",
         "pattern",
+        "format",
         "minItems",
         "maxItems",
         "uniqueItems",
@@ -150,6 +152,9 @@ fn validate_schema_shape(schema: &Value, path: &str) -> Result<(), BridgeError> 
         for (name, property) in properties {
             validate_schema_shape(property, &format!("{path}/properties/{name}"))?;
         }
+    }
+    if let Some(property_names) = object.get("propertyNames") {
+        validate_schema_shape(property_names, &format!("{path}/propertyNames"))?;
     }
     if let Some(items) = object.get("items") {
         validate_schema_shape(items, &format!("{path}/items"))?;
@@ -220,6 +225,11 @@ fn validate_schema_shape(schema: &Value, path: &str) -> Result<(), BridgeError> 
         regex::Regex::new(pattern).map_err(|_| BridgeError::SchemaAdaptationLoss {
             summary: format!("{path}/pattern must be a valid regular expression"),
         })?;
+    }
+    if let Some(format) = object.get("format") {
+        if format.as_str() != Some("uri") {
+            return schema_error(&format!("{path}/format must be the supported uri format"));
+        }
     }
     for keyword in ["uniqueItems", "deprecated", "readOnly", "writeOnly"] {
         if object.get(keyword).is_some_and(|value| !value.is_boolean()) {
@@ -431,6 +441,11 @@ fn validate_value(schema: &Value, value: &Value, path: &str) -> Result<(), Strin
                 return Err(format!("argument string at {path} does not match pattern"));
             }
         }
+        if object.get("format").and_then(Value::as_str) == Some("uri")
+            && url::Url::parse(text).is_err()
+        {
+            return Err(format!("argument string at {path} is not a valid uri"));
+        }
     }
     Ok(())
 }
@@ -470,6 +485,13 @@ fn validate_object(
     }
     let properties = schema.get("properties").and_then(Value::as_object);
     for (name, child) in value {
+        if let Some(property_names) = schema.get("propertyNames") {
+            validate_value(
+                property_names,
+                &Value::String(name.clone()),
+                &format!("{path}/propertyNames"),
+            )?;
+        }
         if let Some(property_schema) = properties.and_then(|properties| properties.get(name)) {
             validate_value(property_schema, child, &format!("{path}/{name}"))?;
         } else if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
@@ -596,15 +618,37 @@ mod tests {
     }
 
     #[test]
+    fn adaptation_accepts_and_enforces_uri_format() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "endpoint": {"type": "string", "format": "uri"}
+            },
+            "required": ["endpoint"],
+            "additionalProperties": false
+        });
+
+        adapt_schema(&schema).unwrap();
+        validate_arguments(&schema, &json!({"endpoint": "https://example.com/path"})).unwrap();
+        assert!(validate_arguments(&schema, &json!({"endpoint": "not a uri"})).is_err());
+    }
+
+    #[test]
+    fn adaptation_accepts_and_enforces_property_names() {
+        let schema = json!({
+            "type": "object",
+            "propertyNames": {"type": "string", "pattern": "^[a-z]+$"},
+            "additionalProperties": {"type": "string"}
+        });
+
+        adapt_schema(&schema).unwrap();
+        validate_arguments(&schema, &json!({"alpha": "ok"})).unwrap();
+        assert!(validate_arguments(&schema, &json!({"Alpha": "rejected"})).is_err());
+    }
+
+    #[test]
     fn adaptation_rejects_unsupported_correctness_affecting_keywords() {
-        for keyword in [
-            "$ref",
-            "not",
-            "if",
-            "dependentRequired",
-            "propertyNames",
-            "format",
-        ] {
+        for keyword in ["$ref", "not", "if", "dependentRequired"] {
             let schema = json!({
                 "type": "object",
                 "properties": {"value": {(keyword): {}}}
@@ -617,6 +661,13 @@ mod tests {
                 "keyword {keyword} must fail closed"
             );
         }
+        assert!(matches!(
+            adapt_schema(&json!({
+                "type": "object",
+                "properties": {"value": {"type": "string", "format": "date-time"}}
+            })),
+            Err(BridgeError::SchemaAdaptationLoss { .. })
+        ));
     }
 
     #[test]
