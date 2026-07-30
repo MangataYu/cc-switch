@@ -6,8 +6,8 @@ use serde_json::Value;
 use super::{
     canonical_request_fingerprint,
     streaming::{
-        claude_stream_event_kind, decode_codex_response_event, PreparedCodexStream,
-        StreamTerminalState,
+        claude_stream_event_kind, decode_codex_response_event, ClaudeContentBlock,
+        ClaudeContentDelta, ClaudeStreamEvent, PreparedCodexStream, StreamTerminalState,
     },
     PreparedCodexTurn, TransformAction,
 };
@@ -546,8 +546,7 @@ impl ShadowComparisonSession {
                     }
                 };
                 for output in outputs {
-                    let kind = claude_stream_event_kind(&output);
-                    observation.bridge.record_kind(kind);
+                    observation.bridge.record_bridge_event(&output);
                     if observation.machine.acknowledge_emitted(&output).is_err() {
                         failed = true;
                         break;
@@ -581,9 +580,10 @@ impl ShadowComparisonSession {
             chunk,
         );
         while let Some(block) = crate::proxy::sse::take_sse_block(&mut self.legacy_stream.buffer) {
-            if let Some((event_name, _)) = parse_sse_block(&block) {
+            if let Some((event_name, payload)) = parse_sse_block(&block) {
                 if let Some(event_name) = event_name {
-                    self.legacy_stream.record_kind(&event_name);
+                    self.legacy_stream
+                        .record_legacy_event(&event_name, &payload);
                 }
             }
         }
@@ -649,20 +649,71 @@ impl ShadowComparisonSession {
 }
 
 impl ShadowStreamAccumulator {
-    fn record_kind(&mut self, kind: &str) {
+    fn record_bridge_event(&mut self, event: &ClaudeStreamEvent) {
+        let kind = claude_stream_event_kind(event);
+        let classification = match event {
+            ClaudeStreamEvent::ContentBlockStart {
+                block: ClaudeContentBlock::ToolUse { .. },
+                ..
+            }
+            | ClaudeStreamEvent::ContentBlockDelta {
+                delta: ClaudeContentDelta::InputJson { .. },
+                ..
+            } => ShadowEventClass::Tool,
+            ClaudeStreamEvent::ContentBlockStart {
+                block: ClaudeContentBlock::Thinking,
+                ..
+            }
+            | ClaudeStreamEvent::ContentBlockDelta {
+                delta: ClaudeContentDelta::Thinking { .. } | ClaudeContentDelta::Signature { .. },
+                ..
+            } => ShadowEventClass::Reasoning,
+            ClaudeStreamEvent::ContentBlockDelta {
+                delta: ClaudeContentDelta::Text { .. },
+                ..
+            } => ShadowEventClass::Text,
+            _ => ShadowEventClass::Other,
+        };
+        self.record_classified(kind, classification);
+    }
+
+    fn record_legacy_event(&mut self, kind: &str, payload: &Value) {
+        let content_type = payload
+            .pointer("/content_block/type")
+            .or_else(|| payload.pointer("/delta/type"))
+            .and_then(Value::as_str);
+        let classification = match content_type {
+            Some("tool_use" | "input_json_delta") => ShadowEventClass::Tool,
+            Some("thinking" | "thinking_delta" | "signature_delta") => ShadowEventClass::Reasoning,
+            Some("text_delta") => ShadowEventClass::Text,
+            _ => ShadowEventClass::Other,
+        };
+        self.record_classified(kind, classification);
+    }
+
+    fn record_classified(&mut self, kind: &str, classification: ShadowEventClass) {
         if self.event_kinds.len() >= MAX_SHADOW_STREAM_EVENTS {
             return;
         }
         self.event_kinds.push(kind.to_string());
+        match classification {
+            ShadowEventClass::Text => self.text_events += 1,
+            ShadowEventClass::Reasoning => self.reasoning_events += 1,
+            ShadowEventClass::Tool => self.tool_events += 1,
+            ShadowEventClass::Other => {}
+        }
         match kind {
-            "content_block_delta" => self.text_events += 1,
             "content_block_start" | "content_block_stop" => {}
             "message_delta" => self.usage_events += 1,
             "message_stop" => self.terminal_events += 1,
-            _ if kind.contains("reasoning") || kind.contains("thinking") => {
+            _ if classification == ShadowEventClass::Other
+                && (kind.contains("reasoning") || kind.contains("thinking")) =>
+            {
                 self.reasoning_events += 1
             }
-            _ if kind.contains("tool") => self.tool_events += 1,
+            _ if classification == ShadowEventClass::Other && kind.contains("tool") => {
+                self.tool_events += 1
+            }
             _ => {}
         }
     }
@@ -685,6 +736,14 @@ impl ShadowStreamAccumulator {
             complete: self.complete,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShadowEventClass {
+    Text,
+    Reasoning,
+    Tool,
+    Other,
 }
 
 fn parse_sse_block(block: &str) -> Option<(Option<String>, Value)> {
@@ -1153,5 +1212,58 @@ mod tests {
         assert!(calculate_shadow_readiness(&input)
             .blocking_reasons
             .contains(&ShadowReadinessBlocker::RollbackUnavailable));
+    }
+
+    #[test]
+    fn stream_shape_classifies_tool_and_reasoning_payloads_without_content() {
+        use crate::proxy::claude_codex_bridge::streaming::{
+            ClaudeContentBlock, ClaudeContentDelta, ClaudeStreamEvent,
+        };
+
+        let mut bridge = ShadowStreamAccumulator::default();
+        bridge.record_bridge_event(&ClaudeStreamEvent::ContentBlockStart {
+            index: 0,
+            block: ClaudeContentBlock::ToolUse {
+                id: "call-secret".to_string(),
+                name: "tool-secret".to_string(),
+            },
+        });
+        bridge.record_bridge_event(&ClaudeStreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: ClaudeContentDelta::InputJson {
+                partial_json: "{\"secret\":true}".to_string(),
+            },
+        });
+        bridge.record_bridge_event(&ClaudeStreamEvent::ContentBlockDelta {
+            index: 1,
+            delta: ClaudeContentDelta::Thinking {
+                text: "private reasoning".to_string(),
+            },
+        });
+
+        let mut legacy = ShadowStreamAccumulator::default();
+        legacy.record_legacy_event(
+            "content_block_start",
+            &json!({"content_block":{"type":"tool_use","name":"tool-secret"}}),
+        );
+        legacy.record_legacy_event(
+            "content_block_delta",
+            &json!({"delta":{"type":"input_json_delta","partial_json":"secret"}}),
+        );
+        legacy.record_legacy_event(
+            "content_block_delta",
+            &json!({"delta":{"type":"thinking_delta","thinking":"private reasoning"}}),
+        );
+
+        assert_eq!(bridge.tool_events, 2);
+        assert_eq!(legacy.tool_events, 2);
+        assert_eq!(bridge.reasoning_events, 1);
+        assert_eq!(legacy.reasoning_events, 1);
+        assert_eq!(bridge.text_events, 0);
+        assert_eq!(legacy.text_events, 0);
+
+        let encoded = serde_json::to_string(&bridge.shape()).unwrap();
+        assert!(!encoded.contains("secret"));
+        assert!(!encoded.contains("private reasoning"));
     }
 }

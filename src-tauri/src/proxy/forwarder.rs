@@ -3827,6 +3827,7 @@ fn prepare_upstream_request_body(request_body: Value) -> Value {
 
 fn should_capture_bridge_evidence(app_type: &AppType, provider: &Provider) -> bool {
     bridge_scope_matches(app_type, provider)
+        && provider.claude_codex_bridge_mode() != ClaudeCodexBridgeMode::Shadow
 }
 
 fn begin_bridge_evidence_capture(
@@ -4097,11 +4098,16 @@ mod tests {
     }
 
     #[test]
-    fn evidence_capture_is_scoped_to_claude_codex_oauth_responses() {
-        assert!(should_capture_bridge_evidence(
-            &AppType::Claude,
-            &bridge_provider("codex_oauth", "openai_responses")
-        ));
+    fn evidence_capture_excludes_shadow_to_keep_diagnostics_structural_only() {
+        let mut legacy = bridge_provider("codex_oauth", "openai_responses");
+        assert!(should_capture_bridge_evidence(&AppType::Claude, &legacy));
+
+        legacy.meta.as_mut().unwrap().bridge_mode = Some(ClaudeCodexBridgeMode::Shadow);
+        assert!(!should_capture_bridge_evidence(&AppType::Claude, &legacy));
+
+        legacy.meta.as_mut().unwrap().bridge_mode = Some(ClaudeCodexBridgeMode::Enabled);
+        assert!(should_capture_bridge_evidence(&AppType::Claude, &legacy));
+
         assert!(!should_capture_bridge_evidence(
             &AppType::Codex,
             &bridge_provider("codex_oauth", "openai_responses")
