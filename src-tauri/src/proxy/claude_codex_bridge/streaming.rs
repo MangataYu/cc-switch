@@ -997,6 +997,17 @@ pub fn decode_codex_response_event(
                 sequence: event_sequence(&payload),
             });
         }
+        "response.reasoning.done" => {
+            let item = payload.get("item").unwrap_or(&payload);
+            events.push(CodexResponseEvent::ReasoningDone {
+                item_id: required_item_id(item, &payload, "reasoning_done")?,
+                encrypted_content: item
+                    .get("encrypted_content")
+                    .or_else(|| payload.get("encrypted_content"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            });
+        }
         "response.output_item.done" => {
             let item = payload
                 .get("item")
@@ -1380,6 +1391,34 @@ mod tests {
         )
         .unwrap()
         .is_empty());
+    }
+
+    #[test]
+    fn legacy_reasoning_done_requires_identity_and_preserves_encrypted_content() {
+        let decoded = decode_codex_response_event(
+            Some("response.reasoning.done"),
+            json!({
+                "type":"response.reasoning.done",
+                "item_id":"reasoning_1",
+                "encrypted_content":"opaque-signature"
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            decoded,
+            vec![CodexResponseEvent::ReasoningDone {
+                item_id: ItemId("reasoning_1".to_string()),
+                encrypted_content: Some("opaque-signature".to_string()),
+            }]
+        );
+
+        assert!(matches!(
+            decode_codex_response_event(
+                Some("response.reasoning.done"),
+                json!({"type":"response.reasoning.done"}),
+            ),
+            Err(BridgeError::InvalidUpstreamEvent { .. })
+        ));
     }
 
     #[test]

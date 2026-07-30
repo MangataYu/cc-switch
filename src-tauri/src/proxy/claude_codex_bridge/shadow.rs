@@ -1156,6 +1156,255 @@ mod tests {
         })
     }
 
+    async fn compare_production_shadow_stream(
+        request: Value,
+        upstream: String,
+        session_id: &str,
+    ) -> ShadowComparisonReport {
+        use bytes::Bytes;
+        use futures::{stream, StreamExt};
+
+        let bridge = ClaudeCodexBridge::with_ledger(ConversationLedger::default());
+        let prepared = bridge
+            .prepare_turn(
+                &AppType::Claude,
+                request.clone(),
+                &provider(),
+                Some(session_id),
+            )
+            .unwrap();
+        let cache_key = prepared.request["prompt_cache_key"]
+            .as_str()
+            .expect("prepared request cache key")
+            .to_string();
+        let legacy_request = crate::proxy::providers::transform_responses::anthropic_to_responses(
+            request,
+            Some(&cache_key),
+            true,
+            false,
+        )
+        .unwrap();
+        let legacy_chunks =
+            crate::proxy::providers::streaming_responses::create_anthropic_sse_stream_from_responses(
+                stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
+                    upstream.as_bytes(),
+                ))]),
+            )
+            .collect::<Vec<_>>()
+            .await;
+        let mut comparison = ShadowComparisonSession::compare_request(prepared, &legacy_request);
+        comparison.observe_stream_chunk(upstream.as_bytes());
+        for chunk in legacy_chunks {
+            comparison.observe_legacy_stream_chunk(&chunk.unwrap());
+        }
+        comparison.finish_stream();
+        comparison.report()
+    }
+
+    fn responses_event(name: &str, payload: Value) -> String {
+        format!("event: {name}\ndata: {payload}\n\n")
+    }
+
+    fn write_edit_request(messages: Vec<Value>) -> Value {
+        json!({
+            "model":"gpt-5.6",
+            "stream":true,
+            "max_tokens":128,
+            "messages":messages,
+            "tools":[
+                {
+                    "name":"Write",
+                    "description":"Write a local file",
+                    "input_schema":{
+                        "type":"object",
+                        "properties":{
+                            "file_path":{"type":"string"},
+                            "content":{"type":"string"}
+                        },
+                        "required":["file_path","content"],
+                        "additionalProperties":false
+                    }
+                },
+                {
+                    "name":"Edit",
+                    "description":"Edit a local file",
+                    "input_schema":{
+                        "type":"object",
+                        "properties":{
+                            "file_path":{"type":"string"},
+                            "old_string":{"type":"string"},
+                            "new_string":{"type":"string"},
+                            "replace_all":{"type":"boolean"}
+                        },
+                        "required":["file_path","old_string","new_string"],
+                        "additionalProperties":false
+                    }
+                }
+            ]
+        })
+    }
+
+    fn tool_call_stream(
+        response_id: &str,
+        item_id: &str,
+        call_id: &str,
+        name: &str,
+        arguments: &str,
+    ) -> String {
+        [
+            responses_event(
+                "response.created",
+                json!({"type":"response.created","response":{"id":response_id,"model":"gpt-5.6"}}),
+            ),
+            responses_event(
+                "response.output_item.added",
+                json!({"type":"response.output_item.added","output_index":0,"item":{"id":item_id,"type":"function_call","call_id":call_id,"name":name,"status":"in_progress"}}),
+            ),
+            responses_event(
+                "response.function_call_arguments.delta",
+                json!({"type":"response.function_call_arguments.delta","item_id":item_id,"output_index":0,"delta":arguments,"sequence_number":1}),
+            ),
+            responses_event(
+                "response.function_call_arguments.done",
+                json!({"type":"response.function_call_arguments.done","item_id":item_id,"output_index":0,"name":name,"arguments":arguments,"sequence_number":2}),
+            ),
+            responses_event(
+                "response.output_item.done",
+                json!({"type":"response.output_item.done","output_index":0,"item":{"id":item_id,"type":"function_call","call_id":call_id,"name":name,"arguments":arguments,"status":"completed"}}),
+            ),
+            responses_event(
+                "response.completed",
+                json!({"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":3,"output_tokens":4}}}),
+            ),
+        ]
+        .concat()
+    }
+
+    #[tokio::test]
+    async fn shadow_write_edit_error_continuation_remains_bounded() {
+        let write_input = json!({"file_path":"fixture.txt","content":"before"});
+        let edit_input = json!({
+            "file_path":"fixture.txt",
+            "old_string":"before",
+            "new_string":"after"
+        });
+        let write_arguments = serde_json::to_string(&write_input).unwrap();
+        let edit_arguments = serde_json::to_string(&edit_input).unwrap();
+        let write_stream = tool_call_stream(
+            "resp_write",
+            "item_write",
+            "call_write",
+            "Write",
+            &write_arguments,
+        );
+        let first = compare_production_shadow_stream(
+            write_edit_request(vec![json!({"role":"user","content":"create then edit"})]),
+            write_stream,
+            "shadow-write-edit",
+        )
+        .await;
+        assert_eq!(first.readiness.comparison_failures, 0);
+        assert!(first.stream.as_ref().is_some_and(|stream| stream.bounded));
+
+        let after_write = vec![
+            json!({"role":"user","content":"create then edit"}),
+            json!({"role":"assistant","content":[{"type":"tool_use","id":"call_write","name":"Write","input":write_input}]}),
+            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"call_write","content":"created"}]}),
+        ];
+        let edit_stream = tool_call_stream(
+            "resp_edit",
+            "item_edit",
+            "call_edit",
+            "Edit",
+            &edit_arguments,
+        );
+        let second = compare_production_shadow_stream(
+            write_edit_request(after_write.clone()),
+            edit_stream,
+            "shadow-write-edit",
+        )
+        .await;
+        assert_eq!(second.readiness.comparison_failures, 0);
+        assert!(second.stream.as_ref().is_some_and(|stream| stream.bounded));
+
+        let mut after_edit = after_write;
+        after_edit.extend([
+            json!({"role":"assistant","content":[{"type":"tool_use","id":"call_edit","name":"Edit","input":edit_input}]}),
+            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"call_edit","is_error":true,"content":"marker not found"}]}),
+        ]);
+        let completed_stream = [
+            responses_event(
+                "response.created",
+                json!({"type":"response.created","response":{"id":"resp_done","model":"gpt-5.6"}}),
+            ),
+            responses_event(
+                "response.output_item.added",
+                json!({"type":"response.output_item.added","output_index":0,"item":{"id":"reasoning_done","type":"reasoning","status":"in_progress"}}),
+            ),
+            responses_event(
+                "response.reasoning.delta",
+                json!({"type":"response.reasoning.delta","item_id":"reasoning_done","output_index":0,"delta":"checking result","sequence_number":1}),
+            ),
+            responses_event(
+                "response.reasoning.done",
+                json!({"type":"response.reasoning.done","item_id":"reasoning_done","output_index":0}),
+            ),
+            responses_event(
+                "response.output_item.added",
+                json!({"type":"response.output_item.added","output_index":1,"item":{"id":"message_done","type":"message","status":"in_progress"}}),
+            ),
+            responses_event(
+                "response.content_part.added",
+                json!({"type":"response.content_part.added","item_id":"message_done","output_index":1,"part":{"type":"output_text","text":""}}),
+            ),
+            responses_event(
+                "response.output_text.delta",
+                json!({"type":"response.output_text.delta","item_id":"message_done","output_index":1,"delta":"done","sequence_number":2}),
+            ),
+            responses_event(
+                "response.output_text.done",
+                json!({"type":"response.output_text.done","item_id":"message_done","output_index":1,"text":"done"}),
+            ),
+            responses_event(
+                "response.output_item.done",
+                json!({"type":"response.output_item.done","output_index":1,"item":{"id":"message_done","type":"message","status":"completed"}}),
+            ),
+            responses_event(
+                "response.completed",
+                json!({"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":5,"output_tokens":1}}}),
+            ),
+        ]
+        .concat();
+        let final_report = compare_production_shadow_stream(
+            write_edit_request(after_edit),
+            completed_stream,
+            "shadow-write-edit",
+        )
+        .await;
+
+        assert_eq!(
+            (
+                final_report.readiness.comparison_failures,
+                final_report
+                    .stream
+                    .as_ref()
+                    .is_some_and(|stream| stream.bounded),
+                final_report.readiness.unexplained_differences,
+            ),
+            (0, true, 0)
+        );
+        let encoded = serde_json::to_string(&final_report).unwrap();
+        for secret in [
+            "fixture.txt",
+            "marker not found",
+            "call_write",
+            "call_edit",
+            "checking result",
+        ] {
+            assert!(!encoded.contains(secret));
+        }
+    }
+
     #[test]
     fn shadow_request_comparison_is_typed_deterministic_and_leak_free() {
         let secret = "sk-secret prompt Authorization cookie tool-arguments reasoning";
