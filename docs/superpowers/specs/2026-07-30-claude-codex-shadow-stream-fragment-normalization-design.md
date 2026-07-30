@@ -8,7 +8,7 @@ The legacy Responses-to-Anthropic stream forwards non-`Read` function argument f
 
 ## Goals
 
-- Treat different fragmentation of the same logical content-block delta stream as structurally equivalent.
+- Treat different fragmentation of the same logical tool-argument delta stream as structurally equivalent.
 - Keep tool identity, call identity, content-block ordering, lifecycle, strict argument validation, completion, and terminal-state checks fail-closed.
 - Preserve the raw event counts and structural hashes already exposed in safe shadow reports.
 - Emit enough content-free diagnostics to identify any future unexplained difference by reason code.
@@ -31,7 +31,7 @@ The legacy Responses-to-Anthropic stream forwards non-`Read` function argument f
 - content-block index when present;
 - structural class: text, reasoning, tool, or other.
 
-Consecutive `content_block_delta` events with the same block index and structural class collapse into one semantic token. Starts, stops, message lifecycle events, tool blocks, and terminal events never collapse. Deltas for different indexes or different classes remain distinct.
+Consecutive `input_json_delta` events with the same block index collapse into one semantic token. Text, thinking, signature, starts, stops, message lifecycle events, tool blocks, and terminal events never collapse. Tool deltas for different indexes remain distinct.
 
 Both the legacy accumulator and the strict bridge accumulator use the same token builder. This makes one versus many JSON argument fragments equivalent while preserving the surrounding lifecycle.
 
@@ -55,7 +55,7 @@ The existing shadow log line will add an ordered, deduplicated list of unexplain
 
 - Invalid or incomplete strict decoding remains a comparison failure and detaches the observer as today.
 - Missing starts/stops, changed block ordering, changed block index, different structural class, or a terminal mismatch remains unexplained and blocks rollout.
-- Semantic normalization is applied only to consecutive deltas within one logical block; it cannot join separate tool calls or reorder events.
+- Semantic normalization is applied only to consecutive `input_json_delta` events within one logical block; it cannot join separate tool calls, collapse reasoning/text/signature events, or reorder events.
 
 ## Test strategy
 
