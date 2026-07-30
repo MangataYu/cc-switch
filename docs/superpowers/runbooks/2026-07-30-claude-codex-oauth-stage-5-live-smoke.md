@@ -1,6 +1,15 @@
 # Claude Code Codex OAuth Stage 5 Live Smoke Runbook
 
-**Status:** Blocked on 2026-07-30 with blocker `CodexOAuthRefreshExpired`; rollout remains blocked. The tool-fragment fix is green offline but has not passed a live rerun. Reauthenticate the CC Switch-managed Codex OAuth account before requesting another live attempt.
+**Status:** Failed on 2026-07-30 with blocker `ComparisonFailures`; rollout remains blocked. The Glob/Grep tool-fragment fix passed live, but the later Write/Edit flow produced an incomplete shadow observation and the expected Edit marker was not applied.
+
+## 2026-07-30 credential-handoff live rerun
+
+- Credential continuity: stopped the installed CC Switch before testing, copied its freshly authorized OAuth store without inspecting values, and used a fresh isolated home/database/provider. The first no-tool request returned HTTP 200 with `request_match=true`, `unexplained=0`, `comparison_failures=0`, and `bounded=true`. The isolated manager rotated its refresh token; the updated store was atomically handed back immediately and again during final cleanup. The installed application was restarted successfully, so no additional login is required.
+- Glob/Grep passed: Claude Code executed exactly one `Glob` and one `Grep`, produced two unique tool-use IDs and two matching results, used no other tool, exited 0, and emitted no result error. All three flow requests returned HTTP 200. Every shadow stream report was bounded with zero unexplained differences and zero comparison failures.
+- Blocking Write/Edit result: Claude Code emitted exactly one `Write` and one `Edit`, with two unique IDs and matching tool-result closures, no other tool, exit 0, and no top-level result error. The new disposable file was created, but the independent fixture check found the original Edit marker still present and the replacement absent. Across the rerun, all seven upstream requests returned HTTP 200; six stream reports were bounded and failure-free, while the final Write/Edit report recorded `stream_differences=2`, `unexplained=0`, `comparison_failures=1`, and `bounded=false`.
+- Not run after the blocker: Bash/test, the dedicated parallel-tools flow, optional MCP/Task, and `enabled` mode. No visible tool was retried.
+- Rollback and cleanup: stopped only the isolated debug application, changed its provider to explicit `legacy`, disabled its proxy/takeover state, performed the final OAuth handback, deleted the exact temporary directory and obsolete recovery backup, and restarted the original installed CC Switch. Raw prompts, traffic, tool arguments/results, logs, and temporary credentials were not retained.
+- Readiness: `LiveSmokeStatus::Failed` with blocker `ComparisonFailures`. Diagnose and fix the Write/Edit shadow observation offline before another live rerun.
 
 ## 2026-07-30 tool-fragment-fix verification attempt
 
