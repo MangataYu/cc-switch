@@ -1,7 +1,7 @@
 # Claude Code → Codex OAuth Agent Bridge Design
 
 **Date:** 2026-07-29
-**Status:** Stages 0–3 implemented; Stage 4 pending
+**Status:** Stages 0–4 implemented; Stage 5 pending
 **Scope:** Claude Code client to the built-in Codex OAuth backend only
 
 ## 1. Summary
@@ -589,7 +589,7 @@ Implemented on 2026-07-29. Providers without `bridgeMode` remain on `legacy`; `s
 
 Compile request-scoped tool bindings, adapt schemas with loss reports, restore calls by registry identity, and reject unknown tools. Cover the built-in Claude tool matrix before MCP and dynamic tools.
 
-Implemented on 2026-07-29. Each prepared turn freezes a request-scoped registry covering the current Claude Code built-ins plus deterministic MCP/dynamic bindings; schema adaptation is loss-reported and fail-closed, non-streaming and existing SSE codecs restore exact registered identities, IDs, and validated arguments, and forensic replay verifies registry, capability, and transform-decision evidence without network access. `BatchTool` remains explicitly unsupported. Conversation-ledger behavior remains Stage 3, and the strict typed streaming state machine remains Stage 4.
+Implemented on 2026-07-29. Each prepared turn freezes a request-scoped registry covering the current Claude Code built-ins plus deterministic MCP/dynamic bindings; schema adaptation is loss-reported and fail-closed, non-streaming and enabled strict SSE restore exact registered identities, IDs, and validated arguments, and forensic replay verifies registry, capability, and transform-decision evidence without network access. `BatchTool` remains explicitly unsupported. Conversation-ledger behavior is provided by Stage 3, and strict typed streaming ownership is provided by Stage 4.
 
 ### Stage 3: Conversation ledger
 
@@ -597,11 +597,19 @@ Track session/turn identity, calls, reasoning items, retries, and compaction epo
 
 Implemented on 2026-07-29. The enabled bridge now uses a concurrency-safe, process-local ledger with hashed session/request/history identities, frozen turn registries and capability snapshots, monotonic parallel tool-call state, matching `tool_result` closure, provider/model/profile-bound encrypted-reasoning identity, prefix-based compaction epochs, protected active-state retention, safe structural snapshots, and zero-network lifecycle replay. Exact same-session retries reuse the original turn, registry, schema-loss report, and capability snapshot; orphan or conflicting results fail closed. Legacy never creates or reads ledger state, while shadow uses an isolated ledger and still makes only the served legacy upstream request.
 
-The default limits are 128 sessions, 32 evictable turns per session, and a 30-minute idle TTL. Active calls, calls already returned to Claude Code, and incomplete reasoning items can temporarily exceed those bounds rather than being evicted. State is intentionally lost on restart and is never shared across processes. The existing Responses SSE codec reports validated tool/reasoning completion into the ledger, but typed event ownership, strict SSE sequencing, arbitrary fragmentation/property testing, and full event replay remain Stage 4.
+The default limits are 128 sessions, 32 evictable turns per session, and a 30-minute idle TTL. Active calls, calls already returned to Claude Code, and incomplete reasoning items can temporarily exceed those bounds rather than being evicted. State is intentionally lost on restart and is never shared across processes. The Stage 4 enabled stream path now reports validated tool/reasoning completion into this ledger; legacy remains outside the ledger.
 
 ### Stage 4: Strict streaming state machine
 
 Decode Responses SSE into typed events, validate them through the prepared turn, and encode validated Claude SSE. Add property and replay coverage for fragmentation and failure cases.
+
+Implemented on 2026-07-29. Only the scoped Claude Code → built-in Codex OAuth → `openai_responses` path with `bridgeMode=enabled` requires and consumes its creating `PreparedCodexTurn`. A protocol-boundary decoder converts the supported Responses lifecycle into typed response, reasoning, text, tool, usage, completion, and failure events. The turn-bound state machine assigns stable content indices, enforces item identity and type, validates terminal ordering and exact duplicate semantics, restores tool calls through the frozen registry, and advances the Stage 3 ledger. Unknown semantic events, malformed or missing identity, conflicting sequence reuse, post-completion deltas, invalid tool JSON, completion with open items, and terminal-free EOF fail closed. Only validated typed Claude events reach the SSE encoder; it performs no semantic repair.
+
+Output and tool visibility are acknowledged only after the corresponding Claude SSE chunk is yielded. Failures before visibility remain eligible for the existing pre-output retry decision, while any emitted output forbids unconditional legacy fallback and any visible tool forbids automatic retry. Forensic failures record structural event/state decisions, hashed item and call identities, frozen registry/capability fingerprints, terminal state, and visibility without retaining prompt, reasoning, tool arguments/results, or credentials.
+
+Deterministic tests split canonical streams at every SSE byte boundary, including inside multibyte UTF-8, and split completed tool JSON at every logical delta boundary. Offline replay exercises text-only, reasoning plus text, one tool, parallel tools, chunked arguments, the tool-result lifecycle, incomplete streams, invalid ordering, unknown tools, and conflicting duplicates through the production decoder and state machine with `network_requests = 0`.
+
+The limits remain deliberate: ledger and stream buffers are process-local and request-scoped, completed plaintext reasoning and tool arguments are discarded after validation, legacy/shadow and other providers keep their prior codec behavior, and no live OAuth probe or smoke test is performed. Stage 5 opt-in rollout/shadow comparison and Stage 6 default enablement/legacy removal are not implemented.
 
 ### Stage 5: Shadow comparison and opt-in live use
 

@@ -111,23 +111,23 @@ Return `BridgeError::InvalidUpstreamEvent` for malformed/unknown semantic events
 
 **Interfaces:** `decode_codex_response_event(event_name: Option<&str>, payload: Value) -> Result<Vec<CodexResponseEvent>, BridgeError>`; `CodexResponseEvent::kind()`; safe `BridgeError::{InvalidUpstreamEvent,IncompleteStream}`.
 
-- [ ] Add failing table tests for every typed event, official compatibility alias, explicit ignorable lifecycle event, malformed JSON shape, unknown semantic event, missing item/call/tool identity, and safe summaries that exclude supplied secrets.
-- [ ] Run `cargo test typed_responses_event --lib -- --nocapture` and confirm RED is caused by missing decoder/types.
-- [ ] Implement the typed values and decoder with explicit field extraction/allowlists; retain no raw payload after decoding.
-- [ ] Re-run focused tests plus `cargo check`; refactor extraction helpers only while green.
-- [ ] Commit as `feat(proxy): add typed Responses stream events`.
+- [x] Add failing table tests for every typed event, official compatibility alias, explicit ignorable lifecycle event, malformed JSON shape, unknown semantic event, missing item/call/tool identity, and safe summaries that exclude supplied secrets.
+- [x] Run `cargo test typed_responses_event --lib -- --nocapture` and confirm RED is caused by missing decoder/types.
+- [x] Implement the typed values and decoder with explicit field extraction/allowlists; retain no raw payload after decoding.
+- [x] Re-run focused tests plus `cargo check`; refactor extraction helpers only while green.
+- [x] Commit as `feat(proxy): add typed Responses stream events`.
 
 ### Task 2: Prepared-turn strict state machine
 
 **Files:** modify `claude_codex_bridge/{streaming.rs,mod.rs,conversation_ledger.rs}` only where an existing hashed transition needs a stream-safe entry point.
 
-**Interfaces:** `PreparedCodexTurn::stream() -> PreparedCodexStream`; `PreparedCodexStream::{apply,finish,visibility,decisions}`; `StreamVisibility { output_emitted, tool_visible }`.
+**Interfaces:** `PreparedCodexTurn::start_stream() -> PreparedCodexStream`; `PreparedCodexStream::{apply,acknowledge_emitted,finish,visibility,decisions}`; `StreamVisibility { output_emitted, tool_visible }`.
 
-- [ ] Add failing tests for legal text, reasoning, single tool, parallel tool, and interleaved multi-item streams; exact duplicate idempotency; every forbidden sequence in the policy; frozen capability/registry enforcement; and monotonic ledger transitions.
-- [ ] Run `cargo test strict_stream_state --lib -- --nocapture` and confirm expected RED failures.
-- [ ] Implement minimal response/item maps and transition methods. Keep argument/reasoning plaintext request-scoped only, hash before ledger/decision output, validate completed tool JSON through `ToolRegistry`, and call the ledger for authoritative lifecycle changes.
-- [ ] Re-run strict state, ledger, and bridge tests plus `cargo check`; split helpers if needed while green.
-- [ ] Commit as `feat(proxy): validate prepared turn streams`.
+- [x] Add failing tests for legal text, reasoning, single tool, parallel tool, and interleaved multi-item streams; exact duplicate idempotency; every forbidden sequence in the policy; frozen capability/registry enforcement; and monotonic ledger transitions.
+- [x] Run `cargo test strict_stream_state --lib -- --nocapture` and confirm expected RED failures.
+- [x] Implement minimal response/item maps and transition methods. Keep argument/reasoning plaintext request-scoped only, hash before ledger/decision output, validate completed tool JSON through `ToolRegistry`, and call the ledger for authoritative lifecycle changes.
+- [x] Re-run strict state, ledger, and bridge tests plus `cargo check`; split helpers if needed while green.
+- [x] Commit as `feat(proxy): validate prepared turn streams`.
 
 ### Task 3: Validated Claude SSE encoder and routing isolation
 
@@ -135,11 +135,11 @@ Return `BridgeError::InvalidUpstreamEvent` for malformed/unknown semantic events
 
 **Interfaces:** `encode_claude_stream_event(&ClaudeStreamEvent) -> Bytes`; prepared-turn converter uses the typed pipeline; legacy converter remains the existing core.
 
-- [ ] Add failing end-to-end tests proving exact Claude event shapes/order for text, reasoning signature, tool use, parallel tools, usage, and stop reason; prove enabled cannot bypass a prepared turn and legacy/non-scoped callers preserve current output.
-- [ ] Run `cargo test strict_streaming_responses --lib -- --nocapture` and confirm RED.
-- [ ] Implement a separate strict prepared-turn stream adapter using existing UTF-8-safe SSE framing. Encode only validated events, mark output visibility on emitted Claude events, and mark tool calls `ReturnedToClaude` only after their Claude events become visible.
-- [ ] Re-run strict adapter, legacy `streaming_responses`, bridge, and handler tests plus `cargo check`.
-- [ ] Commit as `feat(proxy): route enabled streams through prepared turns`.
+- [x] Add failing end-to-end tests proving exact Claude event shapes/order for text, reasoning signature, tool use, parallel tools, usage, and stop reason; prove enabled cannot bypass a prepared turn and legacy/non-scoped callers preserve current output.
+- [x] Run `cargo test strict_streaming_responses --lib -- --nocapture` and confirm RED.
+- [x] Implement a separate strict prepared-turn stream adapter using existing UTF-8-safe SSE framing. Encode only validated events, mark output visibility on emitted Claude events, and mark tool calls `ReturnedToClaude` only after their Claude events become visible.
+- [x] Re-run strict adapter, legacy `streaming_responses`, bridge, and handler tests plus `cargo check`.
+- [x] Commit as `feat(proxy): route enabled streams through prepared turns`.
 
 ### Task 4: Retry/failover boundary and structural forensics
 
@@ -147,35 +147,35 @@ Return `BridgeError::InvalidUpstreamEvent` for malformed/unknown semantic events
 
 **Interfaces:** `bridge_stream_retry_allowed(StreamVisibility) -> bool`; structural stream artifact rows based on `StreamDecision`; typed evidence errors include event kind, output/tool visibility, session hash, turn ID, and bundle ID without content.
 
-- [ ] Add failing tests proving pre-output failure remains retryable, any emitted output forbids unconditional legacy fallback, visible tools forbid automatic retry, retry reuses Stage 3 identities, and failure artifacts contain only hashes/enums/IDs.
-- [ ] Add failing redaction tests with sentinel prompt, arguments, result, credential, and reasoning strings; assert none appear in logs/errors/artifacts.
-- [ ] Run focused forwarder/forensics tests and confirm RED.
-- [ ] Implement the pure visibility gate and structural capture. Preserve the existing first-semantic-event priming path and do not redesign the retry loop.
-- [ ] Re-run `cargo test proxy::forwarder --lib`, `cargo test bridge_forensics --lib`, and `cargo check`.
-- [ ] Commit as `feat(proxy): enforce visible stream retry boundary`.
+- [x] Add failing tests proving pre-output failure remains retryable, any emitted output forbids unconditional legacy fallback, visible tools forbid automatic retry, retry reuses Stage 3 identities, and failure artifacts contain only hashes/enums/IDs.
+- [x] Add failing redaction tests with sentinel prompt, arguments, result, credential, and reasoning strings; assert none appear in logs/errors/artifacts.
+- [x] Run focused forwarder/forensics tests and confirm RED.
+- [x] Implement the pure visibility gate and structural capture. Preserve the existing first-semantic-event priming path and do not redesign the retry loop.
+- [x] Re-run `cargo test proxy::forwarder --lib`, `cargo test bridge_forensics --lib`, and `cargo check`.
+- [x] Commit as `feat(proxy): enforce visible stream retry boundary`.
 
 ### Task 5: Fragmentation properties and complete offline replay
 
 **Files:** modify bridge streaming tests and `bridge_forensics/{replay.rs,mod.rs}`; add compact in-module fixtures if no standalone fixture directory is required.
 
-**Interfaces:** `replay_stream_events(...) -> StreamingReplayReport` returning decisions, Claude event shapes, ledger transitions, terminal/error state, and `network_requests: 0`.
+**Interfaces:** `replay_strict_stream_fixture(...) -> StreamingEventReplayReport` returning decisions, Claude event shapes, ledger transitions, terminal/error state, and `network_requests: 0`.
 
-- [ ] Add systematic split-point tests across every byte boundary for SSE frames, multi-byte UTF-8, and multi-chunk tool JSON; compare Claude output and final ledger snapshots with the unsplit fixture.
-- [ ] Add illegal-sequence matrices for duplicate/conflicting delta, truncation, no terminal, parallel/interleaved items, duplicate completion, post-done delta, malformed JSON, unknown event, and unknown tool; assert rejection is split-invariant and leak-free.
-- [ ] Add ten offline replay fixtures: text-only; reasoning+text; single tool; parallel tools; multi-chunk arguments; tool→`ReturnedToClaude`→later result→`Completed`; incomplete; invalid order; unknown tool; conflicting duplicate.
-- [ ] Run new tests and confirm RED, then implement deterministic replay through the same decoder/machine as enabled routing with no HTTP/Tauri dependencies.
-- [ ] Re-run `cargo test strict_stream_fragmentation --lib`, `cargo test streaming_event_replay --lib`, `cargo test bridge_forensics --lib`, and `cargo check`; assert every report says `network_requests = 0`.
-- [ ] Commit as `test(proxy): replay strict streaming events`.
+- [x] Add systematic split-point tests across every byte boundary for SSE frames, multi-byte UTF-8, and multi-chunk tool JSON; compare Claude output and final ledger snapshots with the unsplit fixture.
+- [x] Add illegal-sequence matrices for duplicate/conflicting delta, truncation, no terminal, parallel/interleaved items, duplicate completion, post-done delta, malformed JSON, unknown event, and unknown tool; assert rejection is split-invariant and leak-free.
+- [x] Add ten offline replay fixtures: text-only; reasoning+text; single tool; parallel tools; multi-chunk arguments; tool→`ReturnedToClaude`→later result→`Completed`; incomplete; invalid order; unknown tool; conflicting duplicate.
+- [x] Run new tests and confirm RED, then implement deterministic replay through the same decoder/machine as enabled routing with no HTTP/Tauri dependencies.
+- [x] Re-run `cargo test strict_stream_fragmentation --lib`, `cargo test streaming_event_replay --lib`, `cargo test bridge_forensics --lib`, and `cargo check`; assert every report says `network_requests = 0`.
+- [x] Commit as `test(proxy): replay strict streaming events`.
 
 ### Task 6: Documentation, acceptance, and scope audit
 
 **Files:** modify the approved design document and this plan.
 
-- [ ] Update the design status to exactly `Stages 0–4 implemented; Stage 5 pending`; summarize typed events, transitions/rejections, visibility boundary, fragmentation/replay coverage, and limitations.
-- [ ] Mark all completed tasks and acceptance checks in this plan; scan for placeholders and interface-name drift.
-- [ ] Run every command in Test Commands, the dedicated property/replay tests, and `git diff --check`.
-- [ ] Inspect status/diff and changed-file content for warnings, credentials, plaintext reasoning, tool argument/result leakage, temporary bundles, `.codegraph/` changes, other-provider changes, legacy behavior changes, shadow network duplication, and prepared-turn bypass.
-- [ ] Commit as `docs: record Claude Codex bridge stage 4`.
+- [x] Update the design status to exactly `Stages 0–4 implemented; Stage 5 pending`; summarize typed events, transitions/rejections, visibility boundary, fragmentation/replay coverage, and limitations.
+- [x] Mark all completed tasks and acceptance checks in this plan; scan for placeholders and interface-name drift.
+- [x] Run every command in Test Commands, the dedicated property/replay tests, and `git diff --check`.
+- [x] Inspect status/diff and changed-file content for warnings, credentials, plaintext reasoning, tool argument/result leakage, temporary bundles, `.codegraph/` changes, other-provider changes, legacy behavior changes, shadow network duplication, and prepared-turn bypass.
+- [x] Commit as `docs: record Claude Codex bridge stage 4`.
 
 ## Fragmentation / Property Strategy
 
@@ -194,19 +194,19 @@ Return `BridgeError::InvalidUpstreamEvent` for malformed/unknown semantic events
 
 ## Acceptance Criteria
 
-- [ ] Enabled scoped Responses SSE always requires and consumes its creating `PreparedCodexTurn`.
-- [ ] All listed typed events exist and no raw JSON is the state-machine interface.
-- [ ] Text, reasoning, tool, usage, parallel calls, interleaving, legal duplicates, and arbitrary legal fragmentation are deterministic.
-- [ ] Every listed illegal sequence fails closed with `InvalidUpstreamEvent` or `IncompleteStream` (or the existing typed registry/conversation conflict where authoritative).
-- [ ] Tool identity restores exactly from the frozen registry; valid object JSON is required before tool visibility; ledger reaches `ReturnedToClaude` only after visibility.
-- [ ] Reasoning encrypted identity follows Stage 3 bindings; plaintext reasoning is not persisted.
-- [ ] Usage/stop reason match terminal state and the encoder performs no semantic repair.
-- [ ] Output-visible failures cannot fall back unconditionally; tool-visible failures cannot automatically retry.
-- [ ] Forensics/replay artifacts are structural and contain none of the forbidden sentinel content.
-- [ ] Legacy behavior and other providers remain unchanged; shadow sends exactly one upstream request and does not mutate enabled state.
-- [ ] Offline replay covers all ten required fixtures and reports `network_requests = 0`.
-- [ ] `.codegraph/` remains untouched and uncommitted.
-- [ ] Stage 5 and Stage 6 remain unimplemented.
+- [x] Enabled scoped Responses SSE always requires and consumes its creating `PreparedCodexTurn`.
+- [x] All listed typed events exist and no raw JSON is the state-machine interface.
+- [x] Text, reasoning, tool, usage, parallel calls, interleaving, legal duplicates, and arbitrary legal fragmentation are deterministic.
+- [x] Every listed illegal sequence fails closed with `InvalidUpstreamEvent` or `IncompleteStream` (or the existing typed registry/conversation conflict where authoritative).
+- [x] Tool identity restores exactly from the frozen registry; valid object JSON is required before tool visibility; ledger reaches `ReturnedToClaude` only after visibility.
+- [x] Reasoning encrypted identity follows Stage 3 bindings; plaintext reasoning is not persisted.
+- [x] Usage/stop reason match terminal state and the encoder performs no semantic repair.
+- [x] Output-visible failures cannot fall back unconditionally; tool-visible failures cannot automatically retry.
+- [x] Forensics/replay artifacts are structural and contain none of the forbidden sentinel content.
+- [x] Legacy behavior and other providers remain unchanged; shadow sends exactly one upstream request and does not mutate enabled state.
+- [x] Offline replay covers all ten required fixtures and reports `network_requests = 0`.
+- [x] `.codegraph/` remains untouched and uncommitted.
+- [x] Stage 5 and Stage 6 remain unimplemented.
 
 ## Test Commands
 
