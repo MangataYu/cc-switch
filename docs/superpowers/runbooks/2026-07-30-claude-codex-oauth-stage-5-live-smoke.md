@@ -1,8 +1,17 @@
 # Claude Code Codex OAuth Stage 5 Live Smoke Runbook
 
-**Status:** Failed on 2026-07-30; rollout remains blocked. A new explicit authorization is required for any rerun.
+**Status:** Blocked on 2026-07-30 by `CodexOAuthRefreshExpired`; rollout remains blocked. Refresh the local Codex OAuth login and obtain new explicit authorization before any rerun.
 
-## 2026-07-30 result
+## 2026-07-30 authorized rerun
+
+- Environment: rebuilt the debug binary from the fixed source, then used an isolated temporary home, isolated CC Switch database, copied OAuth store without inspecting values, disposable tool directory, loopback-only random port, and explicit `shadow` mode.
+- Blocking result: the first no-tool Claude Code text flow never entered bridge comparison. Claude Code emitted one initialization event followed by nine API retries; the isolated proxy recorded HTTP 401 with safe reason code `CodexOAuthRefreshExpired`. No tool became visible and no `enabled` request was sent.
+- Not run after the blocker: reasoning, Read, continuation, Glob/Grep, Write/Edit, Bash/test, parallel tools, optional MCP/Task, and `enabled` mode.
+- Rollback and cleanup: changed the isolated provider back to explicit `legacy`, disabled isolated takeover, stopped only the scoped debug application and launcher, then deleted the exact disposable directory containing the copied OAuth store, database, fixtures, and logs.
+- Isolation note: two earlier launcher attempts started the debug executable without the intended environment because Windows PowerShell rejected the process environment dictionary. Both were stopped before any Claude/model request; no intentional real-user configuration mutation was performed. The successful launcher used an independently created hidden process with the verified isolation environment.
+- Readiness: `LiveSmokeStatus::Blocked` with blocker `CodexOAuthRefreshExpired`. Reauthenticate Codex OAuth before requesting another live rerun; offline verification remains green but cannot substitute for the required live matrix.
+
+## 2026-07-30 earlier result
 
 - Environment: isolated temporary home, isolated CC Switch database, copied OAuth store without inspecting values, disposable tool directory, and a debug-only local proxy startup hook removed immediately after the run.
 - Passed: direct Anthropic-compatible text, Claude Code streaming text, Claude Code reasoning, legacy-served `Read`, tool-result continuation, and immediate rollback to explicit `legacy`.
@@ -11,7 +20,7 @@
 - Not run after the blocker: Glob/Grep, Write/Edit, Bash/test, parallel tools, optional MCP/Task, and `enabled` mode.
 - Rollback: the next Claude Code text request completed with no new shadow diagnostic.
 - Cleanup: application/proxy/dev processes stopped; the exact disposable directory, copied OAuth store, isolated database, fixtures, and logs were deleted. Real user configuration was unchanged.
-- Readiness: `LiveSmokeStatus::Failed`; the recorded live sample still carries blocker `ComparisonFailures`. The offline root cause is fixed, but do not opt into `enabled` or mark Stage 5 rollout-ready until a newly authorized live rerun completes the required matrix.
+- Readiness at the time: `LiveSmokeStatus::Failed` with blocker `ComparisonFailures`. That offline root cause was subsequently fixed; the newer authorized rerun above is now blocked earlier by expired Codex OAuth credentials.
 
 ## Safety boundary
 
