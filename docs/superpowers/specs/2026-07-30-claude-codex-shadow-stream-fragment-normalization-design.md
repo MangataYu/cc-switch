@@ -11,7 +11,7 @@ The legacy Responses-to-Anthropic stream forwards non-`Read` function argument f
 - Treat different fragmentation of the same logical content-block delta stream as structurally equivalent.
 - Keep tool identity, call identity, content-block ordering, lifecycle, strict argument validation, completion, and terminal-state checks fail-closed.
 - Preserve the raw event counts and structural hashes already exposed in safe shadow reports.
-- Emit enough content-free diagnostics to identify any future unexplained difference by reason code and structural path.
+- Emit enough content-free diagnostics to identify any future unexplained difference by reason code.
 - Lock the live Glob/Grep pattern down with an offline regression before changing production behavior.
 
 ## Non-goals
@@ -49,7 +49,7 @@ Raw `event_count`, per-class event counts, and `structural_hash` remain unchange
 
 ### Safe diagnostics
 
-The existing shadow log line will add an ordered, deduplicated list of unexplained reason codes and structural paths. Values come only from `ShadowDifference.reason_code` and `ShadowDifference.path`; hashes and payload content remain excluded.
+The existing shadow log line will add an ordered, deduplicated list of unexplained reason codes. Paths are intentionally omitted because request-field paths can contain caller-controlled keys. Hashes and payload content remain excluded.
 
 ## Error handling
 
@@ -62,7 +62,7 @@ The existing shadow log line will add an ordered, deduplicated list of unexplain
 1. Add a regression using a built-in Glob or Grep tool whose upstream function arguments arrive in multiple delta events. Feed the same upstream SSE through the production legacy converter and shadow observer. Before the fix it must fail with one unexplained `ResponseEventMismatch`.
 2. After the fix, require zero unexplained differences, zero comparison failures, bounded observation, matching semantic shape, and different raw event counts to prove the normalization is doing real work.
 3. Add a negative test where a lifecycle event or block index differs; it must remain `ResponseEventMismatch`.
-4. Assert serialized reports and safe reason-code diagnostics contain none of the fixture path, argument text, call ID, legacy tool name, or projected tool name.
+4. Assert serialized reports and safe reason-code diagnostics contain none of the fixture path, argument text, call ID, legacy tool name, projected tool name, or caller-controlled request-field key.
 5. Run the focused bridge tests, streaming Responses tests, forwarder tests, `cargo check`, formatting, and diff checks.
 
 ## Rollout
