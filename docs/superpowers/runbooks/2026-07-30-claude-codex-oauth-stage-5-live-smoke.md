@@ -1,6 +1,16 @@
 # Claude Code Codex OAuth Stage 5 Live Smoke Runbook
 
-**Status:** Blocked on 2026-07-30 by `CodexOAuthRefreshExpired`; rollout remains blocked. Refresh the local Codex OAuth login and obtain new explicit authorization before any rerun.
+**Status:** Failed on 2026-07-30 with blocker `UnexplainedDifferences`; rollout remains blocked. Codex OAuth reauthentication succeeded, but a new explicit authorization is required for any visible-tool rerun.
+
+## 2026-07-30 post-reauthentication rerun on 3.19.0
+
+- Environment: rebuilt the 3.19.0 debug binary, then used a new isolated temporary home, isolated 3.19 database, copied OAuth store without inspecting values, disposable fixtures, loopback-only random port, explicit `shadow`, and persisted debug-level structural logging.
+- Passed: ordinary text, reasoning with separate thinking/text structure, one legacy-served `Read`, the matching tool-result continuation, and immediate rollback to explicit `legacy`. Every upstream request in these flows returned HTTP 200; no comparison failure or incomplete observation was recorded.
+- Blocking result: the Glob/Grep flow executed exactly one `Glob` and one `Grep`, with two unique tool-use IDs and matching results, but its stream comparison recorded one unexplained difference while remaining bounded. Request comparison remained explained and strict observation did not fail. The retained safe evidence narrows the blocker to a stream event-shape or terminal-state mismatch; raw traffic was deleted, so this run does not speculate further.
+- Not run after the blocker: Write/Edit, Bash/test, the dedicated parallel-tools flow, optional MCP/Task, and `enabled` mode. The visible tool flow was not retried.
+- Rollback and cleanup: the next no-tool Claude Code request completed with HTTP 200 and no new shadow diagnostic. The isolated provider remained explicit `legacy`; proxy/application/launcher processes stopped; the exact temporary directory, copied OAuth store, database, fixtures, evidence staging directories, and raw logs were deleted.
+- 3.19 setup note: `proxy_config.live_takeover_active` no longer exists. The isolated setup used the current schema and did not recreate the earlier literal `%SystemDrive%` cache artifact.
+- Readiness: `LiveSmokeStatus::Failed` with blocker `UnexplainedDifferences`. Do not opt into `enabled` until an offline regression explains and fixes the Glob/Grep stream mismatch and a separately authorized live rerun completes the matrix.
 
 ## 2026-07-30 authorized rerun
 
