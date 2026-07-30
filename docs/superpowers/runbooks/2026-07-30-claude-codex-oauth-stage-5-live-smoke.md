@@ -1,6 +1,17 @@
 # Claude Code Codex OAuth Stage 5 Live Smoke Runbook
 
-**Status:** Failed on 2026-07-30 with blocker `ComparisonFailures`; rollout remains blocked. The Glob/Grep tool-fragment fix passed live. The later Write/Edit incomplete observation now has an offline production-chain regression and fix, but no new live run has been authorized, and the expected Edit marker was not applied in the last live run.
+**Status:** Failed on 2026-07-30 with blocker `ComparisonFailures`; rollout remains blocked. The Glob/Grep tool-fragment fix passed live. The later Write/Edit incomplete observation now has an offline production-chain regression and fix, but the authorized access-token-only rerun below did not produce a visible Write or Edit call, so it did not close the live blocker.
+
+## 2026-07-30 access-token-only Write/Edit rerun attempt
+
+- Refresh boundary during the isolated run: stopped the installed CC Switch and launched an isolated debug application with the current Codex access token injected only into process memory. A temporary fail-closed guard rejected the refresh path; repository source was restored before the run. Isolated safe logs contained zero refresh or HTTP 401/403 signals.
+- Credential integrity before application restart: the real Codex auth file, real CC Switch OAuth store, isolated OAuth-store copy, and real CC Switch database all retained their pre-run SHA-256 hashes. The isolated run did not write either real credential store.
+- Non-tool probe: Claude Code exited 0 and reached the isolated `shadow` proxy. Across the complete attempt, four recorded upstream requests returned HTTP 200 and all four stream reports had `comparison_failures=0`, `bounded=true`, and no unexplained differences.
+- Inconclusive Write/Edit coverage: two separately restricted Claude Code invocations allowed only `Write` and `Edit`, but each exited 0 without emitting any tool use or tool result. The disposable file was not created. Because no visible tool call, continuation, or result closure occurred, this attempt does not verify the Write/Edit incomplete-observation fix live.
+- Retry boundary: no visible tool was retried. After the second no-tool outcome, the run stopped instead of issuing another model request.
+- Rollback and cleanup: the isolated provider was returned to explicit `legacy`, proxy/takeover and failover were disabled, the isolated application was stopped, and raw prompts, responses, logs, temporary credentials, and fixtures were deleted.
+- Post-cleanup restart incident: starting the installed CC Switch triggered one background access-token refresh before any proxy request. The refresh succeeded and rotated the persisted refresh token, changing the OAuth-store hash while preserving its size; there was no HTTP 401/403. The application was stopped immediately, the newly rotated store was retained, and the now-stale pre-refresh value was not restored. The installed application remains stopped to avoid another refresh without explicit authorization.
+- Readiness remains `LiveSmokeStatus::Failed` with blocker `ComparisonFailures`. A later explicitly authorized live run must produce the complete Write → result → Edit → result → terminal sequence before the blocker can be cleared.
 
 ## 2026-07-30 Write/Edit incomplete-observation offline fix
 
