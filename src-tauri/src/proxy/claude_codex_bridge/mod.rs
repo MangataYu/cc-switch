@@ -2,6 +2,7 @@ mod capabilities;
 mod conversation_ledger;
 mod error;
 mod schema;
+pub mod shadow;
 pub mod streaming;
 mod tools;
 
@@ -42,6 +43,7 @@ pub struct PreparedCodexTurn {
     pub capability_snapshot: Arc<CodexOAuthCapabilities>,
     pub negotiation_report: NegotiationReport,
     pub reused_turn: bool,
+    pub(crate) shadow_comparison: Option<shadow::ShadowComparisonReport>,
     ledger: ConversationLedger,
     ledger_binding: TurnBinding,
     provider_hash: String,
@@ -218,6 +220,7 @@ impl ClaudeCodexBridge {
             capability_snapshot,
             negotiation_report,
             reused_turn: registration.reused,
+            shadow_comparison: None,
             ledger: self.ledger.clone(),
             ledger_binding: registration.binding,
             provider_hash,

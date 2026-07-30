@@ -7,9 +7,9 @@ use super::bridge_forensics::{
     EvidenceStage, ForensicTurnCapture,
 };
 use super::claude_codex_bridge::{
-    bridge_scope_matches, streaming::StreamVisibility, BridgeError, ClaudeCodexBridge,
-    CodexOAuthCapabilities, PreparedCodexTurn, SchemaAction, SchemaLoss, SchemaLossReason,
-    TransformAction, TransformDecision,
+    bridge_scope_matches, shadow::ShadowComparisonSession, streaming::StreamVisibility,
+    BridgeError, ClaudeCodexBridge, CodexOAuthCapabilities, PreparedCodexTurn, SchemaAction,
+    SchemaLoss, SchemaLossReason, TransformAction, TransformDecision,
 };
 
 fn bridge_stream_retry_allowed(visibility: StreamVisibility) -> bool {
@@ -58,13 +58,6 @@ struct ClaudeCodexRequestDispatch {
     prepared_turn: Option<PreparedCodexTurn>,
 }
 
-struct ClaudeCodexShadowComparison {
-    registry_identity: String,
-    schema_hash: String,
-    loss_decisions_hash: String,
-    request_structure_matches: bool,
-}
-
 fn claude_codex_bridge_for_mode(provider: &Provider) -> Option<ClaudeCodexBridge> {
     match provider.claude_codex_bridge_mode() {
         ClaudeCodexBridgeMode::Legacy => None,
@@ -72,21 +65,6 @@ fn claude_codex_bridge_for_mode(provider: &Provider) -> Option<ClaudeCodexBridge
             super::claude_codex_bridge::ConversationLedger::default(),
         )),
         ClaudeCodexBridgeMode::Enabled => Some(ClaudeCodexBridge::builtin()),
-    }
-}
-
-fn compare_shadow_turn(
-    prepared: &PreparedCodexTurn,
-    legacy_request: &Value,
-) -> ClaudeCodexShadowComparison {
-    let loss_decisions = serde_json::to_value(&prepared.negotiation_report.schema_losses)
-        .expect("schema loss decisions must serialize");
-    ClaudeCodexShadowComparison {
-        registry_identity: prepared.tool_registry.identity_fingerprint().to_string(),
-        schema_hash: prepared.tool_registry.schema_fingerprint().to_string(),
-        loss_decisions_hash: short_value_hash(Some(&loss_decisions)),
-        request_structure_matches: short_value_hash(Some(&prepared.request))
-            == short_value_hash(Some(legacy_request)),
     }
 }
 
@@ -227,16 +205,23 @@ where
             let legacy_request = legacy_compile(request)?;
             match shadow {
                 Ok(prepared) => {
-                    let comparison = compare_shadow_turn(&prepared, &legacy_request);
+                    let comparison =
+                        ShadowComparisonSession::compare_request(prepared, &legacy_request);
+                    let report = comparison.report();
                     log::debug!(
-                        "[ClaudeCodexBridge] mode=shadow provider={} profile={} registry_identity={} schema_hash={} loss_decisions={} request_match={}",
+                        "[ClaudeCodexBridge] mode=shadow provider={} profile={} registry_identity={} schema_hash={} differences={} unexplained={} request_match={}",
                         provider.id,
-                        prepared.capability_snapshot.profile_version,
-                        comparison.registry_identity,
-                        comparison.schema_hash,
-                        comparison.loss_decisions_hash,
-                        comparison.request_structure_matches
+                        report.request.capability_profile_version,
+                        report.request.registry_identity_hash,
+                        report.request.schema_fingerprint,
+                        report.differences.len(),
+                        report.readiness.unexplained_differences,
+                        report.request.request_structure_matches
                     );
+                    return Ok(ClaudeCodexRequestDispatch {
+                        request: legacy_request,
+                        prepared_turn: comparison.into_prepared_turn(),
+                    });
                 }
                 Err(_) => log::warn!(
                     "[ClaudeCodexBridge] mode=shadow provider={} compile_failed",
@@ -4314,18 +4299,19 @@ mod tests {
             .prepare_turn(&AppType::Claude, claude_request, &provider, None)
             .unwrap();
 
-        let comparison = compare_shadow_turn(&prepared, &legacy);
+        let comparison =
+            ShadowComparisonSession::compare_request(prepared.clone(), &legacy).report();
 
         assert_eq!(
-            comparison.registry_identity,
+            comparison.request.registry_identity_hash,
             prepared.tool_registry.identity_fingerprint()
         );
         assert_eq!(
-            comparison.schema_hash,
+            comparison.request.schema_fingerprint,
             prepared.tool_registry.schema_fingerprint()
         );
-        assert!(!comparison.loss_decisions_hash.is_empty());
-        assert!(!comparison.request_structure_matches);
+        assert!(comparison.request.transform_decision_count > 0);
+        assert!(!comparison.request.request_structure_matches);
     }
 
     #[test]

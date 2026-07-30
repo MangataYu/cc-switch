@@ -432,6 +432,61 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_evidence<
     observe_claude_stream(converted, observer)
 }
 
+pub(crate) fn create_anthropic_sse_stream_from_responses_with_shadow<
+    E: std::error::Error + Send + 'static,
+>(
+    stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+    read_offset_protection: Option<ReadOffsetProtection>,
+    read_trace: Option<ReadTrace>,
+    prepared_turn: PreparedCodexTurn,
+    evidence: Option<ForensicStreamObserver>,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    let comparison = Arc::new(Mutex::new(
+        crate::proxy::claude_codex_bridge::shadow::ShadowComparisonSession::resume(prepared_turn),
+    ));
+    let evidence = Arc::new(Mutex::new(evidence));
+    let stream = observe_upstream_stream(stream, evidence.clone());
+    let upstream_comparison = comparison.clone();
+    let upstream = stream.map(move |result| {
+        if let Ok(bytes) = result.as_ref() {
+            if let Ok(mut comparison) = upstream_comparison.lock() {
+                comparison.observe_stream_chunk(bytes);
+            }
+        }
+        result
+    });
+    let converted = create_anthropic_sse_stream_from_responses_core(
+        upstream,
+        read_offset_protection,
+        read_trace,
+        None,
+        None,
+    );
+    let converted = observe_claude_stream(converted, evidence);
+    async_stream::stream! {
+        tokio::pin!(converted);
+        while let Some(result) = converted.next().await {
+            if let Ok(bytes) = result.as_ref() {
+                if let Ok(mut comparison) = comparison.lock() {
+                    comparison.observe_legacy_stream_chunk(bytes);
+                }
+            }
+            yield result;
+        }
+        if let Ok(mut comparison) = comparison.lock() {
+            comparison.finish_stream();
+            let report = comparison.report();
+            log::debug!(
+                "[ClaudeCodexBridge] mode=shadow stream_differences={} unexplained={} comparison_failures={} bounded={}",
+                report.differences.len(),
+                report.readiness.unexplained_differences,
+                report.readiness.comparison_failures,
+                report.stream.as_ref().is_some_and(|stream| stream.bounded)
+            );
+        }
+    }
+}
+
 pub(crate) fn create_anthropic_sse_stream_from_responses_with_prepared_turn_and_evidence<
     E: std::error::Error + Send + 'static,
 >(
@@ -3314,6 +3369,57 @@ mod tests {
         .into_iter()
         .map(|chunk| String::from_utf8_lossy(chunk.unwrap().as_ref()).to_string())
         .collect()
+    }
+
+    #[tokio::test]
+    async fn shadow_stream_observer_preserves_legacy_bytes_and_uses_one_subscription() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_shadow\",\"model\":\"gpt-5.6\"}}\n\n",
+            "event: response.content_part.added\n",
+            "data: {\"type\":\"response.content_part.added\",\"item_id\":\"msg_1\",\"part\":{\"type\":\"output_text\"}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"sequence_number\":1,\"delta\":\"legacy-visible\"}\n\n",
+            "event: response.output_text.done\n",
+            "data: {\"type\":\"response.output_text.done\",\"item_id\":\"msg_1\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        );
+        let baseline =
+            create_anthropic_sse_stream_from_responses(stream::iter(vec![
+                Ok::<_, std::io::Error>(Bytes::from_static(input.as_bytes())),
+            ]))
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        let subscriptions = Arc::new(AtomicUsize::new(0));
+        let subscription_counter = subscriptions.clone();
+        let upstream = stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::copy_from_slice(&input.as_bytes()[..17])),
+            Ok::<_, std::io::Error>(Bytes::copy_from_slice(&input.as_bytes()[17..])),
+        ])
+        .inspect(move |_| {
+            subscription_counter.fetch_add(1, Ordering::SeqCst);
+        });
+        let observed = create_anthropic_sse_stream_from_responses_with_shadow(
+            upstream,
+            None,
+            None,
+            strict_prepared_turn(),
+            None,
+        )
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+
+        assert_eq!(observed, baseline);
+        assert_eq!(subscriptions.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

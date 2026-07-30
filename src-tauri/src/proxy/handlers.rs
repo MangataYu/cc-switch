@@ -38,6 +38,7 @@ use super::{
             create_anthropic_sse_stream_from_responses_with_prepared_turn,
             create_anthropic_sse_stream_from_responses_with_prepared_turn_and_evidence,
             create_anthropic_sse_stream_from_responses_with_read_offset_protection_and_trace,
+            create_anthropic_sse_stream_from_responses_with_shadow,
         },
         transform, transform_codex_anthropic, transform_codex_chat,
         transform_codex_responses_namespace, transform_gemini, transform_responses,
@@ -386,9 +387,11 @@ fn spawn_claude_usage_log(
 struct ClaudeCodexResponseDispatch {
     response: Value,
     used_prepared_turn: bool,
+    shadow_report: Option<crate::proxy::claude_codex_bridge::shadow::ShadowComparisonReport>,
 }
 
 fn dispatch_claude_codex_response<F>(
+    mode: ClaudeCodexBridgeMode,
     prepared_turn: Option<&PreparedCodexTurn>,
     response: Value,
     read_offset_protection: Option<&crate::proxy::providers::tool_compat::ReadOffsetProtection>,
@@ -398,17 +401,33 @@ fn dispatch_claude_codex_response<F>(
 where
     F: FnOnce(Value) -> Result<Value, ProxyError>,
 {
-    match prepared_turn {
-        Some(prepared_turn) => prepared_turn
+    match (mode, prepared_turn) {
+        (ClaudeCodexBridgeMode::Enabled, Some(prepared_turn)) => prepared_turn
             .consume_response(response, read_offset_protection, read_trace)
             .map(|response| ClaudeCodexResponseDispatch {
                 response,
                 used_prepared_turn: true,
+                shadow_report: None,
             })
             .map_err(|error| error.into_proxy_error()),
-        None => legacy_codec(response).map(|response| ClaudeCodexResponseDispatch {
+        (ClaudeCodexBridgeMode::Shadow, Some(prepared_turn)) => {
+            let upstream = response.clone();
+            let legacy = legacy_codec(response)?;
+            let mut comparison =
+                crate::proxy::claude_codex_bridge::shadow::ShadowComparisonSession::resume(
+                    prepared_turn.clone(),
+                );
+            comparison.compare_non_streaming(&upstream, &legacy);
+            Ok(ClaudeCodexResponseDispatch {
+                response: legacy,
+                used_prepared_turn: false,
+                shadow_report: Some(comparison.report()),
+            })
+        }
+        _ => legacy_codec(response).map(|response| ClaudeCodexResponseDispatch {
             response,
             used_prepared_turn: false,
+            shadow_report: None,
         }),
     }
 }
@@ -469,7 +488,19 @@ async fn handle_claude_transform(
             dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin,
         > = if api_format == "openai_responses" {
             require_prepared_enabled_stream(&ctx.provider, prepared_codex_turn.is_some())?;
-            if let Some(capture) = evidence.take() {
+            if ctx.provider.claude_codex_bridge_mode() == ClaudeCodexBridgeMode::Shadow
+                && prepared_codex_turn.is_some()
+            {
+                Box::new(Box::pin(
+                    create_anthropic_sse_stream_from_responses_with_shadow(
+                        stream,
+                        read_offset_protection.clone(),
+                        read_trace.clone(),
+                        prepared_codex_turn.expect("shadow prepared turn checked"),
+                        evidence.take().map(ForensicStreamObserver::new),
+                    ),
+                ))
+            } else if let Some(capture) = evidence.take() {
                 if let Some(prepared_turn) = prepared_codex_turn {
                     Box::new(Box::pin(
                         create_anthropic_sse_stream_from_responses_with_prepared_turn_and_evidence(
@@ -685,6 +716,7 @@ async fn handle_claude_transform(
     let transform_result = if api_format == "openai_responses" {
         finish_bridge_response_transform(evidence.take(), upstream_response, |upstream_response| {
             dispatch_claude_codex_response(
+                ctx.provider.claude_codex_bridge_mode(),
                 prepared_codex_turn.as_ref(),
                 upstream_response,
                 read_offset_protection.as_ref(),
@@ -705,6 +737,14 @@ async fn handle_claude_transform(
                             .as_ref()
                             .map(|turn| turn.turn_id.as_str())
                             .unwrap_or("missing")
+                    );
+                }
+                if let Some(report) = dispatch.shadow_report.as_ref() {
+                    log::debug!(
+                        "[ClaudeCodexBridge] mode=shadow response_differences={} unexplained={} comparison_failures={}",
+                        report.differences.len(),
+                        report.readiness.unexplained_differences,
+                        report.readiness.comparison_failures
                     );
                 }
                 dispatch.response
@@ -2933,8 +2973,8 @@ mod tests {
     fn claude_codex_bridge_response_dispatch_uses_prepared_turn_when_present() {
         use crate::{
             app_config::AppType,
-            provider::{Provider, ProviderMeta},
-            proxy::claude_codex_bridge::ClaudeCodexBridge,
+            provider::{ClaudeCodexBridgeMode, Provider, ProviderMeta},
+            proxy::claude_codex_bridge::{shadow::ShadowComparisonSession, ClaudeCodexBridge},
         };
         use serde_json::json;
 
@@ -2970,6 +3010,7 @@ mod tests {
             .unwrap();
 
         let enabled = dispatch_claude_codex_response(
+            ClaudeCodexBridgeMode::Enabled,
             Some(&prepared),
             json!({
                 "id": "resp_1",
@@ -2993,6 +3034,7 @@ mod tests {
         assert_eq!(enabled.response["content"][0]["text"], "bridge response");
 
         let legacy = dispatch_claude_codex_response(
+            ClaudeCodexBridgeMode::Legacy,
             None,
             json!({"status": "completed"}),
             None,
@@ -3002,6 +3044,46 @@ mod tests {
         .unwrap();
         assert!(!legacy.used_prepared_turn);
         assert_eq!(legacy.response, json!({"served": "legacy"}));
+
+        let shadow_prepared = ClaudeCodexBridge::with_ledger(Default::default())
+            .prepare_turn(
+                &AppType::Claude,
+                json!({
+                    "model": "gpt-test",
+                    "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "shadow"}]
+                }),
+                &provider,
+                Some("shadow-session"),
+            )
+            .unwrap();
+        let shadow_prepared =
+            ShadowComparisonSession::compare_request(shadow_prepared, &json!({"legacy":"request"}))
+                .into_prepared_turn()
+                .unwrap();
+        let shadow = dispatch_claude_codex_response(
+            ClaudeCodexBridgeMode::Shadow,
+            Some(&shadow_prepared),
+            json!({
+                "id": "resp_shadow",
+                "status": "completed",
+                "model": "gpt-test",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_shadow",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "upstream secret"}]
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
+            }),
+            None,
+            None,
+            |_| Ok(json!({"served":"legacy","content":[]})),
+        )
+        .unwrap();
+        assert!(!shadow.used_prepared_turn);
+        assert_eq!(shadow.response, json!({"served":"legacy","content":[]}));
+        assert!(shadow.shadow_report.is_some());
 
         assert!(ClaudeCodexBridge::builtin()
             .prepare_turn(
