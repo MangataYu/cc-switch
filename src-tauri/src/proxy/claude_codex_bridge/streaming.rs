@@ -720,7 +720,7 @@ impl PreparedCodexStream {
                 buffered.clear();
                 *done = true;
                 *completion_hash = Some(hash);
-                Ok(tool_events(*index, &restored, &raw))
+                Ok(tool_events(*index, &restored))
             }
             CodexResponseEvent::UsageUpdated { usage } => {
                 if usage.input_tokens < self.usage.input_tokens
@@ -839,7 +839,9 @@ impl PreparedCodexStream {
     }
 }
 
-fn tool_events(index: u32, restored: &RestoredToolCall, raw: &str) -> Vec<ClaudeStreamEvent> {
+fn tool_events(index: u32, restored: &RestoredToolCall) -> Vec<ClaudeStreamEvent> {
+    let execution_arguments = serde_json::to_string(&restored.input)
+        .expect("serializing validated tool input cannot fail");
     vec![
         ClaudeStreamEvent::ContentBlockStart {
             index,
@@ -851,7 +853,7 @@ fn tool_events(index: u32, restored: &RestoredToolCall, raw: &str) -> Vec<Claude
         ClaudeStreamEvent::ContentBlockDelta {
             index,
             delta: ClaudeContentDelta::InputJson {
-                partial_json: raw.to_string(),
+                partial_json: execution_arguments,
             },
         },
         ClaudeStreamEvent::ContentBlockStop { index },

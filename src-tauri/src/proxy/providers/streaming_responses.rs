@@ -3148,7 +3148,11 @@ mod tests {
                         "name":"Read",
                         "input_schema":{
                             "type":"object",
-                            "properties":{"file_path":{"type":"string"}},
+                            "properties":{
+                                "file_path":{"type":"string"},
+                                "pages":{"type":"string"},
+                                "offset":{"type":"number"}
+                            },
                             "required":["file_path"],
                             "additionalProperties":false
                         }
@@ -3212,6 +3216,52 @@ mod tests {
         );
         assert!(merged.contains("\"text\":\"hello\""));
         assert!(merged.contains("\"stop_reason\":\"end_turn\""));
+    }
+
+    #[tokio::test]
+    async fn strict_prepared_stream_projects_empty_read_pages_after_validation() {
+        let (_, prepared, _, codex_name) = strict_prepared_tool_turn();
+        let input = [
+            format!(
+                "event: response.created\ndata: {}\n\n",
+                json!({"type":"response.created","response":{"id":"resp_read","model":"gpt-5.6"}})
+            ),
+            format!(
+                "event: response.output_item.added\ndata: {}\n\n",
+                json!({"type":"response.output_item.added","item":{"id":"fc_read","type":"function_call","call_id":"call_read","name":codex_name}})
+            ),
+            format!(
+                "event: response.function_call_arguments.delta\ndata: {}\n\n",
+                json!({"type":"response.function_call_arguments.delta","item_id":"fc_read","sequence_number":1,"delta":"{\"file_path\":\"src/main.rs\",\"offset\":0,\"pages\":\"\"}"})
+            ),
+            format!(
+                "event: response.function_call_arguments.done\ndata: {}\n\n",
+                json!({"type":"response.function_call_arguments.done","item_id":"fc_read"})
+            ),
+            format!(
+                "event: response.completed\ndata: {}\n\n",
+                json!({"type":"response.completed","response":{"status":"completed"}})
+            ),
+        ]
+        .concat();
+
+        let merged = create_anthropic_sse_stream_from_responses_with_prepared_turn(
+            stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(input))]),
+            None,
+            None,
+            prepared,
+        )
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|chunk| String::from_utf8_lossy(chunk.unwrap().as_ref()).to_string())
+        .collect::<String>();
+
+        assert_eq!(merged.matches("\"type\":\"tool_use\"").count(), 1);
+        assert_eq!(merged.matches("partial_json").count(), 1);
+        assert!(!merged.contains("\\\"pages\\\""));
+        assert!(merged.contains("\\\"offset\\\":0"));
+        assert!(!merged.contains("event: error"));
     }
 
     #[tokio::test]
@@ -4047,6 +4097,29 @@ mod tests {
         assert!(converted.contains(
             "\"partial_json\":\"{\\\"file_path\\\":\\\"src/main.rs\\\",\\\"offset\\\":0}\""
         ));
+        assert!(!converted.contains("\\\"pages\\\""));
+        assert!(!converted.contains("tool_registry_violation"));
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_projects_empty_read_pages_from_argument_deltas() {
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-test\"}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"item_1\",\"output_index\":0,\"delta\":\"{\\\"file_path\\\":\\\"src/main.rs\\\",\\\"offset\\\":0,\\\"pages\\\":\\\"\\\"}\"}\n\n",
+            "event: response.function_call_arguments.done\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"item_1\",\"output_index\":0,\"arguments\":\"{\\\"file_path\\\":\\\"src/main.rs\\\",\\\"offset\\\":0,\\\"pages\\\":\\\"\\\"}\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        );
+
+        let converted = convert_stream_with_registry(input).await;
+
+        assert_eq!(converted.matches("\"type\":\"tool_use\"").count(), 1);
+        assert_eq!(converted.matches("partial_json").count(), 1);
         assert!(!converted.contains("\\\"pages\\\""));
         assert!(!converted.contains("tool_registry_violation"));
     }
