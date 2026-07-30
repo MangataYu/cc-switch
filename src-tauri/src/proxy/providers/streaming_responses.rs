@@ -18,7 +18,13 @@ use super::transform_responses::{
     responses_to_anthropic_with_read_offset_protection_and_trace,
 };
 use crate::proxy::bridge_forensics::ForensicStreamObserver;
-use crate::proxy::claude_codex_bridge::{PreparedCodexTurn, ToolRegistry};
+use crate::proxy::claude_codex_bridge::{
+    streaming::{
+        claude_stream_event_kind, decode_codex_response_event, encode_claude_stream_event,
+        ClaudeStreamEvent, CodexResponseEventKind,
+    },
+    BridgeError, PreparedCodexTurn, ToolRegistry,
+};
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
@@ -394,12 +400,12 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_prepared_turn<
     read_trace: Option<ReadTrace>,
     prepared_turn: PreparedCodexTurn,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
-    create_anthropic_sse_stream_from_responses_core(
+    create_strict_anthropic_sse_stream_from_responses(
         stream,
         read_offset_protection,
         read_trace,
-        Some(prepared_turn.tool_registry.clone()),
-        Some(prepared_turn),
+        prepared_turn,
+        Arc::new(Mutex::new(None)),
     )
 }
 
@@ -433,15 +439,197 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_prepared_turn_and_
     evidence: Option<ForensicStreamObserver>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     let observer = Arc::new(Mutex::new(evidence));
-    let upstream = observe_upstream_stream(stream, observer.clone());
-    let converted = create_anthropic_sse_stream_from_responses_core(
-        upstream,
+    create_strict_anthropic_sse_stream_from_responses(
+        stream,
         read_offset_protection,
         read_trace,
-        Some(prepared_turn.tool_registry.clone()),
-        Some(prepared_turn),
+        prepared_turn,
+        observer,
+    )
+}
+
+fn create_strict_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 'static>(
+    stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+    _read_offset_protection: Option<ReadOffsetProtection>,
+    _read_trace: Option<ReadTrace>,
+    prepared_turn: PreparedCodexTurn,
+    observer: SharedForensicObserver,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    async_stream::stream! {
+        let mut machine = prepared_turn.start_stream();
+        let mut buffer = String::new();
+        let mut utf8_remainder = Vec::new();
+        let mut failed = false;
+        let stream = stream
+            .map(|result| (result, false))
+            .chain(futures::stream::once(async {
+                (Ok::<Bytes, E>(Bytes::new()), true)
+            }));
+        tokio::pin!(stream);
+
+        'upstream: while let Some((chunk, is_eof)) = stream.next().await {
+            let bytes = match chunk {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    let error = BridgeError::IncompleteStream {
+                        summary: "upstream byte stream failed before terminal response".to_string(),
+                    };
+                    mark_observer_stream_error(&observer);
+                    yield Ok(strict_error_sse(&error));
+                    failed = true;
+                    break;
+                }
+            };
+            crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
+            if is_eof && !utf8_remainder.is_empty() {
+                let error = BridgeError::IncompleteStream {
+                    summary: "stream ended inside a UTF-8 scalar".to_string(),
+                };
+                mark_observer_stream_error(&observer);
+                yield Ok(strict_error_sse(&error));
+                failed = true;
+                break;
+            }
+            if is_eof && !buffer.trim().is_empty() {
+                buffer.push_str("\n\n");
+            }
+
+            while let Some(block) = take_sse_block(&mut buffer) {
+                if block.trim().is_empty() {
+                    continue;
+                }
+                let (named_event, data) = match strict_sse_payload(&block) {
+                    Ok(Some(value)) => value,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        mark_observer_stream_error(&observer);
+                        yield Ok(strict_error_sse(&error));
+                        failed = true;
+                        break 'upstream;
+                    }
+                };
+                let decoded = match decode_codex_response_event(named_event.as_deref(), data) {
+                    Ok(decoded) => decoded,
+                    Err(error) => {
+                        mark_observer_stream_error(&observer);
+                        yield Ok(strict_error_sse(&error));
+                        failed = true;
+                        break 'upstream;
+                    }
+                };
+                for event in decoded {
+                    observe_strict_upstream_event(&observer, event.kind());
+                    let claude_events = match machine.apply(event) {
+                        Ok(events) => events,
+                        Err(error) => {
+                            mark_observer_stream_error(&observer);
+                            yield Ok(strict_error_sse(&error));
+                            failed = true;
+                            break 'upstream;
+                        }
+                    };
+                    for claude_event in claude_events {
+                        observe_strict_claude_event(&observer, &claude_event);
+                        yield Ok(encode_claude_stream_event(&claude_event));
+                        if let Err(error) = machine.acknowledge_emitted(&claude_event) {
+                            mark_observer_stream_error(&observer);
+                            yield Ok(strict_error_sse(&error));
+                            failed = true;
+                            break 'upstream;
+                        }
+                    }
+                }
+            }
+            if is_eof {
+                break;
+            }
+        }
+
+        if !failed {
+            if let Err(error) = machine.finish() {
+                mark_observer_stream_error(&observer);
+                yield Ok(strict_error_sse(&error));
+                failed = true;
+            }
+        }
+        finish_strict_observer(&observer, failed);
+    }
+}
+
+fn strict_sse_payload(block: &str) -> Result<Option<(Option<String>, Value)>, BridgeError> {
+    let mut event_name = None;
+    let mut data_parts = Vec::new();
+    for line in block.lines() {
+        if let Some(value) = strip_sse_field(line, "event") {
+            event_name = Some(value.trim().to_string());
+        } else if let Some(value) = strip_sse_field(line, "data") {
+            data_parts.push(value.to_string());
+        }
+    }
+    if data_parts.is_empty() {
+        return Ok(None);
+    }
+    let data = data_parts.join("\n");
+    if data.trim() == "[DONE]" {
+        return Err(BridgeError::IncompleteStream {
+            summary: "legacy DONE marker cannot replace a terminal Responses event".to_string(),
+        });
+    }
+    let payload = serde_json::from_str(&data).map_err(|_| BridgeError::InvalidUpstreamEvent {
+        event_kind: "malformed_json".to_string(),
+        summary: "SSE data is not valid JSON".to_string(),
+    })?;
+    Ok(Some((event_name, payload)))
+}
+
+fn strict_error_sse(error: &BridgeError) -> Bytes {
+    let error_type = match error {
+        BridgeError::ToolRegistryViolation { .. } => "tool_registry_violation",
+        BridgeError::ConversationStateConflict { .. } => "conversation_state_conflict",
+        BridgeError::IncompleteStream { .. } => "incomplete_stream",
+        _ => "invalid_upstream_event",
+    };
+    encode_claude_stream_event(&ClaudeStreamEvent::Error {
+        error_type: error_type.to_string(),
+        safe_message: error.to_string(),
+    })
+}
+
+fn observe_strict_upstream_event(observer: &SharedForensicObserver, kind: CodexResponseEventKind) {
+    let event_type = match kind {
+        CodexResponseEventKind::ResponseCompleted => "response.completed",
+        CodexResponseEventKind::ResponseFailed => "response.failed",
+        _ => "typed_response_event",
+    };
+    offer_observer_event(
+        observer,
+        &json!({"type":event_type,"event_kind":kind}),
+        true,
     );
-    observe_claude_stream(converted, observer)
+}
+
+fn observe_strict_claude_event(observer: &SharedForensicObserver, event: &ClaudeStreamEvent) {
+    offer_observer_event(
+        observer,
+        &json!({"type":claude_stream_event_kind(event)}),
+        false,
+    );
+}
+
+fn finish_strict_observer(observer: &SharedForensicObserver, failed: bool) {
+    let evidence = observer.lock().ok().and_then(|mut guard| guard.take());
+    if let Some(evidence) = evidence {
+        match evidence.finish(failed.then_some("typed stream validation failed")) {
+            Ok(Some(bundle)) => log::error!(
+                "[BridgeEvidence] bundle_id={} stage=stream_transform summary=typed_stream_failed",
+                bundle.bundle_id.0
+            ),
+            Ok(None) => {}
+            Err(error) => {
+                log::warn!("[BridgeEvidence] capture_failed stage=stream_transform error={error}")
+            }
+        }
+    }
 }
 
 fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send + 'static>(
@@ -2667,6 +2855,135 @@ mod tests {
             bridge.ledger().call_state(&binding, "call-1"),
             Some(ToolCallState::ReturnedToClaude)
         );
+    }
+
+    fn strict_prepared_turn() -> PreparedCodexTurn {
+        let provider = Provider {
+            id: "strict-adapter".to_string(),
+            name: "Strict Adapter".to_string(),
+            settings_config: json!({}),
+            website_url: None,
+            category: Some("claude".to_string()),
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: Some(ProviderMeta {
+                provider_type: Some("codex_oauth".to_string()),
+                api_format: Some("openai_responses".to_string()),
+                ..ProviderMeta::default()
+            }),
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        };
+        ClaudeCodexBridge::with_ledger(ConversationLedger::default())
+            .prepare_turn(
+                &AppType::Claude,
+                json!({
+                    "model":"gpt-5.6",
+                    "max_tokens":64,
+                    "messages":[{"role":"user","content":"strict fixture"}]
+                }),
+                &provider,
+                Some("strict-adapter-session"),
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn strict_streaming_responses_emits_only_validated_claude_shape() {
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.6\",\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\"}}\n\n",
+            "event: response.content_part.added\n",
+            "data: {\"type\":\"response.content_part.added\",\"item_id\":\"msg_1\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"sequence_number\":4,\"delta\":\"hello\"}\n\n",
+            "event: response.output_text.done\n",
+            "data: {\"type\":\"response.output_text.done\",\"item_id\":\"msg_1\",\"text\":\"hello\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\n"
+        );
+        let merged = create_anthropic_sse_stream_from_responses_with_prepared_turn(
+            stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(input))]),
+            None,
+            None,
+            strict_prepared_turn(),
+        )
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|chunk| String::from_utf8_lossy(chunk.unwrap().as_ref()).to_string())
+        .collect::<String>();
+
+        let event_names = merged
+            .split("\n\n")
+            .filter_map(|block| block.lines().find_map(|line| line.strip_prefix("event: ")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            event_names,
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop"
+            ]
+        );
+        assert!(merged.contains("\"text\":\"hello\""));
+        assert!(merged.contains("\"stop_reason\":\"end_turn\""));
+    }
+
+    #[tokio::test]
+    async fn strict_streaming_responses_fails_closed_for_unknown_or_incomplete_stream() {
+        for input in [
+            concat!(
+                "event: response.created\n",
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.6\"}}\n\n",
+                "event: response.future_semantic.delta\n",
+                "data: {\"type\":\"response.future_semantic.delta\",\"delta\":\"secret-sentinel\"}\n\n",
+                "event: response.output_item.added\n",
+                "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"msg_1\",\"type\":\"message\"}}\n\n",
+                "event: response.content_part.added\n",
+                "data: {\"type\":\"response.content_part.added\",\"item_id\":\"msg_1\",\"part\":{\"type\":\"output_text\"}}\n\n",
+                "event: response.output_text.delta\n",
+                "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"delta\":\"late\"}\n\n",
+                "event: response.output_text.done\n",
+                "data: {\"type\":\"response.output_text.done\",\"item_id\":\"msg_1\"}\n\n",
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+            ),
+            concat!(
+                "event: response.created\n",
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.6\"}}\n\n"
+            ),
+            concat!(
+                "event: response.output_text.delta\n",
+                "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"delta\":\"no start\"}\n\n",
+                "event: response.output_text.done\n",
+                "data: {\"type\":\"response.output_text.done\",\"item_id\":\"msg_1\"}\n\n",
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+            ),
+        ] {
+            let merged = create_anthropic_sse_stream_from_responses_with_prepared_turn(
+                stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(input))]),
+                None,
+                None,
+                strict_prepared_turn(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|chunk| String::from_utf8_lossy(chunk.unwrap().as_ref()).to_string())
+            .collect::<String>();
+            assert!(merged.contains("event: error"));
+            assert!(!merged.contains("secret-sentinel"));
+            assert!(!merged.contains("event: message_stop"));
+        }
     }
 
     fn evidence_capture(

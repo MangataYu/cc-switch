@@ -12,7 +12,7 @@ use super::{
         EvidenceArtifactKind, EvidenceError, EvidenceErrorKind, EvidenceStage,
         ForensicStreamObserver, ForensicTurnCapture,
     },
-    claude_codex_bridge::PreparedCodexTurn,
+    claude_codex_bridge::{bridge_scope_matches, PreparedCodexTurn},
     content_encoding::{decompress_body, get_content_encoding, is_supported_content_encoding},
     error_mapper::{get_error_message, map_proxy_error_to_status},
     forwarder::ActiveConnectionGuard,
@@ -55,6 +55,7 @@ use super::{
 };
 use crate::app_config::AppType;
 use crate::database::PRICING_SOURCE_REQUEST;
+use crate::provider::{ClaudeCodexBridgeMode, Provider};
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use bytes::Bytes;
 use http_body_util::BodyExt;
@@ -467,6 +468,7 @@ async fn handle_claude_transform(
         let sse_stream: Box<
             dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin,
         > = if api_format == "openai_responses" {
+            require_prepared_enabled_stream(&ctx.provider, prepared_codex_turn.is_some())?;
             if let Some(capture) = evidence.take() {
                 if let Some(prepared_turn) = prepared_codex_turn {
                     Box::new(Box::pin(
@@ -777,6 +779,21 @@ async fn handle_claude_transform(
         log::error!("[Claude] 构建响应失败: {e}");
         ProxyError::Internal(format!("Failed to build response: {e}"))
     })
+}
+
+fn require_prepared_enabled_stream(
+    provider: &Provider,
+    has_prepared_turn: bool,
+) -> Result<(), ProxyError> {
+    if provider.claude_codex_bridge_mode() == ClaudeCodexBridgeMode::Enabled
+        && bridge_scope_matches(&AppType::Claude, provider)
+        && !has_prepared_turn
+    {
+        return Err(ProxyError::TransformError(
+            "enabled Claude Codex Responses stream requires its prepared turn".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn finish_bridge_response_transform<F>(
@@ -2869,10 +2886,47 @@ mod tests {
     use super::{
         body_looks_like_sse, chat_sse_to_response_value, classify_body_for_diagnostics,
         codex_proxy_error_json, dispatch_claude_codex_response, finish_bridge_response_transform,
-        response_transform_evidence_kind, responses_sse_to_response_value,
-        should_use_claude_transform_streaming, transform, upstream_body_parse_error,
+        require_prepared_enabled_stream, response_transform_evidence_kind,
+        responses_sse_to_response_value, should_use_claude_transform_streaming, transform,
+        upstream_body_parse_error,
     };
     use crate::proxy::ProxyError;
+
+    #[test]
+    fn strict_streaming_responses_enabled_scope_cannot_bypass_prepared_turn() {
+        use crate::provider::{ClaudeCodexBridgeMode, Provider, ProviderMeta};
+        use serde_json::json;
+
+        let provider = Provider {
+            id: "bridge-enabled".to_string(),
+            name: "Bridge Enabled".to_string(),
+            settings_config: json!({}),
+            website_url: None,
+            category: Some("claude".to_string()),
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: Some(ProviderMeta {
+                provider_type: Some("codex_oauth".to_string()),
+                api_format: Some("openai_responses".to_string()),
+                bridge_mode: Some(ClaudeCodexBridgeMode::Enabled),
+                ..ProviderMeta::default()
+            }),
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        };
+
+        assert!(require_prepared_enabled_stream(&provider, true).is_ok());
+        assert!(matches!(
+            require_prepared_enabled_stream(&provider, false),
+            Err(ProxyError::TransformError(_))
+        ));
+
+        let mut legacy = provider.clone();
+        legacy.meta.as_mut().unwrap().bridge_mode = Some(ClaudeCodexBridgeMode::Legacy);
+        assert!(require_prepared_enabled_stream(&legacy, false).is_ok());
+    }
 
     #[test]
     fn claude_codex_bridge_response_dispatch_uses_prepared_turn_when_present() {

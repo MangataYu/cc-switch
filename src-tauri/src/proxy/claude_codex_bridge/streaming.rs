@@ -4,6 +4,7 @@ use crate::proxy::providers::{
     reasoning_bridge::anthropic_block_from_openai_reasoning_item,
     transform_responses::map_responses_stop_reason,
 };
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json::Value;
@@ -164,6 +165,102 @@ pub enum ClaudeStreamEvent {
     },
 }
 
+pub fn encode_claude_stream_event(event: &ClaudeStreamEvent) -> Bytes {
+    let (event_name, payload) = match event {
+        ClaudeStreamEvent::MessageStart { id, model, usage } => (
+            "message_start",
+            json!({
+                "type":"message_start",
+                "message":{
+                    "id":id,
+                    "type":"message",
+                    "role":"assistant",
+                    "model":model,
+                    "usage":claude_usage_json(usage)
+                }
+            }),
+        ),
+        ClaudeStreamEvent::ContentBlockStart { index, block } => {
+            let content_block = match block {
+                ClaudeContentBlock::Text => json!({"type":"text","text":""}),
+                ClaudeContentBlock::Thinking => json!({"type":"thinking","thinking":""}),
+                ClaudeContentBlock::ToolUse { id, name } => {
+                    json!({"type":"tool_use","id":id,"name":name,"input":{}})
+                }
+            };
+            (
+                "content_block_start",
+                json!({"type":"content_block_start","index":index,"content_block":content_block}),
+            )
+        }
+        ClaudeStreamEvent::ContentBlockDelta { index, delta } => {
+            let delta = match delta {
+                ClaudeContentDelta::Text { text } => json!({"type":"text_delta","text":text}),
+                ClaudeContentDelta::Thinking { text } => {
+                    json!({"type":"thinking_delta","thinking":text})
+                }
+                ClaudeContentDelta::Signature { signature } => {
+                    json!({"type":"signature_delta","signature":signature})
+                }
+                ClaudeContentDelta::InputJson { partial_json } => {
+                    json!({"type":"input_json_delta","partial_json":partial_json})
+                }
+            };
+            (
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":index,"delta":delta}),
+            )
+        }
+        ClaudeStreamEvent::ContentBlockStop { index } => (
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":index}),
+        ),
+        ClaudeStreamEvent::MessageDelta { stop_reason, usage } => (
+            "message_delta",
+            json!({
+                "type":"message_delta",
+                "delta":{"stop_reason":stop_reason,"stop_sequence":null},
+                "usage":claude_usage_json(usage)
+            }),
+        ),
+        ClaudeStreamEvent::MessageStop => ("message_stop", json!({"type":"message_stop"})),
+        ClaudeStreamEvent::Error {
+            error_type,
+            safe_message,
+        } => (
+            "error",
+            json!({"type":"error","error":{"type":error_type,"message":safe_message}}),
+        ),
+    };
+    Bytes::from(format!(
+        "event: {event_name}\ndata: {}\n\n",
+        serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
+    ))
+}
+
+pub fn claude_stream_event_kind(event: &ClaudeStreamEvent) -> &'static str {
+    match event {
+        ClaudeStreamEvent::MessageStart { .. } => "message_start",
+        ClaudeStreamEvent::ContentBlockStart { .. } => "content_block_start",
+        ClaudeStreamEvent::ContentBlockDelta { .. } => "content_block_delta",
+        ClaudeStreamEvent::ContentBlockStop { .. } => "content_block_stop",
+        ClaudeStreamEvent::MessageDelta { .. } => "message_delta",
+        ClaudeStreamEvent::MessageStop => "message_stop",
+        ClaudeStreamEvent::Error { .. } => "error",
+    }
+}
+
+fn claude_usage_json(usage: &ClaudeUsage) -> Value {
+    let mut value = json!({
+        "input_tokens":usage.input_tokens,
+        "output_tokens":usage.output_tokens
+    });
+    if usage.cache_read_input_tokens > 0 {
+        value["cache_read_input_tokens"] = json!(usage.cache_read_input_tokens);
+    }
+    value
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamVisibility {
     pub output_emitted: bool,
@@ -216,9 +313,9 @@ enum StreamItem {
 impl StreamItem {
     fn is_done(&self) -> bool {
         match self {
-            Self::Text { done, .. }
-            | Self::Reasoning { done, .. }
-            | Self::Tool { done, .. } => *done,
+            Self::Text { done, .. } | Self::Reasoning { done, .. } | Self::Tool { done, .. } => {
+                *done
+            }
         }
     }
 }
@@ -269,22 +366,36 @@ impl PreparedCodexStream {
                 if existing == &event_hash {
                     return Ok(Vec::new());
                 }
-                return Err(invalid("duplicate_delta", "delta sequence content conflicts"));
+                return Err(invalid(
+                    "duplicate_delta",
+                    "delta sequence content conflicts",
+                ));
             }
             self.seen_delta_sequences
                 .insert(sequence, event_hash.clone());
         }
-        if matches!(self.state, StreamTerminalState::Completed | StreamTerminalState::Failed) {
-            if matches!(kind, CodexResponseEventKind::ResponseCompleted | CodexResponseEventKind::ResponseFailed)
-                && self.terminal_hash.as_deref() == Some(event_hash.as_str())
+        if matches!(
+            self.state,
+            StreamTerminalState::Completed | StreamTerminalState::Failed
+        ) {
+            if matches!(
+                kind,
+                CodexResponseEventKind::ResponseCompleted | CodexResponseEventKind::ResponseFailed
+            ) && self.terminal_hash.as_deref() == Some(event_hash.as_str())
             {
                 return Ok(Vec::new());
             }
-            return Err(invalid("terminal", "semantic event arrived after terminal response"));
+            return Err(invalid(
+                "terminal",
+                "semantic event arrived after terminal response",
+            ));
         }
 
         let output = self.apply_non_terminal(event)?;
-        if matches!(self.state, StreamTerminalState::Completed | StreamTerminalState::Failed) {
+        if matches!(
+            self.state,
+            StreamTerminalState::Completed | StreamTerminalState::Failed
+        ) {
             self.terminal_hash = Some(event_hash);
         }
         self.event_sequence = self.event_sequence.saturating_add(1);
@@ -308,7 +419,10 @@ impl PreparedCodexStream {
         if self.state == StreamTerminalState::AwaitingResponse
             && !matches!(event, CodexResponseEvent::ResponseStarted { .. })
         {
-            return Err(invalid("response", "stream must begin with response.started"));
+            return Err(invalid(
+                "response",
+                "stream must begin with response.started",
+            ));
         }
         match event {
             CodexResponseEvent::ResponseStarted {
@@ -317,7 +431,10 @@ impl PreparedCodexStream {
                 usage,
             } => {
                 if self.state != StreamTerminalState::AwaitingResponse {
-                    return Err(invalid("response_started", "response started more than once"));
+                    return Err(invalid(
+                        "response_started",
+                        "response started more than once",
+                    ));
                 }
                 if let Some(usage) = usage {
                     self.usage = usage;
@@ -337,7 +454,8 @@ impl PreparedCodexStream {
                     };
                 }
                 let index = self.allocate_index();
-                self.items.insert(item_id, StreamItem::Text { index, done: false });
+                self.items
+                    .insert(item_id, StreamItem::Text { index, done: false });
                 Ok(vec![ClaudeStreamEvent::ContentBlockStart {
                     index,
                     block: ClaudeContentBlock::Text,
@@ -352,7 +470,10 @@ impl PreparedCodexStream {
                     return Err(invalid("item_type", "item changed semantic type"));
                 };
                 if *done {
-                    return Err(invalid("text_delta", "text delta arrived after text completion"));
+                    return Err(invalid(
+                        "text_delta",
+                        "text delta arrived after text completion",
+                    ));
                 }
                 Ok(vec![ClaudeStreamEvent::ContentBlockDelta {
                     index: *index,
@@ -455,7 +576,12 @@ impl PreparedCodexStream {
                     "encrypted_content":encrypted_content
                 });
                 let signature = anthropic_block_from_openai_reasoning_item(&reasoning_item)
-                    .and_then(|block| block.get("signature").and_then(Value::as_str).map(str::to_string));
+                    .and_then(|block| {
+                        block
+                            .get("signature")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    });
                 text.clear();
                 *done = true;
                 *completion_hash = Some(hash);
@@ -481,14 +607,17 @@ impl PreparedCodexStream {
                             call_id: existing_id,
                             codex_name: existing_name,
                             ..
-                        } if existing_id == &call_id && existing_name == &codex_name => Ok(Vec::new()),
+                        } if existing_id == &call_id && existing_name == &codex_name => {
+                            Ok(Vec::new())
+                        }
                         StreamItem::Tool { .. } => {
                             Err(invalid("tool_identity", "tool item identity conflicts"))
                         }
                         _ => Err(invalid("item_type", "item changed semantic type")),
                     };
                 }
-                self.turn.declare_streamed_tool_call(&codex_name, &call_id.0)?;
+                self.turn
+                    .declare_streamed_tool_call(&codex_name, &call_id.0)?;
                 let index = self.allocate_index();
                 self.items.insert(
                     item_id,
@@ -561,7 +690,10 @@ impl PreparedCodexStream {
                     return Err(invalid("tool_identity", "call identity conflicts"));
                 }
                 let complete = arguments.clone().unwrap_or_else(|| buffered.clone());
-                if arguments.as_ref().is_some_and(|value| !buffered.is_empty() && value != buffered) {
+                if arguments
+                    .as_ref()
+                    .is_some_and(|value| !buffered.is_empty() && value != buffered)
+                {
                     return Err(invalid(
                         "tool_call_done",
                         "completed tool arguments conflict with streamed bytes",
@@ -582,9 +714,9 @@ impl PreparedCodexStream {
                 let raw = std::str::from_utf8(&complete)
                     .map_err(|_| invalid("tool_call_done", "tool arguments are not valid UTF-8"))?
                     .to_string();
-                let restored = self
-                    .turn
-                    .complete_streamed_tool_call(codex_name, &expected.0, &raw)?;
+                let restored =
+                    self.turn
+                        .complete_streamed_tool_call(codex_name, &expected.0, &raw)?;
                 buffered.clear();
                 *done = true;
                 *completion_hash = Some(hash);
@@ -609,13 +741,10 @@ impl PreparedCodexStream {
                         "terminal response has unfinished output items",
                     ));
                 }
-                let mapped = map_responses_stop_reason(
-                    Some(&status),
-                    self.has_tool,
-                    stop_reason.as_deref(),
-                )
-                .unwrap_or("end_turn")
-                .to_string();
+                let mapped =
+                    map_responses_stop_reason(Some(&status), self.has_tool, stop_reason.as_deref())
+                        .unwrap_or("end_turn")
+                        .to_string();
                 self.state = StreamTerminalState::Completed;
                 Ok(vec![
                     ClaudeStreamEvent::MessageDelta {
@@ -638,10 +767,7 @@ impl PreparedCodexStream {
         }
     }
 
-    pub fn acknowledge_emitted(
-        &mut self,
-        event: &ClaudeStreamEvent,
-    ) -> Result<(), BridgeError> {
+    pub fn acknowledge_emitted(&mut self, event: &ClaudeStreamEvent) -> Result<(), BridgeError> {
         if matches!(
             event,
             ClaudeStreamEvent::MessageStart { .. }
@@ -650,6 +776,7 @@ impl PreparedCodexStream {
                 | ClaudeStreamEvent::ContentBlockStop { .. }
                 | ClaudeStreamEvent::MessageDelta { .. }
                 | ClaudeStreamEvent::MessageStop
+                | ClaudeStreamEvent::Error { .. }
         ) {
             self.visibility.output_emitted = true;
         }
@@ -676,7 +803,10 @@ impl PreparedCodexStream {
     }
 
     pub fn finish(&self) -> Result<StreamTerminalState, BridgeError> {
-        if matches!(self.state, StreamTerminalState::Completed | StreamTerminalState::Failed) {
+        if matches!(
+            self.state,
+            StreamTerminalState::Completed | StreamTerminalState::Failed
+        ) {
             Ok(self.state)
         } else {
             Err(BridgeError::IncompleteStream {
@@ -1275,7 +1405,10 @@ mod tests {
     fn strict_stream_state_validates_text_and_terminal_lifecycle() {
         let mut stream = prepared_turn().start_stream();
         let started = stream.apply(start_event()).unwrap();
-        assert!(matches!(started.as_slice(), [ClaudeStreamEvent::MessageStart { .. }]));
+        assert!(matches!(
+            started.as_slice(),
+            [ClaudeStreamEvent::MessageStart { .. }]
+        ));
         acknowledge_all(&mut stream, &started);
 
         let item = ItemId("msg_1".to_string());
@@ -1321,7 +1454,10 @@ mod tests {
             stop_reason: None,
         };
         let terminal = stream.apply(completed.clone()).unwrap();
-        assert!(matches!(terminal.last(), Some(ClaudeStreamEvent::MessageStop)));
+        assert!(matches!(
+            terminal.last(),
+            Some(ClaudeStreamEvent::MessageStop)
+        ));
         acknowledge_all(&mut stream, &terminal);
         assert!(stream.apply(completed).unwrap().is_empty());
         assert_eq!(stream.finish().unwrap(), StreamTerminalState::Completed);
