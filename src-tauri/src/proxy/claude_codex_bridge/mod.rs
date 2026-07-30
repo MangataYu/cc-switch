@@ -23,7 +23,7 @@ use crate::{
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, OnceLock},
 };
 
@@ -44,6 +44,7 @@ pub struct PreparedCodexTurn {
     pub negotiation_report: NegotiationReport,
     pub reused_turn: bool,
     pub(crate) shadow_comparison: Option<shadow::ShadowComparisonReport>,
+    pub(crate) shadow_upstream_tool_aliases: BTreeMap<String, String>,
     ledger: ConversationLedger,
     ledger_binding: TurnBinding,
     provider_hash: String,
@@ -221,6 +222,7 @@ impl ClaudeCodexBridge {
             negotiation_report,
             reused_turn: registration.reused,
             shadow_comparison: None,
+            shadow_upstream_tool_aliases: BTreeMap::new(),
             ledger: self.ledger.clone(),
             ledger_binding: registration.binding,
             provider_hash,

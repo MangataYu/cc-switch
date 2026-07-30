@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -278,6 +278,7 @@ pub struct ShadowComparisonSession {
 #[derive(Debug)]
 struct ShadowStreamObservation {
     machine: PreparedCodexStream,
+    upstream_tool_aliases: BTreeMap<String, String>,
     buffer: String,
     utf8_remainder: Vec<u8>,
     bridge: ShadowStreamAccumulator,
@@ -368,6 +369,8 @@ impl ShadowComparisonSession {
             differences,
             readiness,
         };
+        prepared.shadow_upstream_tool_aliases =
+            collect_shadow_upstream_tool_aliases(&prepared, legacy);
         prepared.shadow_comparison = Some(report.clone());
         Self {
             prepared: Some(prepared),
@@ -508,8 +511,10 @@ impl ShadowComparisonSession {
                 self.fail_open(ShadowReasonCode::InternalComparisonFailure);
                 return;
             };
+            let upstream_tool_aliases = prepared.shadow_upstream_tool_aliases.clone();
             self.stream_observation = Some(ShadowStreamObservation {
                 machine: prepared.start_stream(),
+                upstream_tool_aliases,
                 buffer: String::new(),
                 utf8_remainder: Vec::new(),
                 bridge: ShadowStreamAccumulator::default(),
@@ -533,10 +538,15 @@ impl ShadowComparisonSession {
         );
         let mut failed = false;
         while let Some(block) = crate::proxy::sse::take_sse_block(&mut observation.buffer) {
-            let (event_name, payload) = match parse_sse_block(&block) {
+            let (event_name, mut payload) = match parse_sse_block(&block) {
                 Some(parsed) => parsed,
                 None => continue,
             };
+            reproject_shadow_tool_identity(
+                event_name.as_deref(),
+                &mut payload,
+                &observation.upstream_tool_aliases,
+            );
             let events = match decode_codex_response_event(event_name.as_deref(), payload) {
                 Ok(events) => events,
                 Err(_) => {
@@ -752,6 +762,55 @@ enum ShadowEventClass {
     Reasoning,
     Tool,
     Other,
+}
+
+fn collect_shadow_upstream_tool_aliases(
+    prepared: &PreparedCodexTurn,
+    legacy_request: &Value,
+) -> BTreeMap<String, String> {
+    let legacy_names = legacy_request
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+    prepared
+        .tool_registry
+        .bindings()
+        .iter()
+        .filter(|binding| {
+            binding.claude_name != binding.codex_name
+                && legacy_names.contains(binding.claude_name.as_str())
+        })
+        .map(|binding| (binding.claude_name.clone(), binding.codex_name.clone()))
+        .collect()
+}
+
+fn reproject_shadow_tool_identity(
+    event_name: Option<&str>,
+    payload: &mut Value,
+    aliases: &BTreeMap<String, String>,
+) {
+    let event_name = event_name
+        .filter(|name| !name.is_empty())
+        .or_else(|| payload.get("type").and_then(Value::as_str));
+    let name = match event_name {
+        Some("response.output_item.added" | "response.output_item.done") => {
+            payload.pointer_mut("/item/name")
+        }
+        Some(
+            "response.function_call_arguments.delta" | "response.function_call_arguments.done",
+        ) => payload.get_mut("name"),
+        _ => None,
+    };
+    let Some(name) = name else {
+        return;
+    };
+    let Some(alias) = name.as_str().and_then(|name| aliases.get(name)) else {
+        return;
+    };
+    *name = Value::String(alias.clone());
 }
 
 fn parse_sse_block(block: &str) -> Option<(Option<String>, Value)> {
@@ -1215,6 +1274,78 @@ mod tests {
             ShadowReasonCode::IncompleteShadowObservation
         );
         assert_eq!(report.readiness.comparison_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn shadow_tool_stream_reprojects_legacy_tool_name_before_strict_observation() {
+        use bytes::Bytes;
+        use futures::{stream, StreamExt};
+
+        let original = request("fixture");
+        let bridge = ClaudeCodexBridge::with_ledger(ConversationLedger::default());
+        let prepared = bridge
+            .prepare_turn(
+                &AppType::Claude,
+                original.clone(),
+                &provider(),
+                Some("shadow-legacy-tool-name"),
+            )
+            .unwrap();
+        let cache_key = prepared.request["prompt_cache_key"]
+            .as_str()
+            .expect("prepared request cache key")
+            .to_string();
+        let legacy_request = crate::proxy::providers::transform_responses::anthropic_to_responses(
+            original,
+            Some(&cache_key),
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(legacy_request["tools"][0]["name"], "Read");
+        assert_eq!(prepared.request["tools"][0]["name"], "read_file");
+
+        let upstream = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_tool\",\"model\":\"gpt-5.6\"}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"Read\",\"status\":\"in_progress\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"output_index\":0,\"delta\":\"{\\\"file_path\\\":\\\"fixture.txt\\\"}\",\"sequence_number\":1}\n\n",
+            "event: response.function_call_arguments.done\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_1\",\"output_index\":0,\"name\":\"Read\",\"arguments\":\"{\\\"file_path\\\":\\\"fixture.txt\\\"}\",\"sequence_number\":2}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"Read\",\"arguments\":\"{\\\"file_path\\\":\\\"fixture.txt\\\"}\",\"status\":\"completed\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}}\n\n"
+        );
+        let legacy_chunks =
+            crate::proxy::providers::streaming_responses::create_anthropic_sse_stream_from_responses(
+                stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(
+                    upstream.as_bytes(),
+                ))]),
+            )
+            .collect::<Vec<_>>()
+            .await;
+        let mut session = ShadowComparisonSession::compare_request(prepared, &legacy_request);
+
+        session.observe_stream_chunk(upstream.as_bytes());
+        for chunk in legacy_chunks {
+            session.observe_legacy_stream_chunk(&chunk.unwrap());
+        }
+        session.finish_stream();
+
+        let report = session.report();
+        assert_eq!(report.readiness.comparison_failures, 0);
+        assert_eq!(report.readiness.unexplained_differences, 0);
+        assert!(report.stream.as_ref().is_some_and(|stream| {
+            stream.bounded && stream.shape_matches && stream.legacy.tool_events == 2
+        }));
+        assert!(report.state.tool_visible);
+        let encoded = serde_json::to_string(&report).unwrap();
+        for secret in ["fixture.txt", "call_1", "Read", "read_file"] {
+            assert!(!encoded.contains(secret));
+        }
     }
 
     #[test]
