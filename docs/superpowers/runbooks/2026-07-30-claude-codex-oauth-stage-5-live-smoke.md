@@ -1,6 +1,16 @@
 # Claude Code Codex OAuth Stage 5 Live Smoke Runbook
 
-**Status:** Failed on 2026-07-30 with blocker `FixtureCoverageIncomplete`; rollout remains blocked. All required `shadow` tool fixtures now pass, including Claude Code filesystem Write/Edit, Bash, and parallel Glob/Grep. The first `enabled` Read call closed with a tool-result error, so later `enabled` fixtures were not run. Optional MCP/Task remain unverified.
+**Status:** Failed on 2026-07-30 with blocker `FixtureCoverageIncomplete`; rollout remains blocked. All required `shadow` tool fixtures pass. The strict schema blocker found while rerunning `enabled` with the current Claude Code tool directory is fixed and the full directory now completes enabled requests, but two post-fix Claude Code attempts emitted no visible Read call. The required enabled Read closure and later enabled fixtures therefore remain unverified. Optional MCP/Task remain unverified.
+
+## 2026-07-30 current Claude Code schema compatibility fix
+
+- Fail-closed live signal: before any tool became visible, a fresh isolated `enabled` Claude Code Read fixture returned the safe reason code `schema_adaptation_loss`. No visible tool was executed or retried, and all credential hashes remained unchanged.
+- Offline structural diagnosis: the current Claude Code request advertised the complete built-in tool directory even when execution permission was restricted to Read. Read's own schema contained no unsupported keyword. Across the full directory, three tool schemas used previously unsupported strict-schema features: two `propertyNames` occurrences and one `format: uri` occurrence. Only keyword enums and counts were retained; raw requests, schemas, prompts, tool arguments, and results were deleted.
+- TDD evidence: focused tests first failed because the strict adapter rejected `propertyNames` and `format`. The minimal implementation then passed 3/3 focused tests. `propertyNames` now recursively validates every object key against its child schema; `format` accepts and enforces only `uri` through the existing URL parser. Unknown formats and all other unsupported correctness-affecting keywords still fail closed.
+- Live post-fix evidence: an access-token-only, fail-closed no-refresh binary completed an `enabled` no-tool probe with HTTP 200. Two separate Claude Code enabled Read prompts then exited 0 without a top-level error, proving that the complete current tool directory compiled and reached a successful terminal response, but neither prompt emitted a visible tool call or tool-result closure. Per the fail-fast boundary, no further prompt retry or later enabled fixture was run.
+- Credential and cleanup boundary: the installed CC Switch remained stopped. The real CC Switch OAuth store, real Codex auth file, and isolated OAuth copy retained their pre-run SHA-256 hashes. The isolated provider was returned to `legacy`, proxy/failover were disabled, and the exact live/offline temporary directories containing raw events, logs, fixtures, schema sampling, and the credential copy were deleted.
+- Verification: `claude_codex_bridge` 76 passed, `streaming_responses` 46 passed, and `forwarder` 84 passed. `cargo check`, `cargo fmt -- --check`, and `git diff --check` passed.
+- Readiness remains `LiveSmokeStatus::Failed` with blocker `FixtureCoverageIncomplete`. The schema blocker is cleared, but successful enabled Read execution/closure and the remaining enabled matrix still require a later explicit live run.
 
 ## 2026-07-30 remaining Stage 5 fixture run
 
