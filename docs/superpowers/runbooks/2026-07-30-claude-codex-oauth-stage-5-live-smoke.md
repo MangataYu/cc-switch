@@ -1,6 +1,15 @@
 # Claude Code Codex OAuth Stage 5 Live Smoke Runbook
 
-**Status:** Failed on 2026-07-30 with blocker `ComparisonFailures`; rollout remains blocked. The Glob/Grep tool-fragment fix passed live. The later Write/Edit incomplete observation now has an offline production-chain regression and fix, but the authorized access-token-only rerun below did not produce a visible Write or Edit call, so it did not close the live blocker.
+**Status:** Failed on 2026-07-30 with blocker `FixtureCoverageIncomplete`; rollout remains blocked. Glob/Grep passed through Claude Code, and the deterministic Claude-protocol Write/Edit continuation below cleared the prior `ComparisonFailures` blocker for that bridge path. Bash, dedicated parallel tools, optional MCP/Task, and `enabled` mode remain unverified.
+
+## 2026-07-30 deterministic Write/Edit continuation rerun
+
+- Scope: used the production `/v1/messages` handler in isolated `shadow` mode with a deterministic Claude-protocol client. Explicit tool selection forced the exact Write → result → Edit → error result → terminal sequence that the earlier Claude Code prompts did not produce. This verifies the bridge converter, alias restoration, strict observer, continuation ledger, error-result semantics, and terminal lifecycle; it does not substitute for Claude Code filesystem-execution or permission UX coverage.
+- Tool identity and closure: exactly one `Write` and one `Edit` were returned, with two unique tool-use IDs and two matching result closures. The final turn returned no tool and completed normally. No visible tool was retried.
+- Upstream and shadow evidence: all three upstream requests returned HTTP 200. The three stream reports recorded `stream_differences` of 2, 2, and 1 respectively; every report had `unexplained=0`, `comparison_failures=0`, `bounded=true`, and an empty safe reason-code list. All request differences were explained alias/tool-choice projections with zero unexplained request differences.
+- Refresh and credential boundary: the isolated binary rejected the refresh path and accepted only the current access token in process memory. Safe logs contained zero refresh and zero HTTP 401/403 signals. The real Codex auth file, real CC Switch OAuth store, and isolated OAuth-store copy retained their pre-run SHA-256 hashes. The installed CC Switch remained stopped and was not restarted.
+- Rollback and cleanup: returned the isolated provider to explicit `legacy`, disabled proxy/takeover/failover, stopped the isolated application, and deleted the exact temporary directory containing raw prompts, responses, SSE, tool arguments/results, logs, fixtures, and the credential copy.
+- Readiness remains `LiveSmokeStatus::Failed`, now with blocker `FixtureCoverageIncomplete`. The earlier Write/Edit `ComparisonFailures` blocker is cleared for the deterministic production bridge chain, but the full Stage 5 live gate cannot pass until the remaining required fixtures and `enabled` opt-in complete under separate authorization.
 
 ## 2026-07-30 access-token-only Write/Edit rerun attempt
 
