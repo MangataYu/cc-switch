@@ -90,6 +90,8 @@ const renderCopilotForm = (overrides: Partial<ClaudeFormFieldsProps> = {}) => {
     speedTestEndpoints: [],
     apiFormat: "anthropic",
     onApiFormatChange: vi.fn(),
+    bridgeMode: "legacy",
+    onBridgeModeChange: vi.fn(),
     apiKeyField: "ANTHROPIC_AUTH_TOKEN",
     onApiKeyFieldChange: vi.fn(),
     isFullUrl: false,
@@ -173,6 +175,70 @@ describe("ClaudeFormFields", () => {
         "chatgpt-1",
       );
     });
+  });
+
+  it("仅在 Codex OAuth Responses 高级设置中显示 Bridge 模式", () => {
+    const { rerender } = renderCodexOauthForm({
+      apiFormat: "openai_responses",
+    });
+
+    expect(screen.getByText("providerForm.claudeCodexBridgeMode")).toBeTruthy();
+
+    rerender(
+      <FormShell>
+        <ClaudeFormFields
+          {...({
+            shouldShowApiKey: false,
+            apiKey: "",
+            onApiKeyChange: vi.fn(),
+            category: "official",
+            shouldShowApiKeyLink: false,
+            websiteUrl: "",
+            isCodexOauthPreset: true,
+            templateValueEntries: [],
+            templateValues: {},
+            templatePresetName: "",
+            onTemplateValueChange: vi.fn(),
+            shouldShowSpeedTest: false,
+            baseUrl: "",
+            onBaseUrlChange: vi.fn(),
+            isEndpointModalOpen: false,
+            onEndpointModalToggle: vi.fn(),
+            autoSelect: false,
+            onAutoSelectChange: vi.fn(),
+            shouldShowModelSelector: true,
+            claudeModel: "",
+            defaultHaikuModel: "",
+            defaultHaikuModelName: "",
+            defaultSonnetModel: "",
+            defaultSonnetModelName: "",
+            defaultOpusModel: "",
+            defaultOpusModelName: "",
+            defaultFableModel: "",
+            defaultFableModelName: "",
+            subagentModel: "",
+            onModelChange: vi.fn(),
+            speedTestEndpoints: [],
+            apiFormat: "openai_chat",
+            onApiFormatChange: vi.fn(),
+            bridgeMode: "enabled",
+            onBridgeModeChange: vi.fn(),
+            apiKeyField: "ANTHROPIC_AUTH_TOKEN",
+            onApiKeyFieldChange: vi.fn(),
+            isFullUrl: false,
+            onFullUrlChange: vi.fn(),
+            customUserAgent: "",
+            onCustomUserAgentChange: vi.fn(),
+            localProxyHeadersOverride: "",
+            onLocalProxyHeadersOverrideChange: vi.fn(),
+            localProxyBodyOverride: "",
+            onLocalProxyBodyOverrideChange: vi.fn(),
+          } satisfies ClaudeFormFieldsProps)}
+        />
+      </FormShell>,
+    );
+
+    expect(screen.queryByText("providerForm.claudeCodexBridgeMode")).toBeNull();
   });
 
   it("一键设置会同时写入 Subagent 模型", () => {

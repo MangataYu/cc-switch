@@ -55,6 +55,7 @@ import type {
   ProviderCategory,
   ClaudeApiFormat,
   ClaudeApiKeyField,
+  ClaudeCodexBridgeMode,
 } from "@/types";
 import {
   hasClaudeOneMMarker,
@@ -143,6 +144,8 @@ interface ClaudeFormFieldsProps {
   // API Format (for Claude-compatible providers that need request/response conversion)
   apiFormat: ClaudeApiFormat;
   onApiFormatChange: (format: ClaudeApiFormat) => void;
+  bridgeMode: ClaudeCodexBridgeMode;
+  onBridgeModeChange: (mode: ClaudeCodexBridgeMode) => void;
 
   // Auth Field (ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY)
   apiKeyField: ClaudeApiKeyField;
@@ -214,6 +217,8 @@ export function ClaudeFormFields({
   speedTestEndpoints,
   apiFormat,
   onApiFormatChange,
+  bridgeMode,
+  onBridgeModeChange,
   apiKeyField,
   onApiKeyFieldChange,
   isFullUrl,
@@ -237,6 +242,7 @@ export function ClaudeFormFields({
     defaultFableModel ||
     subagentModel ||
     (!isXaiOauthPreset && apiFormat !== "anthropic") ||
+    (isCodexOauthPreset && bridgeMode !== "legacy") ||
     apiKeyField !== "ANTHROPIC_AUTH_TOKEN" ||
     customUserAgent ||
     hasRequestOverrides
@@ -856,6 +862,38 @@ export function ClaudeFormFields({
                   {t("providerForm.apiFormatHint", {
                     defaultValue: "选择供应商 API 的输入格式",
                   })}
+                </p>
+              </div>
+            )}
+
+            {isCodexOauthPreset && apiFormat === "openai_responses" && (
+              <div className="space-y-2">
+                <FormLabel htmlFor="claudeCodexBridgeMode">
+                  {t("providerForm.claudeCodexBridgeMode")}
+                </FormLabel>
+                <Select
+                  value={bridgeMode}
+                  onValueChange={(value) =>
+                    onBridgeModeChange(value as ClaudeCodexBridgeMode)
+                  }
+                >
+                  <SelectTrigger id="claudeCodexBridgeMode" className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="legacy">
+                      {t("providerForm.claudeCodexBridgeLegacy")}
+                    </SelectItem>
+                    <SelectItem value="shadow">
+                      {t("providerForm.claudeCodexBridgeShadow")}
+                    </SelectItem>
+                    <SelectItem value="enabled">
+                      {t("providerForm.claudeCodexBridgeEnabled")}
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  {t("providerForm.claudeCodexBridgeHint")}
                 </p>
               </div>
             )}

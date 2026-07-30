@@ -23,7 +23,12 @@ import type {
   CodexChatReasoning,
   PromptCacheRoutingMode,
   ClaudeApiKeyField,
+  ClaudeCodexBridgeMode,
 } from "@/types";
+import {
+  bridgeModeForProviderSave,
+  resolveClaudeCodexBridgeMode,
+} from "@/utils/claudeCodexBridge";
 import {
   providerPresets,
   type ProviderPreset,
@@ -544,6 +549,10 @@ function ProviderFormFull({
   const [codexFastMode, setCodexFastMode] = useState<boolean>(
     () => initialData?.meta?.codexFastMode ?? false,
   );
+  const [claudeCodexBridgeMode, setClaudeCodexBridgeMode] =
+    useState<ClaudeCodexBridgeMode>(() =>
+      resolveClaudeCodexBridgeMode(initialData?.meta),
+    );
   const [codexChatReasoning, setCodexChatReasoning] =
     useState<CodexChatReasoning>(
       () => initialData?.meta?.codexChatReasoning ?? {},
@@ -1582,6 +1591,12 @@ function ProviderFormFull({
           ? selectedGitHubAccountId
           : undefined,
       codexFastMode: isCodexOauthProvider ? codexFastMode : undefined,
+      bridgeMode: bridgeModeForProviderSave({
+        appId,
+        providerType,
+        apiFormat: localApiFormat,
+        mode: claudeCodexBridgeMode,
+      }),
       codexChatReasoning:
         appId === "codex" &&
         category !== "official" &&
@@ -2263,6 +2278,8 @@ function ProviderFormFull({
               speedTestEndpoints={speedTestEndpoints}
               apiFormat={localApiFormat}
               onApiFormatChange={handleApiFormatChange}
+              bridgeMode={claudeCodexBridgeMode}
+              onBridgeModeChange={setClaudeCodexBridgeMode}
               apiKeyField={localApiKeyField}
               onApiKeyFieldChange={handleApiKeyFieldChange}
               isFullUrl={localIsFullUrl}

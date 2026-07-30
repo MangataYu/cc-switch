@@ -162,6 +162,7 @@ export interface CodexChatReasoning {
 }
 
 export type PromptCacheRoutingMode = "auto" | "enabled" | "disabled";
+export type ClaudeCodexBridgeMode = "legacy" | "shadow" | "enabled";
 
 export interface LocalProxyRequestOverrides {
   headers?: Record<string, string>;
@@ -213,6 +214,9 @@ export interface ProviderMeta {
   promptCacheRouting?: PromptCacheRoutingMode;
   // Codex OAuth FAST mode: injects service_tier="priority" on ChatGPT Codex requests
   codexFastMode?: boolean;
+  // Claude Code -> built-in Codex OAuth Responses bridge rollout mode.
+  // Missing values remain on the legacy path.
+  bridgeMode?: ClaudeCodexBridgeMode;
   // Codex Responses -> Chat Completions reasoning capability metadata
   codexChatReasoning?: CodexChatReasoning;
   // Codex → Anthropic path: emulate the Claude Code client (disabled by default; only an explicit true enables it)
