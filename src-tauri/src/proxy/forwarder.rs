@@ -255,6 +255,17 @@ fn synchronize_prepared_codex_request(
     Ok(())
 }
 
+fn synchronize_prepared_codex_request_for_mode(
+    mode: ClaudeCodexBridgeMode,
+    prepared_turn: Option<&mut PreparedCodexTurn>,
+    finalized_request: &Value,
+) -> Result<(), ProxyError> {
+    if mode == ClaudeCodexBridgeMode::Enabled {
+        synchronize_prepared_codex_request(prepared_turn, finalized_request)?;
+    }
+    Ok(())
+}
+
 fn validate_codex_official_authorization(headers: &http::HeaderMap) -> Result<(), ProxyError> {
     let authorization = headers
         .get(http::header::AUTHORIZATION)
@@ -1881,7 +1892,11 @@ impl RequestForwarder {
                 }
             }
         }
-        synchronize_prepared_codex_request(prepared_codex_turn.as_mut(), &filtered_body)?;
+        synchronize_prepared_codex_request_for_mode(
+            provider.claude_codex_bridge_mode(),
+            prepared_codex_turn.as_mut(),
+            &filtered_body,
+        )?;
         if let (Some(evidence), Some(prepared)) =
             (bridge_evidence.as_mut(), prepared_codex_turn.as_ref())
         {
@@ -4274,6 +4289,38 @@ mod tests {
         synchronize_prepared_codex_request(Some(&mut prepared), &finalized).unwrap();
 
         assert_eq!(prepared.request, finalized);
+    }
+
+    #[test]
+    fn shadow_prepared_turn_is_not_replaced_by_served_legacy_request() {
+        let provider = bridge_provider("codex_oauth", "openai_responses");
+        let mut prepared = ClaudeCodexBridge::with_ledger(Default::default())
+            .prepare_turn(
+                &AppType::Claude,
+                json!({
+                    "model": "gpt-test",
+                    "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "tools": [{
+                        "name": "Read",
+                        "input_schema": {"type":"object","properties":{}}
+                    }]
+                }),
+                &provider,
+                Some("shadow-sync-session"),
+            )
+            .unwrap();
+        let bridge_request = prepared.request.clone();
+        let legacy_request = json!({"tools":[{"name":"Read"}],"served":"legacy"});
+
+        synchronize_prepared_codex_request_for_mode(
+            ClaudeCodexBridgeMode::Shadow,
+            Some(&mut prepared),
+            &legacy_request,
+        )
+        .unwrap();
+
+        assert_eq!(prepared.request, bridge_request);
     }
 
     #[test]
