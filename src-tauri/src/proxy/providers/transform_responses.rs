@@ -268,6 +268,15 @@ pub fn anthropic_to_responses(
     codex_fast_mode: bool,
 ) -> Result<Value, ProxyError> {
     let mut result = json!({});
+    let has_tools = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty());
+    let parallel_tool_calls_default = has_tools
+        && !body
+            .pointer("/tool_choice/disable_parallel_tool_use")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
     // NOTE: 模型映射由上游统一处理（proxy::model_mapper），格式转换层只做结构转换。
     if let Some(model) = body.get("model").and_then(|m| m.as_str()) {
@@ -409,7 +418,7 @@ pub fn anthropic_to_responses(
             obj.entry("instructions".to_string()).or_insert(json!(""));
             obj.entry("tools".to_string()).or_insert(json!([]));
             obj.entry("parallel_tool_calls".to_string())
-                .or_insert(json!(false));
+                .or_insert(json!(parallel_tool_calls_default));
 
             // —— 强制覆盖 stream = true ——
             // 即便客户端误传 stream:false 也要覆盖，因为 codex-rs 永远 true，
@@ -2354,6 +2363,48 @@ mod tests {
         let tools = result["tools"].as_array().expect("tools 应为数组");
         assert_eq!(tools.len(), 1, "client 已送的 tools 必须保留");
         assert_eq!(tools[0]["name"], json!("get_weather"));
+    }
+
+    #[test]
+    fn test_codex_oauth_allows_parallel_calls_when_tools_are_present() {
+        let input = json!({
+            "model": "gpt-5-codex",
+            "tools": [{
+                "name": "first_tool",
+                "description": "First independent operation",
+                "input_schema": {"type": "object"}
+            }, {
+                "name": "second_tool",
+                "description": "Second independent operation",
+                "input_schema": {"type": "object"}
+            }],
+            "messages": [{"role": "user", "content": "Run both operations"}]
+        });
+
+        let result = anthropic_to_responses(input, None, true, false).unwrap();
+
+        assert_eq!(result["parallel_tool_calls"], json!(true));
+    }
+
+    #[test]
+    fn test_codex_oauth_honors_disable_parallel_tool_use() {
+        let input = json!({
+            "model": "gpt-5-codex",
+            "tools": [{
+                "name": "one_at_a_time",
+                "description": "A sequential operation",
+                "input_schema": {"type": "object"}
+            }],
+            "tool_choice": {
+                "type": "auto",
+                "disable_parallel_tool_use": true
+            },
+            "messages": [{"role": "user", "content": "Run the operation"}]
+        });
+
+        let result = anthropic_to_responses(input, None, true, false).unwrap();
+
+        assert_eq!(result["parallel_tool_calls"], json!(false));
     }
 
     #[test]
