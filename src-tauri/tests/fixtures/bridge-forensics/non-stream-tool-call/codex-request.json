@@ -21,6 +21,6 @@
   "store": false,
   "include": ["reasoning.encrypted_content"],
   "instructions": "",
-  "parallel_tool_calls": false,
+  "parallel_tool_calls": true,
   "stream": true
 }
