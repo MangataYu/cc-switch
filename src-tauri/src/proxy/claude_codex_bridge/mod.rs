@@ -348,6 +348,10 @@ fn collect_historical_tool_results(
 }
 
 impl PreparedCodexTurn {
+    pub fn start_stream(self) -> streaming::PreparedCodexStream {
+        streaming::PreparedCodexStream::new(self)
+    }
+
     pub fn ledger_binding(&self) -> &TurnBinding {
         &self.ledger_binding
     }
@@ -365,16 +369,53 @@ impl PreparedCodexTurn {
         call_id: &str,
         arguments: &str,
     ) -> Result<(), BridgeError> {
+        self.declare_streamed_tool_call(codex_name, call_id)?;
+        let arguments_hash = canonical_request_fingerprint(
+            &self
+                .tool_registry
+                .restore_call(codex_name, call_id, arguments)?
+                .input,
+        );
+        self.ledger
+            .arguments_streaming(&self.ledger_binding, call_id, &arguments_hash)?;
+        self.complete_streamed_tool_call(codex_name, call_id, arguments)?;
+        self.mark_streamed_tool_visible(call_id)
+    }
+
+    pub(crate) fn declare_streamed_tool_call(
+        &self,
+        codex_name: &str,
+        call_id: &str,
+    ) -> Result<(), BridgeError> {
+        self.ledger
+            .declare_call(&self.ledger_binding, call_id, codex_name)
+    }
+
+    pub(crate) fn observe_streamed_argument_fragment(
+        &self,
+        call_id: &str,
+        fragment_hash: &str,
+    ) -> Result<(), BridgeError> {
+        self.ledger
+            .arguments_streaming(&self.ledger_binding, call_id, fragment_hash)
+    }
+
+    pub(crate) fn complete_streamed_tool_call(
+        &self,
+        codex_name: &str,
+        call_id: &str,
+        arguments: &str,
+    ) -> Result<RestoredToolCall, BridgeError> {
         let restored = self
             .tool_registry
             .restore_call(codex_name, call_id, arguments)?;
         let arguments_hash = canonical_request_fingerprint(&restored.input);
         self.ledger
-            .declare_call(&self.ledger_binding, call_id, codex_name)?;
-        self.ledger
-            .arguments_streaming(&self.ledger_binding, call_id, &arguments_hash)?;
-        self.ledger
             .mark_ready(&self.ledger_binding, call_id, &arguments_hash)?;
+        Ok(restored)
+    }
+
+    pub(crate) fn mark_streamed_tool_visible(&self, call_id: &str) -> Result<(), BridgeError> {
         self.ledger.mark_returned(&self.ledger_binding, call_id)
     }
 
@@ -386,15 +427,22 @@ impl PreparedCodexTurn {
                 summary: "reasoning item requires a non-empty identity".to_string(),
             });
         }
-        let encrypted = item
-            .get("encrypted_content")
-            .cloned()
-            .unwrap_or(Value::Null);
+        let encrypted = item.get("encrypted_content").and_then(Value::as_str);
+        self.observe_reasoning_completion(item_id, encrypted)
+    }
+
+    pub(crate) fn observe_reasoning_completion(
+        &self,
+        item_id: &str,
+        encrypted_content: Option<&str>,
+    ) -> Result<(), BridgeError> {
         self.ledger.observe_reasoning(
             &self.ledger_binding,
             ReasoningBinding {
                 item_id: item_id.to_string(),
-                content_hash: canonical_request_fingerprint(&encrypted),
+                content_hash: canonical_request_fingerprint(
+                    &encrypted_content.map(Value::from).unwrap_or(Value::Null),
+                ),
                 identity_hash: canonical_request_fingerprint(&serde_json::json!({
                     "id": item_id,
                     "type": "reasoning"
@@ -405,6 +453,11 @@ impl PreparedCodexTurn {
             },
             ReasoningItemState::Completed,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ledger_for_test(&self) -> ConversationLedger {
+        self.ledger.clone()
     }
 
     pub(crate) fn finalize_request(&mut self, request: Value) -> Result<(), BridgeError> {
