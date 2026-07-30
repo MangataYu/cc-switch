@@ -98,12 +98,12 @@ Exact field visibility may be reduced during implementation, but names recorded 
 
 **Produces:** typed report/difference/reason-code values; safe canonical structural summaries for catalog identity, exact Claude identity, schema, transforms, capabilities, tool choice, model/stream/reasoning/usage decisions, and request hashes.
 
-- [ ] Write failing `shadow_request_comparison_*` tests with literal expected reason codes/dispositions for equivalent input, safe normalization, capability-driven difference, registry/schema mismatch, request-field mismatch, bridge rejection, and unexplained input. Assert sentinel prompt, arguments, result, reasoning, token, cookie, and authorization strings are absent from serialized reports.
-- [ ] Run `cargo test shadow_request_comparison --lib -- --nocapture`; confirm RED is caused by the missing typed module/interfaces.
-- [ ] Implement minimal safe structural projection/hashing and deterministic ordering. Every `Expected`/`Accepted` row must carry a non-generic stable reason code; every unknown mismatch must become `Unexplained`.
-- [ ] Replace the boolean `compare_shadow_turn` path with the typed session while preserving the legacy request as the dispatch result and retaining `prepared_turn: None` for served shadow routing.
-- [ ] Re-run focused tests, bridge tests, forwarder tests, and `cargo check`; refactor only while green.
-- [ ] Commit as `feat(proxy): classify structured shadow requests`.
+- [x] Write failing `shadow_request_comparison_*` tests with literal expected reason codes/dispositions for equivalent input, safe normalization, capability-driven difference, registry/schema mismatch, request-field mismatch, bridge rejection, and unexplained input. Assert sentinel prompt, arguments, result, reasoning, token, cookie, and authorization strings are absent from serialized reports.
+- [x] Run `cargo test shadow_request_comparison --lib -- --nocapture`; confirm RED is caused by the missing typed module/interfaces.
+- [x] Implement minimal safe structural projection/hashing and deterministic ordering. Every `Expected`/`Accepted` row must carry a non-generic stable reason code; every unknown mismatch must become `Unexplained`.
+- [x] Replace the boolean `compare_shadow_turn` path with the typed session while preserving the legacy request as the dispatch result and retaining `prepared_turn: None` for served shadow routing.
+- [x] Re-run focused tests, bridge tests, forwarder tests, and `cargo check`; refactor only while green.
+- [x] Commit the typed request/response comparison as `df9f4bf3` (`feat(proxy): compare structured shadow turns`).
 
 ## Task 2: Same-Response Non-Streaming Shadow Recovery
 
@@ -178,10 +178,10 @@ Exact field visibility may be reduced during implementation, but names recorded 
 
 **Files:** modify the approved design and this plan; create `docs/superpowers/runbooks/2026-07-30-claude-codex-oauth-stage-5-live-smoke.md`.
 
-- [ ] Write the manual smoke runbook before any live call: disposable directory setup/cleanup; no real-project Edit/Write/Bash; ordinary text/reasoning; `Read`; `Glob`/`Grep`; safe `Write`/`Edit`; safe Bash/test; parallel tools; result continuation; optional MCP/dynamic tool; optional child `Task`; immediate rollback; safe structured result recording.
-- [ ] Check local OAuth login availability without reading or printing token/cookie/Authorization values.
+- [x] Write the manual smoke runbook before any live call: disposable directory setup/cleanup; no real-project Edit/Write/Bash; ordinary text/reasoning; `Read`; `Glob`/`Grep`; safe `Write`/`Edit`; safe Bash/test; parallel tools; result continuation; optional MCP/dynamic tool; optional child `Task`; immediate rollback; safe structured result recording.
+- [x] Check local OAuth login availability without reading or printing token/cookie/Authorization values.
 - [ ] If live validation is feasible, report exact flows, quota/network impact, and temporary directory, then stop for explicit authorization before the first network request. Without authorization, record `LiveSmokeStatus::NotRun` and exact status `Stage 5 implementation complete; live validation pending`.
-- [ ] Update the design with the actual interfaces, taxonomy, single-request proof, legacy-output guarantee, opt-in/rollback semantics, readiness result, replay coverage, live status, limitations, and Stage 6 boundary. Do not claim `Stages 0–5 implemented` unless all required live gates truly pass.
+- [x] Update the design with the actual interfaces, taxonomy, single-request proof, legacy-output guarantee, opt-in/rollback semantics, readiness result, replay coverage, live status, limitations, and Stage 6 boundary. Live validation remains explicitly pending.
 - [ ] Mark only genuinely completed checkboxes in this plan; scan for placeholders and interface drift.
 - [ ] Run the complete verification matrix below and record counts/zero-match filters accurately.
 - [ ] Perform the Scope / Leak Audit below, inspect `git diff --check`, `git status --short`, and `.codegraph/` status without reading its content.

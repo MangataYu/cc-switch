@@ -1215,6 +1215,65 @@ mod tests {
     }
 
     #[test]
+    fn rollout_readiness_reports_every_blocker_and_never_infers_live_success() {
+        let blocked = calculate_shadow_readiness(&ShadowReadinessInput {
+            sample_count: 0,
+            supported_fixture_count: 1,
+            required_fixture_count: 2,
+            expected_differences: 0,
+            accepted_differences: 0,
+            unexplained_differences: 1,
+            comparison_failures: 1,
+            forensic_suppressions: 1,
+            forensic_failures: 1,
+            visible_tool_retry_safe: false,
+            rollback_available: false,
+            live_smoke_status: LiveSmokeStatus::Pending,
+        });
+
+        assert!(!blocked.ready);
+        assert_eq!(blocked.live_smoke_status, LiveSmokeStatus::Pending);
+        assert_eq!(
+            blocked.blocking_reasons,
+            vec![
+                ShadowReadinessBlocker::NoSamples,
+                ShadowReadinessBlocker::FixtureCoverageIncomplete,
+                ShadowReadinessBlocker::UnexplainedDifferences,
+                ShadowReadinessBlocker::ComparisonFailures,
+                ShadowReadinessBlocker::ForensicSuppression,
+                ShadowReadinessBlocker::ForensicFailures,
+                ShadowReadinessBlocker::VisibleToolRetryUnsafe,
+                ShadowReadinessBlocker::RollbackUnavailable,
+                ShadowReadinessBlocker::LiveSmokeNotPassed,
+            ]
+        );
+
+        for status in [
+            LiveSmokeStatus::NotRun,
+            LiveSmokeStatus::Pending,
+            LiveSmokeStatus::Failed,
+            LiveSmokeStatus::Blocked,
+        ] {
+            let mut otherwise_ready = ShadowReadinessInput {
+                sample_count: 1,
+                supported_fixture_count: 1,
+                required_fixture_count: 1,
+                expected_differences: 0,
+                accepted_differences: 0,
+                unexplained_differences: 0,
+                comparison_failures: 0,
+                forensic_suppressions: 0,
+                forensic_failures: 0,
+                visible_tool_retry_safe: true,
+                rollback_available: true,
+                live_smoke_status: LiveSmokeStatus::Passed,
+            };
+            otherwise_ready.live_smoke_status = status;
+            assert!(!calculate_shadow_readiness(&otherwise_ready).ready);
+        }
+    }
+
+    #[test]
     fn stream_shape_classifies_tool_and_reasoning_payloads_without_content() {
         use crate::proxy::claude_codex_bridge::streaming::{
             ClaudeContentBlock, ClaudeContentDelta, ClaudeStreamEvent,

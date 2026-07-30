@@ -1,7 +1,7 @@
 # Claude Code → Codex OAuth Agent Bridge Design
 
 **Date:** 2026-07-29
-**Status:** Stages 0–4 implemented; Stage 5 pending
+**Status:** Stage 5 implementation complete; live validation pending
 **Scope:** Claude Code client to the built-in Codex OAuth backend only
 
 ## 1. Summary
@@ -609,11 +609,23 @@ Output and tool visibility are acknowledged only after the corresponding Claude 
 
 Deterministic tests split canonical streams at every SSE byte boundary, including inside multibyte UTF-8, and split completed tool JSON at every logical delta boundary. Offline replay exercises text-only, reasoning plus text, one tool, parallel tools, chunked arguments, the tool-result lifecycle, incomplete streams, invalid ordering, unknown tools, and conflicting duplicates through the production decoder and state machine with `network_requests = 0`.
 
-The limits remain deliberate: ledger and stream buffers are process-local and request-scoped, completed plaintext reasoning and tool arguments are discarded after validation, legacy/shadow and other providers keep their prior codec behavior, and no live OAuth probe or smoke test is performed. Stage 5 opt-in rollout/shadow comparison and Stage 6 default enablement/legacy removal are not implemented.
+The limits remain deliberate: ledger and stream buffers are process-local and request-scoped, completed plaintext reasoning and tool arguments are discarded after validation, and legacy and other providers keep their prior codec behavior. Stage 5 adds shadow observation without changing these Stage 4 ownership rules. Stage 6 default enablement and legacy removal are not implemented.
 
 ### Stage 5: Shadow comparison and opt-in live use
 
 Run local shadow compilation without duplicate upstream requests. Resolve unexplained differences, then enable the new path for explicit provider opt-in and live smoke testing.
+
+Implemented on 2026-07-30, with live validation still pending explicit authorization. `ShadowComparisonSession` owns a request-scoped isolated prepared turn and emits a typed `ShadowComparisonReport`. Differences have a stable kind, disposition, reason code, safe structural path, and optional structural hashes. Request summaries include capability profile, registry/schema identity, tool/model/stream structure, and transform decisions. Buffered responses are decoded twice locally from the same already-received JSON value. Streaming responses are subscribed once: the existing legacy converter remains authoritative while a synchronous observer consumes the same byte chunks through the strict bridge state machine with a 256 KiB framing limit and a 4096-event limit.
+
+Shadow never replaces the served request or response. Compile, decode, observation, and report failures detach or record the comparison and fail open to the unchanged legacy path. No second HTTP request, OAuth lookup, response-body subscription, spawned task, or unbounded channel is introduced. Shadow ledger state is isolated from the enabled ledger. Stream summaries recognize text, reasoning, tool, usage, visibility, and terminal structure without retaining their plaintext. The older full-content forensic capture path is disabled in shadow mode; shadow diagnostics and replay contain only enums, booleans, counts, stable paths, profile/version values, opaque identifiers, and hashes.
+
+`replay_shadow_comparison` drives the production comparison logic offline and returns `ShadowComparisonReplayReport { comparison, network_requests: 0 }`. The current deterministic coverage includes the supported built-in registry plus MCP/dynamic identity, strict rejection cases, request/non-stream/stream structure, tool visibility, ledger isolation, readiness blockers, and sentinel leak assertions. The readiness reducer is pure and report-only: incomplete fixture coverage, unexplained differences, comparison or forensic failures, unsafe visible-tool retry, unavailable rollback, or any live status other than `passed` blocks readiness.
+
+Provider metadata now supports explicit `bridgeMode = legacy | shadow | enabled` only for Claude + built-in Codex OAuth + `openai_responses`. Missing and old configuration remains `legacy`. The advanced provider form exposes the three modes only in that scope, persists explicit rollback to `legacy`, and never promotes a provider automatically. The next request reads the selected mode, so rollback is immediate and requires no migration.
+
+Offline Rust verification passed with 2398 library tests after Stage 5. Focused shadow, bridge-mode, rollout, replay, ledger, streaming, bridge, forensics, and forwarder filters all matched and passed. Frontend typecheck, 12 focused bridge-mode/UI tests, formatting, and renderer build passed. The repository-wide Vitest command remains affected by pre-existing test discovery of `.claude/worktrees` and an existing concurrent `App.test.tsx` state leak; the current `App.test.tsx` passes 4/4 when isolated. No live traffic was sent. Local login and Claude Code command availability were checked without reading credentials, and `LiveSmokeStatus` remains `not_run` until the runbook is authorized and completed.
+
+Stage 5 does not make the bridge the default, remove legacy codecs, persist ledger state, execute tools in CC Switch, or relax visible-tool retry safety. Those default/removal decisions remain Stage 6 work and require every rollout gate, including live smoke, to pass.
 
 ### Stage 6: Default and legacy removal
 
