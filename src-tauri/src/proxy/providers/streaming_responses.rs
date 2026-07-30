@@ -1769,6 +1769,8 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                                 continue;
                                             }
                                         };
+                                        let execution_arguments = serde_json::to_string(&call.input)
+                                            .expect("serializing validated tool input cannot fail");
                                         if let Some(prepared) = prepared_turn.as_ref() {
                                             if let Err(error) = prepared.observe_returned_tool_call(
                                                 codex_name,
@@ -1802,7 +1804,7 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                                 "index": index,
                                                 "delta": {
                                                     "type": "input_json_delta",
-                                                    "partial_json": raw
+                                                    "partial_json": execution_arguments
                                                 }
                                             }),
                                         ));
@@ -2432,6 +2434,8 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                                         continue;
                                                     }
                                                 };
+                                                let execution_arguments = serde_json::to_string(&call.input)
+                                                    .expect("serializing validated tool input cannot fail");
                                                 if let Some(prepared) = prepared_turn.as_ref() {
                                                     if let Err(error) = prepared.observe_returned_tool_call(
                                                         codex_name,
@@ -2465,7 +2469,7 @@ fn create_anthropic_sse_stream_from_responses_core<E: std::error::Error + Send +
                                                         "index": index,
                                                         "delta": {
                                                             "type": "input_json_delta",
-                                                            "partial_json": raw
+                                                            "partial_json": execution_arguments
                                                         }
                                                     }),
                                                 ));
@@ -4002,7 +4006,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepared_stream_output_item_done_emits_exact_read_arguments_once() {
+    async fn prepared_stream_output_item_done_projects_only_empty_read_pages_once() {
         let input = concat!(
             "event: response.created\n",
             "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-test\"}}\n\n",
@@ -4018,8 +4022,32 @@ mod tests {
 
         assert_eq!(converted.matches("\"type\":\"tool_use\"").count(), 1);
         assert_eq!(converted.matches("partial_json").count(), 1);
-        assert!(converted.contains("\\\"pages\\\":\\\"\\\""));
-        assert!(converted.contains("2.300310976710655e22"));
+        assert!(!converted.contains("\\\"pages\\\":\\\"\\\""));
+        assert!(converted.contains("2.300310976710655e+22"));
+        assert!(!converted.contains("tool_registry_violation"));
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_projects_empty_read_pages_after_strict_validation() {
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-test\"}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\"}}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":\"{\\\"file_path\\\":\\\"src/main.rs\\\",\\\"pages\\\":\\\"\\\",\\\"offset\\\":0}\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        );
+
+        let converted = convert_stream_with_registry(input).await;
+
+        assert_eq!(converted.matches("\"type\":\"tool_use\"").count(), 1);
+        assert_eq!(converted.matches("partial_json").count(), 1);
+        assert!(converted.contains(
+            "\"partial_json\":\"{\\\"file_path\\\":\\\"src/main.rs\\\",\\\"offset\\\":0}\""
+        ));
+        assert!(!converted.contains("\\\"pages\\\""));
         assert!(!converted.contains("tool_registry_violation"));
     }
 

@@ -268,7 +268,7 @@ impl ToolRegistry {
             }
         })?;
         let binding = &self.bindings[*index];
-        let input: Value =
+        let mut input: Value =
             serde_json::from_str(arguments).map_err(|_| BridgeError::ToolRegistryViolation {
                 summary: format!("arguments for {codex_name} are not valid JSON"),
             })?;
@@ -276,6 +276,7 @@ impl ToolRegistry {
             return registry_error(&format!("arguments for {codex_name} must be a JSON object"));
         }
         validate_arguments(&binding.claude_schema, &input)?;
+        project_claude_execution_input(&binding.claude_name, &mut input);
         Ok(RestoredToolCall {
             claude_name: binding.claude_name.clone(),
             tool_use_id: call_id.to_string(),
@@ -377,6 +378,18 @@ impl ToolRegistry {
             );
         }
         Ok(restored)
+    }
+}
+
+fn project_claude_execution_input(claude_name: &str, input: &mut Value) {
+    if claude_name != "Read" {
+        return;
+    }
+    let Some(object) = input.as_object_mut() else {
+        return;
+    };
+    if matches!(object.get("pages"), Some(Value::String(value)) if value.is_empty()) {
+        object.remove("pages");
     }
 }
 
@@ -724,6 +737,54 @@ mod tests {
                 Err(BridgeError::ToolRegistryViolation { .. })
             ));
         }
+    }
+
+    #[test]
+    fn read_execution_projection_runs_only_after_strict_argument_validation() {
+        let tool = json!({
+            "name": "Read",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "pages": {"type": "string"}
+                },
+                "required": ["file_path", "pages"],
+                "additionalProperties": false
+            }
+        });
+        let (registry, _) =
+            ToolRegistry::compile(&[tool], CodexOAuthCapabilities::builtin().as_ref()).unwrap();
+
+        let projected = registry
+            .restore_call(
+                "read_file",
+                "call_empty_pages",
+                r#"{"file_path":"src/main.rs","pages":""}"#,
+            )
+            .unwrap();
+        assert_eq!(projected.input, json!({"file_path": "src/main.rs"}));
+
+        let preserved = registry
+            .restore_call(
+                "read_file",
+                "call_nonempty_pages",
+                r#"{"file_path":"src/main.rs","pages":"1-2"}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            preserved.input,
+            json!({"file_path": "src/main.rs", "pages": "1-2"})
+        );
+
+        assert!(matches!(
+            registry.restore_call(
+                "read_file",
+                "call_missing_required_pages",
+                r#"{"file_path":"src/main.rs"}"#,
+            ),
+            Err(BridgeError::ToolRegistryViolation { .. })
+        ));
     }
 
     #[test]

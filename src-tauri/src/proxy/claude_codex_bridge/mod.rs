@@ -708,7 +708,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_turn_returns_registry_validated_arguments_without_legacy_read_mutation() {
+    fn prepared_turn_projects_empty_read_pages_after_registry_validation() {
         let provider = provider("codex_oauth", "openai_responses");
         let prepared = ClaudeCodexBridge::builtin()
             .prepare_turn(
@@ -756,7 +756,13 @@ mod tests {
 
         assert_eq!(restored["content"][0]["name"], "Read");
         assert_eq!(restored["content"][0]["id"], "call_exact");
-        assert_eq!(restored["content"][0]["input"], exact_input);
+        assert_eq!(
+            restored["content"][0]["input"],
+            json!({
+                "file_path": "src/main.rs",
+                "offset": 2.300310976710655e22
+            })
+        );
     }
 
     #[test]
