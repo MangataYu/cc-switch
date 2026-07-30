@@ -1,6 +1,15 @@
 # Claude Code Codex OAuth Stage 5 Live Smoke Runbook
 
-**Status:** Failed on 2026-07-30 with blocker `UnexplainedDifferences`; rollout remains blocked. Codex OAuth reauthentication succeeded, but a new explicit authorization is required for any visible-tool rerun.
+**Status:** Blocked on 2026-07-30 with blocker `CodexOAuthRefreshExpired`; rollout remains blocked. The tool-fragment fix is green offline but has not passed a live rerun. Reauthenticate the CC Switch-managed Codex OAuth account before requesting another live attempt.
+
+## 2026-07-30 tool-fragment-fix verification attempt
+
+- Environment: rebuilt the current 3.19.0 `internal` debug binary, then used a new isolated temporary home, fresh 3.19 database, copied CC Switch OAuth store without inspecting values, disposable fixtures, loopback-only random port, explicit `shadow`, one provider, no failover, and scoped Claude tool permissions.
+- Blocking result: the restricted Glob/Grep invocation never exposed a tool or reached strict stream comparison. Claude Code retried automatically until the 180-second outer timeout; the isolated proxy recorded 11 streaming requests, all HTTP 401. Safe application diagnostics identified an expired/invalid refresh token for the CC Switch-managed Codex OAuth account.
+- Additional structural signal: every attempted request logged `mode=shadow ... compile_failed` before the authentication failure. No raw request was retained, so this run does not infer a cause. Recheck this signal after reauthentication; if it persists on an authenticated request, diagnose it offline before continuing the live matrix.
+- Not run after the blocker: Write/Edit, Bash/test, parallel tools, result continuation, optional MCP/Task, and `enabled` mode. No visible tool was retried.
+- Rollback and cleanup: stopped only the scoped application process, changed the isolated provider to explicit `legacy`, disabled isolated takeover/proxy state, verified the exact target remained beneath the OS temporary directory, and deleted the entire disposable directory including copied OAuth data, database, fixtures, and raw logs.
+- Readiness: `LiveSmokeStatus::Blocked` with blocker `CodexOAuthRefreshExpired`. The prior offline fragment regression remains green but cannot substitute for the required live matrix.
 
 ## 2026-07-30 post-reauthentication rerun on 3.19.0
 
