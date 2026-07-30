@@ -10,4 +10,6 @@ pub use replay::{
     ConversationLedgerReplayReport, ReplayMode, ReplayReport, StreamingEventReplayReport,
     StrictStreamReplayFixture, StructuralDifference,
 };
+#[allow(unused_imports)]
+pub use replay::{replay_shadow_comparison, ShadowComparisonReplayReport};
 pub use store::*;

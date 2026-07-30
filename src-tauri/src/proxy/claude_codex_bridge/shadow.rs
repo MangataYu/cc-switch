@@ -146,14 +146,112 @@ pub struct ShadowStreamComparison {
     pub bounded: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveSmokeStatus {
+    #[default]
+    NotRun,
+    Pending,
+    Passed,
+    Failed,
+    Blocked,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ShadowReadinessBlocker {
+    NoSamples,
+    FixtureCoverageIncomplete,
+    UnexplainedDifferences,
+    ComparisonFailures,
+    ForensicSuppression,
+    ForensicFailures,
+    VisibleToolRetryUnsafe,
+    RollbackUnavailable,
+    LiveSmokeNotPassed,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ShadowReadinessSummary {
+pub struct ShadowReadinessInput {
     pub sample_count: u64,
+    pub supported_fixture_count: u64,
+    pub required_fixture_count: u64,
     pub expected_differences: u64,
     pub accepted_differences: u64,
     pub unexplained_differences: u64,
     pub comparison_failures: u64,
+    pub forensic_suppressions: u64,
+    pub forensic_failures: u64,
+    pub visible_tool_retry_safe: bool,
+    pub rollback_available: bool,
+    pub live_smoke_status: LiveSmokeStatus,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShadowReadinessSummary {
+    pub sample_count: u64,
+    pub supported_fixture_count: u64,
+    pub required_fixture_count: u64,
+    pub expected_differences: u64,
+    pub accepted_differences: u64,
+    pub unexplained_differences: u64,
+    pub comparison_failures: u64,
+    pub forensic_suppressions: u64,
+    pub forensic_failures: u64,
+    pub visible_tool_retry_safe: bool,
+    pub rollback_available: bool,
+    pub live_smoke_status: LiveSmokeStatus,
+    pub blocking_reasons: Vec<ShadowReadinessBlocker>,
     pub ready: bool,
+}
+
+pub fn calculate_shadow_readiness(input: &ShadowReadinessInput) -> ShadowReadinessSummary {
+    let mut blocking_reasons = Vec::new();
+    if input.sample_count == 0 {
+        blocking_reasons.push(ShadowReadinessBlocker::NoSamples);
+    }
+    if input.required_fixture_count == 0
+        || input.supported_fixture_count < input.required_fixture_count
+    {
+        blocking_reasons.push(ShadowReadinessBlocker::FixtureCoverageIncomplete);
+    }
+    if input.unexplained_differences > 0 {
+        blocking_reasons.push(ShadowReadinessBlocker::UnexplainedDifferences);
+    }
+    if input.comparison_failures > 0 {
+        blocking_reasons.push(ShadowReadinessBlocker::ComparisonFailures);
+    }
+    if input.forensic_suppressions > 0 {
+        blocking_reasons.push(ShadowReadinessBlocker::ForensicSuppression);
+    }
+    if input.forensic_failures > 0 {
+        blocking_reasons.push(ShadowReadinessBlocker::ForensicFailures);
+    }
+    if !input.visible_tool_retry_safe {
+        blocking_reasons.push(ShadowReadinessBlocker::VisibleToolRetryUnsafe);
+    }
+    if !input.rollback_available {
+        blocking_reasons.push(ShadowReadinessBlocker::RollbackUnavailable);
+    }
+    if input.live_smoke_status != LiveSmokeStatus::Passed {
+        blocking_reasons.push(ShadowReadinessBlocker::LiveSmokeNotPassed);
+    }
+    ShadowReadinessSummary {
+        sample_count: input.sample_count,
+        supported_fixture_count: input.supported_fixture_count,
+        required_fixture_count: input.required_fixture_count,
+        expected_differences: input.expected_differences,
+        accepted_differences: input.accepted_differences,
+        unexplained_differences: input.unexplained_differences,
+        comparison_failures: input.comparison_failures,
+        forensic_suppressions: input.forensic_suppressions,
+        forensic_failures: input.forensic_failures,
+        visible_tool_retry_safe: input.visible_tool_retry_safe,
+        rollback_available: input.rollback_available,
+        live_smoke_status: input.live_smoke_status,
+        ready: blocking_reasons.is_empty(),
+        blocking_reasons,
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -800,14 +898,20 @@ fn summarize_differences(differences: &[ShadowDifference]) -> ShadowReadinessSum
         .iter()
         .filter(|difference| difference.disposition == ShadowDifferenceDisposition::Unexplained)
         .count() as u64;
-    ShadowReadinessSummary {
+    calculate_shadow_readiness(&ShadowReadinessInput {
         sample_count: 1,
+        supported_fixture_count: 0,
+        required_fixture_count: 1,
         expected_differences,
         accepted_differences,
         unexplained_differences,
         comparison_failures: 0,
-        ready: false,
-    }
+        forensic_suppressions: 0,
+        forensic_failures: 0,
+        visible_tool_retry_safe: true,
+        rollback_available: true,
+        live_smoke_status: LiveSmokeStatus::NotRun,
+    })
 }
 
 #[cfg(test)]
@@ -1007,5 +1111,47 @@ mod tests {
                 && difference.reason_code == ShadowReasonCode::BridgeStrictRejection
         }));
         assert_eq!(report.readiness.comparison_failures, 1);
+    }
+
+    #[test]
+    fn rollout_readiness_requires_every_local_and_live_gate() {
+        let mut input = ShadowReadinessInput {
+            sample_count: 12,
+            supported_fixture_count: 12,
+            required_fixture_count: 12,
+            expected_differences: 3,
+            accepted_differences: 1,
+            unexplained_differences: 0,
+            comparison_failures: 0,
+            forensic_suppressions: 0,
+            forensic_failures: 0,
+            visible_tool_retry_safe: true,
+            rollback_available: true,
+            live_smoke_status: LiveSmokeStatus::NotRun,
+        };
+
+        let not_run = calculate_shadow_readiness(&input);
+        assert!(!not_run.ready);
+        assert_eq!(not_run.live_smoke_status, LiveSmokeStatus::NotRun);
+        assert_eq!(
+            not_run.blocking_reasons,
+            vec![ShadowReadinessBlocker::LiveSmokeNotPassed]
+        );
+
+        input.live_smoke_status = LiveSmokeStatus::Passed;
+        assert!(calculate_shadow_readiness(&input).ready);
+
+        input.unexplained_differences = 1;
+        let unexplained = calculate_shadow_readiness(&input);
+        assert!(!unexplained.ready);
+        assert!(unexplained
+            .blocking_reasons
+            .contains(&ShadowReadinessBlocker::UnexplainedDifferences));
+
+        input.unexplained_differences = 0;
+        input.rollback_available = false;
+        assert!(calculate_shadow_readiness(&input)
+            .blocking_reasons
+            .contains(&ShadowReadinessBlocker::RollbackUnavailable));
     }
 }

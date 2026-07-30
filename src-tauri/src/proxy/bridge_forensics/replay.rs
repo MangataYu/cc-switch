@@ -16,6 +16,7 @@ use crate::app_config::AppType;
 use crate::error::AppError;
 use crate::provider::{Provider, ProviderMeta};
 use crate::proxy::claude_codex_bridge::{
+    shadow::{ShadowComparisonReport, ShadowComparisonSession},
     streaming::{
         claude_stream_event_kind, decode_codex_response_event, StreamDecision, StreamTerminalState,
     },
@@ -89,6 +90,41 @@ pub struct StreamingEventReplayReport {
     pub terminal_state: String,
     pub error_kind: Option<EvidenceErrorKind>,
     pub network_requests: u32,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct ShadowComparisonReplayReport {
+    pub comparison: ShadowComparisonReport,
+    pub network_requests: u32,
+}
+
+#[allow(dead_code)]
+pub fn replay_shadow_comparison(request: Value) -> Result<ShadowComparisonReplayReport, AppError> {
+    let provider = replay_provider();
+    let bridge = ClaudeCodexBridge::with_ledger(ConversationLedger::default());
+    let prepared = bridge
+        .prepare_turn_with_session_identity(
+            &AppType::Claude,
+            request.clone(),
+            &provider,
+            "shadow-offline-replay-session",
+            None,
+        )
+        .map_err(|error| AppError::Message(format!("shadow replay preparation failed: {error}")))?;
+    let legacy = crate::proxy::providers::transform_claude_request_for_api_format(
+        request,
+        &provider,
+        "openai_responses",
+        None,
+        None,
+    )
+    .map_err(|error| AppError::Message(format!("shadow legacy replay failed: {error}")))?;
+    let comparison = ShadowComparisonSession::compare_request(prepared, &legacy).report();
+    Ok(ShadowComparisonReplayReport {
+        comparison,
+        network_requests: 0,
+    })
 }
 
 pub fn replay_conversation_lifecycle(
@@ -930,6 +966,34 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn shadow_replay_uses_production_comparison_without_network_or_plaintext() {
+        let secret = "shadow-replay-secret Authorization cookie reasoning arguments";
+        let report = replay_shadow_comparison(json!({
+            "model":"gpt-test",
+            "max_tokens":64,
+            "messages":[{"role":"user","content":secret}],
+            "tools":[
+                {"name":"Read","input_schema":{"type":"object","properties":{}}},
+                {"name":"Glob","input_schema":{"type":"object","properties":{}}},
+                {"name":"Grep","input_schema":{"type":"object","properties":{}}},
+                {"name":"Bash","input_schema":{"type":"object","properties":{}}},
+                {"name":"Edit","input_schema":{"type":"object","properties":{}}},
+                {"name":"Write","input_schema":{"type":"object","properties":{}}},
+                {"name":"NotebookEdit","input_schema":{"type":"object","properties":{}}},
+                {"name":"Task","input_schema":{"type":"object","properties":{}}},
+                {"name":"mcp__fixture__lookup","input_schema":{"type":"object","properties":{}}}
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(report.network_requests, 0);
+        assert_eq!(report.comparison.request.tool_count, 9);
+        let encoded = serde_json::to_string(&report).unwrap();
+        assert!(!encoded.contains(secret));
+        assert!(!encoded.contains("Authorization"));
+    }
 
     #[test]
     fn replays_non_stream_tool_call_without_network() {
