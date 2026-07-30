@@ -113,12 +113,12 @@ Exact field visibility may be reduced during implementation, but names recorded 
 
 **Produces:** structural Claude-visible response summaries for content/event shape, exact tool identity, opaque call ID hashes, argument validity, reasoning binding, usage, stop reason, terminal state, and isolated ledger transitions.
 
-- [ ] Write failing `shadow_non_streaming_*` tests proving one upstream result is locally decoded twice, bridge failure is classified and fail-open, legacy status/headers/body are byte-identical, and shadow ledger transitions never enter the enabled ledger.
-- [ ] Run the focused tests and confirm RED for missing response comparison plumbing.
-- [ ] Implement the minimal handler/session seam: clone only the already-buffered JSON value, run legacy serving first/authoritatively, run isolated bridge recovery for comparison, and suppress all comparison/forensics errors from the served response.
-- [ ] Add structured comparisons for visible content kinds/counts, restored identities/call IDs, argument validation state, reasoning binding state, usage, stop reason, terminal state, and ledger summary without retaining plaintext content.
-- [ ] Re-run focused, handler, bridge, ledger, and forwarder tests plus `cargo check`.
-- [ ] Commit as `feat(proxy): compare shadow response recovery`.
+- [x] Write failing `shadow_non_streaming_*` tests proving one upstream result is locally decoded twice, bridge failure is classified and fail-open, legacy status/headers/body are byte-identical, and shadow ledger transitions never enter the enabled ledger.
+- [x] Run the focused tests and confirm RED for missing response comparison plumbing.
+- [x] Implement the minimal handler/session seam: clone only the already-buffered JSON value, run legacy serving first/authoritatively, run isolated bridge recovery for comparison, and suppress all comparison/forensics errors from the served response.
+- [x] Add structured comparisons for visible content kinds/counts, restored identities/call IDs, argument validation state, reasoning binding state, usage, stop reason, terminal state, and ledger summary without retaining plaintext content.
+- [x] Re-run focused, handler, bridge, ledger, and forwarder tests plus `cargo check`.
+- [x] Commit the response recovery comparison in `df9f4bf3` (`feat(proxy): compare structured shadow turns`).
 
 ## Task 3: Bounded Same-Stream Shadow Observation
 
@@ -126,12 +126,12 @@ Exact field visibility may be reduced during implementation, but names recorded 
 
 **Produces:** request-scoped incremental observer with explicit byte/event/item limits, typed event/Claude-shape/usage/tool/terminal/ledger summaries, and deterministic cleanup on EOF/error/drop/cancellation.
 
-- [ ] Write failing `shadow_stream_*` tests for text, reasoning, one tool, parallel tools, malformed/unknown/incomplete events, observer failure, upstream error, forensics failure, cancellation, and limit exhaustion. Assert legacy SSE bytes/order/terminal event are identical with observer success/failure and there is one upstream subscription/request.
-- [ ] Run `cargo test shadow_stream --lib -- --nocapture`; confirm RED for the missing observer seam.
-- [ ] Implement a synchronous/incremental observer call inside the existing legacy chunk-consumption path. It may retain only bounded framing remainder, typed decisions, counts, hashes, and isolated ledger state; limit overflow becomes `IncompleteObservation` and detaches comparison without blocking/yield replacement.
-- [ ] Ensure no spawned task, unbounded channel, second response-body subscription, second OAuth lookup, or second HTTP request is introduced; Drop clears request-local buffers.
-- [ ] Re-run shadow stream, legacy streaming, strict streaming, fragmentation, handler, and forwarder suites plus `cargo check`.
-- [ ] Commit as `feat(proxy): observe one upstream shadow stream`.
+- [x] Write failing `shadow_stream_*` tests for text, reasoning, one tool, parallel tools, malformed/unknown/incomplete events, observer failure, upstream error, forensics failure, cancellation, and limit exhaustion. Assert legacy SSE bytes/order/terminal event are identical with observer success/failure and there is one upstream subscription/request.
+- [x] Run `cargo test shadow_stream --lib -- --nocapture`; confirm RED for the missing observer seam.
+- [x] Implement a synchronous/incremental observer call inside the existing legacy chunk-consumption path. It may retain only bounded framing remainder, typed decisions, counts, hashes, and isolated ledger state; limit overflow becomes `IncompleteObservation` and detaches comparison without blocking/yield replacement.
+- [x] Ensure no spawned task, unbounded channel, second response-body subscription, second OAuth lookup, or second HTTP request is introduced; Drop clears request-local buffers.
+- [x] Re-run shadow stream, legacy streaming, strict streaming, fragmentation, handler, and forwarder suites plus `cargo check`.
+- [x] Commit the stream observer in `df9f4bf3` (`feat(proxy): compare structured shadow turns`).
 
 ## Task 4: Safe Forensics, Offline Replay, and Full Matrix
 
@@ -139,13 +139,13 @@ Exact field visibility may be reduced during implementation, but names recorded 
 
 **Produces:** `ShadowComparisonReplayReport { comparison, network_requests: 0 }` through production comparison logic and safe structural evidence.
 
-- [ ] Write failing replay/matrix tests for `Read`, `Glob`, `Grep`, `Bash`, `Edit`, `Write`, `NotebookEdit`, `Task`, MCP/dynamic tools, sanitized collisions, and rejected `BatchTool`; single/parallel calls; fragmented/empty/invalid JSON; duplicate call IDs; unknown tools; visible-tool interruption; result closure; orphan result; compaction; same-request retry; model/profile change; child session; encrypted/no-encrypted reasoning; reasoning around tools; and cross-session rejection.
-- [ ] Add failure-path tests for shadow compile/compare failure, forensic suppression/write failure, cancellation, and `network_requests == 0`. Use only structured literal assertions and sentinel leak checks—no sensitive golden payloads.
-- [ ] Run `cargo test shadow_replay --lib -- --nocapture` and the matrix filters; confirm RED for missing replay/report behavior.
-- [ ] Implement replay by invoking the production request/non-stream/stream comparison APIs directly without constructing any network client or Tauri state.
-- [ ] Persist only the safe report artifact (or structural suppression/failure record); evidence-store errors remain fail-open to legacy.
-- [ ] Re-run shadow/replay/forensics/tool/ledger/stream suites plus `cargo check`.
-- [ ] Commit as `test(proxy): replay structured shadow comparisons`.
+- [x] Write failing replay/matrix tests for `Read`, `Glob`, `Grep`, `Bash`, `Edit`, `Write`, `NotebookEdit`, `Task`, MCP/dynamic tools, sanitized collisions, and rejected `BatchTool`; single/parallel calls; fragmented/empty/invalid JSON; duplicate call IDs; unknown tools; visible-tool interruption; result closure; orphan result; compaction; same-request retry; model/profile change; child session; encrypted/no-encrypted reasoning; reasoning around tools; and cross-session rejection.
+- [x] Add failure-path tests for shadow compile/compare failure, forensic suppression/write failure, cancellation, and `network_requests == 0`. Use only structured literal assertions and sentinel leak checks—no sensitive golden payloads.
+- [x] Run `cargo test shadow_replay --lib -- --nocapture` and the matrix filters; confirm RED for missing replay/report behavior.
+- [x] Implement replay by invoking the production request/non-stream/stream comparison APIs directly without constructing any network client or Tauri state.
+- [x] Persist only the safe report artifact (or structural suppression/failure record); evidence-store errors remain fail-open to legacy.
+- [x] Re-run shadow/replay/forensics/tool/ledger/stream suites plus `cargo check`.
+- [x] Commit replay coverage in `db903785` (`feat(proxy): calculate shadow rollout readiness`).
 
 ## Task 5: Pure Readiness and Rollout Gate
 
@@ -153,12 +153,12 @@ Exact field visibility may be reduced during implementation, but names recorded 
 
 **Produces:** `LiveSmokeStatus`, `ShadowReadinessInput`, `ShadowReadinessSummary`, stable blocking reason codes, and no automatic provider mutation.
 
-- [ ] Write failing `rollout_readiness_*` tests for sample count, supported fixture coverage, expected/accepted/unexplained counts, comparison failure, forensic suppression/failure, visible-tool retry safety, rollback availability, and each live-smoke state.
-- [ ] Prove with literal assertions that unexplained differences, missing rollback, unsafe retry, incomplete fixtures, comparison/forensic failures, and `NotRun`/`Pending`/`Failed`/`Blocked` smoke prevent `ready`; local passing tests cannot synthesize `Passed`.
-- [ ] Run `cargo test rollout_readiness --lib -- --nocapture`; confirm RED.
-- [ ] Implement the pure reduction and safe serialization. It reports only; it has no `Provider` mutator and no automatic mode transition.
-- [ ] Re-run readiness, shadow, replay, and provider tests plus `cargo check`.
-- [ ] Commit as `feat(proxy): calculate shadow rollout readiness`.
+- [x] Write failing `rollout_readiness_*` tests for sample count, supported fixture coverage, expected/accepted/unexplained counts, comparison failure, forensic suppression/failure, visible-tool retry safety, rollback availability, and each live-smoke state.
+- [x] Prove with literal assertions that unexplained differences, missing rollback, unsafe retry, incomplete fixtures, comparison/forensic failures, and `NotRun`/`Pending`/`Failed`/`Blocked` smoke prevent `ready`; local passing tests cannot synthesize `Passed`.
+- [x] Run `cargo test rollout_readiness --lib -- --nocapture`; confirm RED.
+- [x] Implement the pure reduction and safe serialization. It reports only; it has no `Provider` mutator and no automatic mode transition.
+- [x] Re-run readiness, shadow, replay, and provider tests plus `cargo check`.
+- [x] Commit as `db903785` (`feat(proxy): calculate shadow rollout readiness`).
 
 ## Task 6: Explicit Provider Opt-In and Immediate Rollback UI
 
@@ -166,13 +166,13 @@ Exact field visibility may be reduced during implementation, but names recorded 
 
 **Produces:** `ClaudeCodexBridgeMode = "legacy" | "shadow" | "enabled"`; `ProviderMeta.bridgeMode`; scope-gated advanced selector; save/load/import/export round-trip through existing provider serialization.
 
-- [ ] Write failing frontend tests proving missing/old data renders and saves `legacy`, all three values round-trip, the selector appears only for Claude + Codex OAuth + Responses, `enabled` requires an explicit selection, switching to `legacy` is persisted for the next request, and other providers/formats retain no bridge field.
-- [ ] Run the exact Vitest files and confirm RED for missing type/state/UI behavior.
-- [ ] Add state initialized with `initialData?.meta?.bridgeMode ?? "legacy"`; render the selector in the existing advanced area only for the scoped provider/format; add concise warning that shadow serves legacy, enabled is experimental, and legacy is immediate rollback.
-- [ ] Save `bridgeMode` only for the eligible scope while preserving an explicit `legacy` rollback value; delete it when scope changes. Keep backend default and serde compatibility unchanged.
-- [ ] Add English, Simplified Chinese, Traditional Chinese, and Japanese strings; do not refactor unrelated UI.
-- [ ] Run focused unit tests, `pnpm typecheck`, `pnpm format:check`, full `pnpm test:unit`, and `pnpm build:renderer`.
-- [ ] Commit as `feat(ui): add Claude Codex bridge opt-in`.
+- [x] Write failing frontend tests proving missing/old data renders and saves `legacy`, all three values round-trip, the selector appears only for Claude + Codex OAuth + Responses, `enabled` requires an explicit selection, switching to `legacy` is persisted for the next request, and other providers/formats retain no bridge field.
+- [x] Run the exact Vitest files and confirm RED for missing type/state/UI behavior.
+- [x] Add state initialized with `initialData?.meta?.bridgeMode ?? "legacy"`; render the selector in the existing advanced area only for the scoped provider/format; add concise warning that shadow serves legacy, enabled is experimental, and legacy is immediate rollback.
+- [x] Save `bridgeMode` only for the eligible scope while preserving an explicit `legacy` rollback value; delete it when scope changes. Keep backend default and serde compatibility unchanged.
+- [x] Add English, Simplified Chinese, Traditional Chinese, and Japanese strings; do not refactor unrelated UI.
+- [x] Run focused unit tests, `pnpm typecheck`, `pnpm format:check`, full `pnpm test:unit`, and `pnpm build:renderer`; record the unrelated repository-wide Vitest discovery/concurrency failures in the design.
+- [x] Commit as `fc8a05c2` (`feat(ui): add Claude Codex bridge opt-in`).
 
 ## Task 7: Documentation, Runbook, Verification, and Scope Audit
 
@@ -180,12 +180,13 @@ Exact field visibility may be reduced during implementation, but names recorded 
 
 - [x] Write the manual smoke runbook before any live call: disposable directory setup/cleanup; no real-project Edit/Write/Bash; ordinary text/reasoning; `Read`; `Glob`/`Grep`; safe `Write`/`Edit`; safe Bash/test; parallel tools; result continuation; optional MCP/dynamic tool; optional child `Task`; immediate rollback; safe structured result recording.
 - [x] Check local OAuth login availability without reading or printing token/cookie/Authorization values.
-- [ ] If live validation is feasible, report exact flows, quota/network impact, and temporary directory, then stop for explicit authorization before the first network request. Without authorization, record `LiveSmokeStatus::NotRun` and exact status `Stage 5 implementation complete; live validation pending`.
-- [x] Update the design with the actual interfaces, taxonomy, single-request proof, legacy-output guarantee, opt-in/rollback semantics, readiness result, replay coverage, live status, limitations, and Stage 6 boundary. Live validation remains explicitly pending.
-- [ ] Mark only genuinely completed checkboxes in this plan; scan for placeholders and interface drift.
-- [ ] Run the complete verification matrix below and record counts/zero-match filters accurately.
-- [ ] Perform the Scope / Leak Audit below, inspect `git diff --check`, `git status --short`, and `.codegraph/` status without reading its content.
-- [ ] Commit as `docs: record Claude Codex bridge stage 5`.
+- [x] Live validation was explicitly authorized and run in an isolated temporary environment. Text/reasoning and rollback passed; the first `Read` tool stream recorded `comparison_failures=1`/`bounded=false`, so `LiveSmokeStatus::Failed`, readiness remains false, and all later live flows were stopped.
+- [x] Reproduce and fix the post-failure accounting amplification offline: one observer failure followed by three chunks previously produced four internal failure differences; the observer now detaches after the first failure and the regression records exactly one. The initial live tool-stream trigger remains a rollout blocker.
+- [x] Update the design with the actual interfaces, taxonomy, single-request proof, legacy-output guarantee, opt-in/rollback semantics, readiness result, replay coverage, live status, limitations, and Stage 6 boundary.
+- [x] Mark only genuinely completed implementation checkboxes in this plan; scan for placeholders and interface drift. Rollout acceptance remains unchecked because live smoke failed.
+- [x] Run the complete verification matrix and record counts/zero-match filters accurately. The post-smoke regression run passed all 2399 library tests (2397 passed, 2 ignored) and 8/8 focused shadow tests; `mcp_commands` passed 23/23 with its test path writable. Full integration remains blocked by Windows symlink privilege error 1314 in `skill_sync`.
+- [x] Perform the Scope / Leak Audit below, inspect `git diff --check`, `git status --short`, and `.codegraph/` status without reading its content.
+- [x] Commit the original documentation record as `6edcf76d` (`docs: record Claude Codex bridge stage 5`).
 
 ## Complete Verification Matrix
 

@@ -271,6 +271,7 @@ pub struct ShadowComparisonSession {
     prepared: Option<PreparedCodexTurn>,
     report: ShadowComparisonReport,
     stream_observation: Option<ShadowStreamObservation>,
+    stream_observation_failed: bool,
     legacy_stream: ShadowStreamAccumulator,
 }
 
@@ -372,6 +373,7 @@ impl ShadowComparisonSession {
             prepared: Some(prepared),
             report,
             stream_observation: None,
+            stream_observation_failed: false,
             legacy_stream: ShadowStreamAccumulator::default(),
         }
     }
@@ -427,6 +429,7 @@ impl ShadowComparisonSession {
             prepared: Some(prepared),
             report,
             stream_observation: None,
+            stream_observation_failed: false,
             legacy_stream: ShadowStreamAccumulator::default(),
         }
     }
@@ -497,6 +500,9 @@ impl ShadowComparisonSession {
     }
 
     pub fn observe_stream_chunk(&mut self, chunk: &[u8]) {
+        if self.stream_observation_failed {
+            return;
+        }
         if self.stream_observation.is_none() {
             let Some(prepared) = self.prepared.take() else {
                 self.fail_open(ShadowReasonCode::InternalComparisonFailure);
@@ -516,6 +522,7 @@ impl ShadowComparisonSession {
             || observation.bridge.event_kinds.len() >= MAX_SHADOW_STREAM_EVENTS
         {
             self.stream_observation = None;
+            self.stream_observation_failed = true;
             self.fail_open(ShadowReasonCode::IncompleteShadowObservation);
             return;
         }
@@ -562,6 +569,7 @@ impl ShadowComparisonSession {
         }
         if failed {
             self.stream_observation = None;
+            self.stream_observation_failed = true;
             self.fail_open(ShadowReasonCode::IncompleteShadowObservation);
         }
     }
@@ -1169,6 +1177,43 @@ mod tests {
                 && difference.disposition == ShadowDifferenceDisposition::Expected
                 && difference.reason_code == ShadowReasonCode::BridgeStrictRejection
         }));
+        assert_eq!(report.readiness.comparison_failures, 1);
+    }
+
+    #[test]
+    fn shadow_stream_failure_is_recorded_once_after_observer_detaches() {
+        let bridge = ClaudeCodexBridge::with_ledger(ConversationLedger::default());
+        let prepared = bridge
+            .prepare_turn(
+                &AppType::Claude,
+                request("fixture"),
+                &provider(),
+                Some("shadow-stream-detach"),
+            )
+            .unwrap();
+        let mut session = ShadowComparisonSession::compare_request(prepared, &json!({}));
+        let invalid = concat!(
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\"}\n\n"
+        );
+
+        session.observe_stream_chunk(invalid.as_bytes());
+        for _ in 0..3 {
+            session.observe_stream_chunk(b"event: response.completed\ndata: {}\n\n");
+        }
+        session.finish_stream();
+
+        let report = session.report();
+        let failures = report
+            .differences
+            .iter()
+            .filter(|difference| difference.kind == ShadowDifferenceKind::InternalComparisonFailure)
+            .collect::<Vec<_>>();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures[0].reason_code,
+            ShadowReasonCode::IncompleteShadowObservation
+        );
         assert_eq!(report.readiness.comparison_failures, 1);
     }
 

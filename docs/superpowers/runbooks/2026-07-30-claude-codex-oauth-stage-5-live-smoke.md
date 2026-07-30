@@ -1,6 +1,17 @@
 # Claude Code Codex OAuth Stage 5 Live Smoke Runbook
 
-**Status:** Not run. Explicit user authorization is required before the first network request.
+**Status:** Failed on 2026-07-30; rollout remains blocked. A new explicit authorization is required for any rerun.
+
+## 2026-07-30 result
+
+- Environment: isolated temporary home, isolated CC Switch database, copied OAuth store without inspecting values, disposable tool directory, and a debug-only local proxy startup hook removed immediately after the run.
+- Passed: direct Anthropic-compatible text, Claude Code streaming text, Claude Code reasoning, legacy-served `Read`, tool-result continuation, and immediate rollback to explicit `legacy`.
+- Shadow evidence for text/reasoning: request matched structurally, zero unexplained differences, zero comparison failures, bounded stream observation, HTTP 200, and Claude Code exit 0.
+- Blocking result: the first `Read` tool-call stream was served successfully by legacy, but shadow recorded one comparison failure and an unbounded/incomplete observation. The continuation turn was bounded and failure-free. No visible tool was retried. Post-run offline diagnosis proved that the large difference count was inflated because every later upstream chunk re-recorded the same detached-observer failure; a red/green regression now limits that incident to one structured failure. The initial tool-stream observation trigger remains unresolved.
+- Not run after the blocker: Glob/Grep, Write/Edit, Bash/test, parallel tools, optional MCP/Task, and `enabled` mode.
+- Rollback: the next Claude Code text request completed with no new shadow diagnostic.
+- Cleanup: application/proxy/dev processes stopped; the exact disposable directory, copied OAuth store, isolated database, fixtures, and logs were deleted. Real user configuration was unchanged.
+- Readiness: `LiveSmokeStatus::Failed`; blocker `ComparisonFailures`. Do not opt into `enabled` or mark Stage 5 rollout-ready until the initial tool-stream observation trigger is reproduced and fixed offline and a newly authorized live rerun completes the required matrix.
 
 ## Safety boundary
 
