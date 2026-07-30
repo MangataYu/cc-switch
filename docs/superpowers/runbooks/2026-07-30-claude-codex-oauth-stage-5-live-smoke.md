@@ -1,6 +1,18 @@
 # Claude Code Codex OAuth Stage 5 Live Smoke Runbook
 
-**Status:** Failed on 2026-07-30 with blocker `FixtureCoverageIncomplete`; rollout remains blocked. Glob/Grep passed through Claude Code, and the deterministic Claude-protocol Write/Edit continuation below cleared the prior `ComparisonFailures` blocker for that bridge path. Bash, dedicated parallel tools, optional MCP/Task, and `enabled` mode remain unverified.
+**Status:** Failed on 2026-07-30 with blocker `FixtureCoverageIncomplete`; rollout remains blocked. All required `shadow` tool fixtures now pass, including Claude Code filesystem Write/Edit, Bash, and parallel Glob/Grep. The first `enabled` Read call closed with a tool-result error, so later `enabled` fixtures were not run. Optional MCP/Task remain unverified.
+
+## 2026-07-30 remaining Stage 5 fixture run
+
+- Refresh boundary: used a fresh isolated application/database/provider with the current access token held only in process memory and a fail-closed refresh guard. The installed CC Switch remained stopped. Safe logs contained zero refresh and zero HTTP 401/403 signals; the real Codex auth file, real CC Switch OAuth store, and isolated OAuth-store copy retained their pre-run SHA-256 hashes.
+- Claude Code Write/Edit passed in `shadow`: exactly one `Write` and one `Edit`, two unique tool-use IDs, two matching successful result closures, no other tool, exit 0, and no top-level result error. The disposable file was created, the original marker was absent afterward, and the replacement marker was present. Its three stream reports were bounded and failure-free.
+- Claude Code Bash passed in `shadow`: exactly one `Bash`, one matching successful closure, no other tool, exit 0, and no top-level result error. The command only validated a disposable local marker.
+- Parallel root cause and TDD fix: the first dedicated Glob/Grep request returned both tools sequentially because the Codex OAuth converter defaulted `parallel_tool_calls` to `false` whenever the Anthropic request omitted that Responses-only field. A focused RED proved tools must default to parallel-enabled; a second RED proved `tool_choice.disable_parallel_tool_use=true` must still force sequential execution. The minimal converter fix passed seven focused Codex OAuth transformation tests and the full 82-test `transform_responses` suite.
+- Parallel live GREEN: after rebuilding the isolated no-refresh binary with the fix, Claude Code returned exactly one Glob and one Grep with two unique IDs and two matching successful closures in two upstream turns: the shared initial assistant turn and the terminal continuation. The post-fix stream reports were bounded, failure-free, and had no unexplained differences.
+- Aggregate `shadow` evidence: all 14 stream reports in the attempt had `unexplained=0`, `comparison_failures=0`, `bounded=true`, and empty safe reason-code lists.
+- `enabled` fail-fast: the ordinary no-tool probe exited 0 without error. The next fixture returned exactly one Read and one matching closure, but the Claude Code tool result was marked as an error. The visible Read was not retried; enabled Write/Edit, Bash, and parallel tools were not run.
+- Rollback and cleanup: switched immediately to explicit `legacy`, where a no-tool request exited 0 without error. Across the complete attempt, all 18 recorded upstream requests returned HTTP 200. Proxy/takeover/failover were disabled, the isolated application was stopped, and the exact temporary directory containing raw prompts, SSE, tool arguments/results, logs, fixtures, and the credential copy was deleted.
+- Readiness remains `LiveSmokeStatus::Failed` with blocker `FixtureCoverageIncomplete`. Required `shadow` coverage is complete; the `enabled` gate remains incomplete after the Read tool-result error. Optional MCP/Task are still not required for the base gate.
 
 ## 2026-07-30 deterministic Write/Edit continuation rerun
 

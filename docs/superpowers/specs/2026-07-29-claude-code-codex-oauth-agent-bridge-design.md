@@ -261,6 +261,8 @@ pub enum SupportLevel {
 
 The profile is selected once when a turn is prepared and stored in the turn. Configuration changes affect new turns only.
 
+Anthropic requests do not carry the Responses-only `parallel_tool_calls` field. When at least one Claude tool is present, the Codex OAuth request projection therefore enables parallel tool calls by default. An explicit Anthropic `tool_choice.disable_parallel_tool_use: true` projects to `parallel_tool_calls: false`; the converter must not silently disable parallel execution merely because the Responses field was absent at the Claude boundary.
+
 ### 8.2 Negotiation report
 
 Request preparation produces a report:
