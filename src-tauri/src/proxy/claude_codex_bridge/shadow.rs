@@ -289,12 +289,20 @@ struct ShadowStreamAccumulator {
     buffer: String,
     utf8_remainder: Vec<u8>,
     event_kinds: Vec<String>,
+    semantic_events: Vec<ShadowSemanticEvent>,
     text_events: usize,
     reasoning_events: usize,
     tool_events: usize,
     usage_events: usize,
     terminal_events: usize,
     complete: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ShadowSemanticEvent {
+    kind: String,
+    index: Option<u32>,
+    classification: ShadowEventClass,
 }
 
 impl ShadowComparisonSession {
@@ -624,11 +632,8 @@ impl ShadowComparisonSession {
         observation.bridge.complete = bridge_complete;
         let legacy = self.legacy_stream.shape();
         let bridge = observation.bridge.shape();
-        let shape_matches = legacy.event_count == bridge.event_count
-            && legacy.text_events == bridge.text_events
-            && legacy.reasoning_events == bridge.reasoning_events
-            && legacy.tool_events == bridge.tool_events
-            && legacy.terminal_events == bridge.terminal_events;
+        let shape_matches =
+            self.legacy_stream.semantic_events == observation.bridge.semantic_events;
         if !shape_matches {
             self.report.differences.push(ShadowDifference {
                 kind: ShadowDifferenceKind::ResponseEventMismatch,
@@ -669,6 +674,12 @@ impl ShadowComparisonSession {
 impl ShadowStreamAccumulator {
     fn record_bridge_event(&mut self, event: &ClaudeStreamEvent) {
         let kind = claude_stream_event_kind(event);
+        let index = match event {
+            ClaudeStreamEvent::ContentBlockStart { index, .. }
+            | ClaudeStreamEvent::ContentBlockDelta { index, .. }
+            | ClaudeStreamEvent::ContentBlockStop { index } => Some(*index),
+            _ => None,
+        };
         let classification = match event {
             ClaudeStreamEvent::ContentBlockStart {
                 block: ClaudeContentBlock::ToolUse { .. },
@@ -692,7 +703,7 @@ impl ShadowStreamAccumulator {
             } => ShadowEventClass::Text,
             _ => ShadowEventClass::Other,
         };
-        self.record_classified(kind, classification);
+        self.record_classified(kind, index, classification);
     }
 
     fn record_legacy_event(&mut self, kind: &str, payload: &Value) {
@@ -706,14 +717,34 @@ impl ShadowStreamAccumulator {
             Some("text_delta") => ShadowEventClass::Text,
             _ => ShadowEventClass::Other,
         };
-        self.record_classified(kind, classification);
+        let index = payload
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|index| u32::try_from(index).ok());
+        self.record_classified(kind, index, classification);
     }
 
-    fn record_classified(&mut self, kind: &str, classification: ShadowEventClass) {
+    fn record_classified(
+        &mut self,
+        kind: &str,
+        index: Option<u32>,
+        classification: ShadowEventClass,
+    ) {
         if self.event_kinds.len() >= MAX_SHADOW_STREAM_EVENTS {
             return;
         }
         self.event_kinds.push(kind.to_string());
+        let semantic_event = ShadowSemanticEvent {
+            kind: kind.to_string(),
+            index,
+            classification,
+        };
+        let collapsible = kind == "content_block_delta"
+            && classification == ShadowEventClass::Tool
+            && self.semantic_events.last() == Some(&semantic_event);
+        if !collapsible {
+            self.semantic_events.push(semantic_event);
+        }
         match classification {
             ShadowEventClass::Text => self.text_events += 1,
             ShadowEventClass::Reasoning => self.reasoning_events += 1,
@@ -1091,6 +1122,26 @@ mod tests {
         })
     }
 
+    fn glob_request(secret: &str) -> serde_json::Value {
+        json!({
+            "model": "gpt-5.6",
+            "stream": true,
+            "max_tokens": 128,
+            "messages": [{"role":"user","content":secret}],
+            "tools": [{
+                "name":"Glob",
+                "description":"Find files by pattern",
+                "input_schema": {
+                    "type":"object",
+                    "properties":{"pattern":{"type":"string"}},
+                    "required":["pattern"],
+                    "additionalProperties":false
+                }
+            }],
+            "tool_choice": {"type":"tool","name":"Glob"}
+        })
+    }
+
     #[test]
     fn shadow_request_comparison_is_typed_deterministic_and_leak_free() {
         let secret = "sk-secret prompt Authorization cookie tool-arguments reasoning";
@@ -1348,6 +1399,76 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn shadow_fragmented_tool_arguments_are_semantically_equivalent() {
+        use bytes::Bytes;
+        use futures::{stream, StreamExt};
+
+        let original = glob_request("find the Rust fixtures");
+        let bridge = ClaudeCodexBridge::with_ledger(ConversationLedger::default());
+        let prepared = bridge
+            .prepare_turn(
+                &AppType::Claude,
+                original.clone(),
+                &provider(),
+                Some("shadow-fragmented-glob"),
+            )
+            .unwrap();
+        let cache_key = prepared.request["prompt_cache_key"]
+            .as_str()
+            .expect("prepared request cache key")
+            .to_string();
+        let legacy_request = crate::proxy::providers::transform_responses::anthropic_to_responses(
+            original,
+            Some(&cache_key),
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(legacy_request["tools"][0]["name"], "Glob");
+        assert_eq!(prepared.request["tools"][0]["name"], "find_files");
+
+        let upstream = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_glob\",\"model\":\"gpt-5.6\"}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"fc_glob\",\"type\":\"function_call\",\"call_id\":\"call_glob\",\"name\":\"Glob\",\"status\":\"in_progress\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_glob\",\"output_index\":0,\"delta\":\"{\\\"pattern\\\":\",\"sequence_number\":1}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_glob\",\"output_index\":0,\"delta\":\"\\\"*.rs\\\"}\",\"sequence_number\":2}\n\n",
+            "event: response.function_call_arguments.done\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_glob\",\"output_index\":0,\"name\":\"Glob\",\"arguments\":\"{\\\"pattern\\\":\\\"*.rs\\\"}\",\"sequence_number\":3}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"fc_glob\",\"type\":\"function_call\",\"call_id\":\"call_glob\",\"name\":\"Glob\",\"arguments\":\"{\\\"pattern\\\":\\\"*.rs\\\"}\",\"status\":\"completed\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}}\n\n"
+        );
+        let legacy_chunks =
+            crate::proxy::providers::streaming_responses::create_anthropic_sse_stream_from_responses(
+                stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(
+                    upstream.as_bytes(),
+                ))]),
+            )
+            .collect::<Vec<_>>()
+            .await;
+        let mut session = ShadowComparisonSession::compare_request(prepared, &legacy_request);
+
+        session.observe_stream_chunk(upstream.as_bytes());
+        for chunk in legacy_chunks {
+            session.observe_legacy_stream_chunk(&chunk.unwrap());
+        }
+        session.finish_stream();
+
+        let report = session.report();
+        let stream = report.stream.as_ref().expect("bounded stream comparison");
+        assert_eq!(report.readiness.comparison_failures, 0);
+        assert_eq!(report.readiness.unexplained_differences, 0);
+        assert!(stream.bounded);
+        assert!(stream.shape_matches);
+        assert_ne!(stream.legacy.tool_events, stream.bridge.tool_events);
+    }
+
     #[test]
     fn rollout_readiness_requires_every_local_and_live_gate() {
         let mut input = ShadowReadinessInput {
@@ -1500,5 +1621,57 @@ mod tests {
         let encoded = serde_json::to_string(&bridge.shape()).unwrap();
         assert!(!encoded.contains("secret"));
         assert!(!encoded.contains("private reasoning"));
+    }
+
+    #[test]
+    fn shadow_tool_fragment_normalization_keeps_block_indexes_distinct() {
+        let mut stream = ShadowStreamAccumulator::default();
+        for index in [0, 0, 1] {
+            stream.record_legacy_event(
+                "content_block_delta",
+                &json!({
+                    "index": index,
+                    "delta": {"type":"input_json_delta","partial_json":"private"}
+                }),
+            );
+        }
+
+        assert_eq!(stream.tool_events, 3);
+        assert_eq!(stream.semantic_events.len(), 2);
+        assert_eq!(stream.semantic_events[0].index, Some(0));
+        assert_eq!(stream.semantic_events[1].index, Some(1));
+    }
+
+    #[test]
+    fn shadow_tool_fragment_normalization_does_not_collapse_non_tool_deltas() {
+        use crate::proxy::claude_codex_bridge::streaming::{ClaudeContentDelta, ClaudeStreamEvent};
+
+        let mut stream = ShadowStreamAccumulator::default();
+        for delta in [
+            ClaudeContentDelta::Text {
+                text: "private".to_string(),
+            },
+            ClaudeContentDelta::Text {
+                text: "private".to_string(),
+            },
+            ClaudeContentDelta::Thinking {
+                text: "private".to_string(),
+            },
+            ClaudeContentDelta::Thinking {
+                text: "private".to_string(),
+            },
+            ClaudeContentDelta::Signature {
+                signature: "private".to_string(),
+            },
+            ClaudeContentDelta::Signature {
+                signature: "private".to_string(),
+            },
+        ] {
+            stream.record_bridge_event(&ClaudeStreamEvent::ContentBlockDelta { index: 0, delta });
+        }
+
+        assert_eq!(stream.semantic_events.len(), 6);
+        assert_eq!(stream.text_events, 2);
+        assert_eq!(stream.reasoning_events, 4);
     }
 }
