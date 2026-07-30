@@ -1,6 +1,15 @@
 # Claude Code Codex OAuth Stage 5 Live Smoke Runbook
 
-**Status:** Failed on 2026-07-30 with blocker `ComparisonFailures`; rollout remains blocked. The Glob/Grep tool-fragment fix passed live, but the later Write/Edit flow produced an incomplete shadow observation and the expected Edit marker was not applied.
+**Status:** Failed on 2026-07-30 with blocker `ComparisonFailures`; rollout remains blocked. The Glob/Grep tool-fragment fix passed live. The later Write/Edit incomplete observation now has an offline production-chain regression and fix, but no new live run has been authorized, and the expected Edit marker was not applied in the last live run.
+
+## 2026-07-30 Write/Edit incomplete-observation offline fix
+
+- Exact offline reproduction: a three-turn production-converter replay issued `Write`, continued with its matching result, issued `Edit`, continued with an error result, and ended with reasoning, text, and `response.completed`. Before the fix, the final shadow report reproduced `comparison_failures=1`, `bounded=false`, and `unexplained=0` without plaintext or raw-payload diagnostics.
+- Confirmed offline cause: the legacy production converter explicitly accepts the identity-bearing legacy lifecycle event `response.reasoning.done`, but the strict shadow typed decoder classified it as an unknown semantic Responses event. That decode failure detached the strict observer and entered the `IncompleteShadowObservation` fail-open path. The preceding Write/Edit identity and schema validation, legacy-name re-projection, unique call identities, both tool-result closures, the Edit error result, and the final terminal event all passed in the same regression.
+- Minimal fix: the strict decoder now maps only an identity-bearing `response.reasoning.done` into the existing `ReasoningDone` state-machine event and preserves optional encrypted content through the existing signature path. An anonymous completion still fails closed. Tool identity, call identity, argument validation, visible-tool retry safety, content-block ordering/lifecycle, reasoning/signature handling, and terminal completeness were not relaxed.
+- TDD evidence: the focused production-chain test first failed with the exact tuple `(comparison_failures=1, bounded=false, unexplained=0)` and then passed after the typed mapping. A focused decoder test also proves encrypted content is preserved and missing reasoning identity is rejected. Serialized comparison assertions exclude fixture paths, tool-result text, call IDs, and reasoning text.
+- Attribution boundary: raw traffic from the prior live run was deleted as required, so this offline-equivalent failure cannot retroactively prove the exact historical SSE payload. A separately authorized live rerun is still required to close the Write/Edit blocker.
+- Readiness remains `LiveSmokeStatus::Failed` with blocker `ComparisonFailures`; do not run `enabled` or mark the live gate passed from offline evidence alone.
 
 ## 2026-07-30 credential-handoff live rerun
 
