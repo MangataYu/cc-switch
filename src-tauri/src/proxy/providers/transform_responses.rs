@@ -1319,6 +1319,57 @@ mod tests {
     }
 
     #[test]
+    fn test_anthropic_to_responses_preserves_multiple_tool_result_identities_and_order() {
+        let input = json!({
+            "model": "gpt-5.6",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_glob_1",
+                        "content": "src/**/*.rs"
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_grep_2",
+                        "content": "src/main.rs:42"
+                    }
+                ]
+            }]
+        });
+
+        let result = anthropic_to_responses(input, None, false, false).unwrap();
+        let outputs = result["input"].as_array().unwrap();
+
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(
+            outputs,
+            &vec![
+                json!({
+                    "type": "function_call_output",
+                    "call_id": "call_glob_1",
+                    "output": "src/**/*.rs"
+                }),
+                json!({
+                    "type": "function_call_output",
+                    "call_id": "call_grep_2",
+                    "output": "src/main.rs:42"
+                })
+            ]
+        );
+        for call_id in ["call_glob_1", "call_grep_2"] {
+            assert_eq!(
+                outputs
+                    .iter()
+                    .filter(|item| item["call_id"] == call_id)
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
     fn test_anthropic_to_responses_tool_result_preserves_blocks_and_error() {
         let input = json!({
             "model":"gpt-5",
@@ -1581,6 +1632,61 @@ mod tests {
         assert_eq!(result["content"][0]["id"], "call_123");
         assert_eq!(result["content"][0]["name"], "get_weather");
         assert_eq!(result["content"][0]["input"]["location"], "Tokyo");
+        assert_eq!(result["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn test_responses_to_anthropic_groups_multiple_function_calls_in_one_message() {
+        let input = json!({
+            "id": "resp_parallel_calls",
+            "object": "response",
+            "status": "completed",
+            "model": "gpt-5.6",
+            "output": [
+                {
+                    "type": "function_call",
+                    "id": "fc_glob_1",
+                    "call_id": "call_glob_1",
+                    "name": "Glob",
+                    "arguments": "{\"pattern\":\"src/**/*.rs\"}",
+                    "status": "completed"
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_grep_2",
+                    "call_id": "call_grep_2",
+                    "name": "Grep",
+                    "arguments": "{\"pattern\":\"tool_use\",\"path\":\"src\"}",
+                    "status": "completed"
+                }
+            ],
+            "usage": {"input_tokens": 20, "output_tokens": 12}
+        });
+
+        let result = responses_to_anthropic(input).unwrap();
+        let content = result["content"].as_array().unwrap();
+
+        assert_eq!(result["type"], "message");
+        assert_eq!(result["role"], "assistant");
+        assert_eq!(content.len(), 2);
+        assert_eq!(
+            content[0],
+            json!({
+                "type": "tool_use",
+                "id": "call_glob_1",
+                "name": "Glob",
+                "input": {"pattern": "src/**/*.rs"}
+            })
+        );
+        assert_eq!(
+            content[1],
+            json!({
+                "type": "tool_use",
+                "id": "call_grep_2",
+                "name": "Grep",
+                "input": {"pattern": "tool_use", "path": "src"}
+            })
+        );
         assert_eq!(result["stop_reason"], "tool_use");
     }
 
