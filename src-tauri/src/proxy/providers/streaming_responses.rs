@@ -17,8 +17,9 @@ use super::transform_responses::{
     build_anthropic_usage_from_responses, map_responses_stop_reason,
     responses_to_anthropic_with_read_offset_protection_and_trace,
 };
-use crate::proxy::bridge_forensics::ForensicStreamObserver;
-use crate::proxy::bridge_forensics::StreamingFailureContext;
+use crate::proxy::bridge_forensics::{
+    redact_protocol_value, ForensicStreamObserver, StreamingFailureContext,
+};
 use crate::proxy::claude_codex_bridge::{
     canonical_request_fingerprint,
     streaming::{
@@ -32,6 +33,7 @@ use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -608,12 +610,31 @@ fn create_strict_anthropic_sse_stream_from_responses<E: std::error::Error + Send
                         break 'upstream;
                     }
                 };
+                let payload_event_type = if named_event
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
+                {
+                    None
+                } else {
+                    data.get("type")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                };
                 let decoded = match decode_codex_response_event(named_event.as_deref(), data) {
                     Ok(decoded) => decoded,
                     Err(error) => {
+                        let event_type = named_event
+                            .as_deref()
+                            .filter(|value| !value.is_empty())
+                            .or(payload_event_type.as_deref());
+                        let failure_kind = format!(
+                            "typed_decode_error:{}",
+                            safe_responses_event_label(event_type)
+                        );
                         set_strict_failure_context(
                             &observer,
-                            "typed_decode_error",
+                            &failure_kind,
                             None,
                             None,
                             &machine,
@@ -777,6 +798,24 @@ fn serde_enum_name(state: StreamTerminalState) -> String {
         .ok()
         .and_then(|value| value.as_str().map(str::to_string))
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn safe_responses_event_label(label: Option<&str>) -> String {
+    let Some(label) = label else {
+        return "missing".to_string();
+    };
+
+    let credential_safe = redact_protocol_value(&json!({"type": label})).safe_for_full_capture;
+    if credential_safe
+        && label.len() <= 128
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        label.to_string()
+    } else {
+        format!("sha256:{:x}", Sha256::digest(label.as_bytes()))
+    }
 }
 
 fn strict_sse_payload(block: &str) -> Result<Option<(Option<String>, Value)>, BridgeError> {
@@ -3605,6 +3644,101 @@ mod tests {
             })
             .unwrap();
         ForensicStreamObserver::new(capture)
+    }
+
+    async fn capture_unknown_event_diagnostic(
+        named_event: &str,
+        payload: Value,
+    ) -> (
+        String,
+        String,
+        crate::proxy::bridge_forensics::EvidenceManifest,
+    ) {
+        use crate::proxy::bridge_forensics::BridgeForensicStore;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = BridgeForensicStore::new(temp.path().to_path_buf());
+        let mut observer = evidence_capture(&store);
+        observer
+            .upstream_event(&json!({
+                "type": "test.prelude",
+                "content": "sk-secret-payload"
+            }))
+            .unwrap();
+        let input = format!(
+            "event: {named_event}\ndata: {}\n\n",
+            serde_json::to_string(&payload).unwrap()
+        );
+        let client_output =
+            create_anthropic_sse_stream_from_responses_with_prepared_turn_and_evidence(
+                stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(input))]),
+                None,
+                None,
+                strict_prepared_turn(),
+                Some(observer),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .map(|chunk| String::from_utf8_lossy(&chunk).into_owned())
+            .collect::<String>();
+
+        let bundles = store.list_bundles().unwrap();
+        assert_eq!(bundles.len(), 1);
+        let manifest_path = temp
+            .path()
+            .join("bundles")
+            .join(&bundles[0].bundle_id.0)
+            .join("manifest.json");
+        let manifest_json = std::fs::read_to_string(manifest_path).unwrap();
+        let manifest = serde_json::from_str(&manifest_json).unwrap();
+        (client_output, manifest_json, manifest)
+    }
+
+    #[tokio::test]
+    async fn unknown_event_diagnostic_preserves_safe_type_after_artifact_suppression() {
+        let event_type = "response.future_semantic.delta";
+        let (client_output, manifest_json, manifest) = capture_unknown_event_diagnostic(
+            event_type,
+            json!({
+                "type": event_type,
+                "delta": "sk-secret-payload"
+            }),
+        )
+        .await;
+
+        assert!(!manifest.full_capture);
+        assert!(manifest.artifacts.is_empty());
+        assert_eq!(
+            manifest.error.streaming.unwrap().event_kind,
+            "typed_decode_error:response.future_semantic.delta"
+        );
+        assert!(!manifest_json.contains("sk-secret-payload"));
+        assert!(!client_output.contains("sk-secret-payload"));
+    }
+
+    #[tokio::test]
+    async fn unknown_event_diagnostic_hashes_unsafe_type_without_leaking_it() {
+        let unsafe_event_type = "response.sk-secret-label";
+        let (client_output, manifest_json, manifest) = capture_unknown_event_diagnostic(
+            unsafe_event_type,
+            json!({
+                "type": unsafe_event_type,
+                "delta": "sk-secret-payload"
+            }),
+        )
+        .await;
+
+        assert!(!manifest.full_capture);
+        assert_eq!(
+            manifest.error.streaming.unwrap().event_kind,
+            "typed_decode_error:sha256:1884ecd782cff93ebf1e9f39951e40d6162e6443d83666c8bd9d627d1b115914"
+        );
+        assert!(!manifest_json.contains(unsafe_event_type));
+        assert!(!manifest_json.contains("sk-secret-payload"));
+        assert!(!client_output.contains(unsafe_event_type));
+        assert!(!client_output.contains("sk-secret-payload"));
     }
 
     #[tokio::test]

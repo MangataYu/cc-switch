@@ -14,10 +14,11 @@ Before moving an SSE payload into the typed decoder, derive a diagnostic event l
 from the named SSE `event` field or, when absent, from the JSON `type` field. Preserve
 the existing mismatch and missing-type validation in the decoder.
 
-Only event labels matching the complete grammar `[A-Za-z0-9._-]{1,128}` may be stored
-verbatim. Any other non-empty label is represented by a stable SHA-256 digest with a
-fixed `sha256:` prefix. Missing labels remain `missing`. The diagnostic label is
-stored in the manifest's existing streaming failure `event_kind` field as
+Only event labels matching the complete grammar `[A-Za-z0-9._-]{1,128}` and passing
+the existing protocol credential-shape scan may be stored verbatim. Any other
+non-empty label is represented by a stable SHA-256 digest with a fixed `sha256:`
+prefix. Missing labels remain `missing`. The diagnostic label is stored in the
+manifest's existing streaming failure `event_kind` field as
 `typed_decode_error:<safe-label>`, so it survives full-artifact suppression without
 changing the evidence format.
 
