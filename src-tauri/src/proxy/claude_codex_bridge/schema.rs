@@ -133,7 +133,7 @@ fn validate_schema_shape(schema: &Value, path: &str) -> Result<(), BridgeError> 
         validate_type_keyword(kind, path)?;
     }
     if let Some(values) = object.get("enum") {
-        if !values.as_array().is_some_and(|values| !values.is_empty()) {
+        if values.as_array().is_none_or(|values| values.is_empty()) {
             return schema_error(&format!("{path}/enum must be a non-empty array"));
         }
     }

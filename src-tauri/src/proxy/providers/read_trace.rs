@@ -41,6 +41,7 @@ impl ReadTrace {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn upstream_fragment(
         &self,
         call: &ReadCallTrace,
@@ -67,6 +68,7 @@ impl ReadTrace {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn upstream_complete(
         &self,
         call: &ReadCallTrace,
@@ -117,6 +119,7 @@ impl ReadTrace {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn log_raw(
         &self,
         stage: &str,

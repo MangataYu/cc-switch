@@ -117,11 +117,10 @@ impl ForensicStreamObserver {
         if let Some(capture) = self.capture.as_mut() {
             capture.append_ndjson(EvidenceArtifactKind::ClaudeResponse, event)?;
         }
-        match event.get("type").and_then(Value::as_str) {
-            Some("content_block_start" | "content_block_delta" | "message_delta") => {
-                self.mark_output_visible()
-            }
-            _ => {}
+        if let Some("content_block_start" | "content_block_delta" | "message_delta") =
+            event.get("type").and_then(Value::as_str)
+        {
+            self.mark_output_visible()
         }
         Ok(())
     }

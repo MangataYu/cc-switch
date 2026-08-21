@@ -620,11 +620,9 @@ impl ShadowComparisonSession {
             chunk,
         );
         while let Some(block) = crate::proxy::sse::take_sse_block(&mut self.legacy_stream.buffer) {
-            if let Some((event_name, payload)) = parse_sse_block(&block) {
-                if let Some(event_name) = event_name {
-                    self.legacy_stream
-                        .record_legacy_event(&event_name, &payload);
-                }
+            if let Some((Some(event_name), payload)) = parse_sse_block(&block) {
+                self.legacy_stream
+                    .record_legacy_event(&event_name, &payload);
             }
         }
     }
