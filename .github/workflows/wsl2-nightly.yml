@@ -84,30 +84,32 @@ jobs:
 
       - name: Compile backend tests with native temp
         # link.exe/mt.exe cannot create manifests when TEMP points at a WSL UNC path.
-        run: cargo test --lib --manifest-path src-tauri/Cargo.toml --no-run
+        # Save nextest's build metadata so both WSL2 steps reuse these binaries
+        # without invoking the compiler or linker again.
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+        shell: pwsh
+        run: |
+          cargo metadata --format-version 1 --manifest-path src-tauri/Cargo.toml > "$env:RUNNER_TEMP/cargo-metadata.json"
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          cargo nextest list --lib --manifest-path src-tauri/Cargo.toml --list-type binaries-only --message-format json > "$env:RUNNER_TEMP/binaries-metadata.json"
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
 
       - name: Run Windows-to-WSL2 filesystem contract
         shell: pwsh
         run: |
           $env:TEMP = $env:CC_SWITCH_WSL_TEST_TEMP
           $env:TMP = $env:CC_SWITCH_WSL_TEST_TEMP
-          $testName = "config::tests::atomic_write_replaces_existing_wsl_unc_file"
-          $testList = cargo test --lib --manifest-path src-tauri/Cargo.toml -- --ignored --list
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
-          }
-          $expected = "${testName}: test"
-          if ($testList -notcontains $expected) {
-            throw "Expected ignored test was not discovered: $testName"
-          }
-          cargo test --lib --manifest-path src-tauri/Cargo.toml $testName -- --ignored --exact --nocapture
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
-          }
+          cargo nextest run --binaries-metadata "$env:RUNNER_TEMP/binaries-metadata.json" --cargo-metadata "$env:RUNNER_TEMP/cargo-metadata.json" --profile ci --test-threads 1 --run-ignored only --no-tests fail -E 'test(=config::tests::atomic_write_replaces_existing_wsl_unc_file)'
 
       - name: Run lib tests against WSL2-backed home
         shell: pwsh
         run: |
           $env:TEMP = $env:CC_SWITCH_WSL_TEST_TEMP
           $env:TMP = $env:CC_SWITCH_WSL_TEST_TEMP
-          cargo nextest run --lib --manifest-path src-tauri/Cargo.toml --profile ci --test-threads 1 -E 'not test(/database::/)'
+          cargo nextest run --binaries-metadata "$env:RUNNER_TEMP/binaries-metadata.json" --cargo-metadata "$env:RUNNER_TEMP/cargo-metadata.json" --profile ci --test-threads 1 --no-tests fail -E 'not test(/database::/)'
