@@ -12,6 +12,9 @@ name: WSL2 Nightly
 # which all create the app database, are not run. Tests run under cargo-nextest
 # one at a time, so a hung test is killed by the per-test timeout in
 # src-tauri/.config/nextest.toml instead of eating the whole job.
+# Windows symlink fixtures need native reparse-point support, and the 13k-file
+# archive-limit fixture exceeds that timeout on 9P. Run those fixtures with
+# native TEMP while keeping the remaining filesystem tests on the WSL2 share.
 on:
   schedule:
     - cron: "23 18 * * *" # 02:23 Beijing time
@@ -24,6 +27,11 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+    env:
+      NATIVE_TEMP_TEST_FILTER: >-
+        test(=codex_config::tests::resolve_catalog_rejects_symlink_escaping_config_dir) |
+        test(=services::session_usage_grokbuild::tests::symlink_cycle_does_not_cause_stack_overflow) |
+        test(=services::skill::tests::extract_repo_archive_accepts_real_world_sized_skill_repos)
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -107,9 +115,17 @@ jobs:
           $env:TMP = $env:CC_SWITCH_WSL_TEST_TEMP
           cargo nextest run --binaries-metadata "$env:RUNNER_TEMP/binaries-metadata.json" --cargo-metadata "$env:RUNNER_TEMP/cargo-metadata.json" --profile ci --test-threads 1 --run-ignored only --no-tests fail -E 'test(=config::tests::atomic_write_replaces_existing_wsl_unc_file)'
 
+      - name: Run native-filesystem fixture tests
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+        shell: pwsh
+        run: |
+          cargo nextest run --binaries-metadata "$env:RUNNER_TEMP/binaries-metadata.json" --cargo-metadata "$env:RUNNER_TEMP/cargo-metadata.json" --profile ci --test-threads 1 --no-tests fail -E $env:NATIVE_TEMP_TEST_FILTER
+
       - name: Run lib tests against WSL2-backed home
         shell: pwsh
         run: |
           $env:TEMP = $env:CC_SWITCH_WSL_TEST_TEMP
           $env:TMP = $env:CC_SWITCH_WSL_TEST_TEMP
-          cargo nextest run --binaries-metadata "$env:RUNNER_TEMP/binaries-metadata.json" --cargo-metadata "$env:RUNNER_TEMP/cargo-metadata.json" --profile ci --test-threads 1 --no-tests fail -E 'not test(/database::/)'
+          cargo nextest run --binaries-metadata "$env:RUNNER_TEMP/binaries-metadata.json" --cargo-metadata "$env:RUNNER_TEMP/cargo-metadata.json" --profile ci --test-threads 1 --no-tests fail -E "not test(/database::/) & not ($env:NATIVE_TEMP_TEST_FILTER)"
